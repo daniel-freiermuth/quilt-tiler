@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use tracing::{debug, info, warn};
 
 /// Convert decrypted OSENC (.oesu) chart files to `GeoJSON` + `MapLibre` style JSON.
 ///
@@ -31,6 +32,14 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
     let args = Args::parse();
 
     let inputs: Vec<PathBuf> = if args.input.is_dir() {
@@ -63,18 +72,18 @@ fn main() -> Result<()> {
         let cell = match osenc::parse_file(&data) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("Warning: skipping {}: {e}", path.display());
+                warn!(path = %path.display(), "skipping: {e}");
                 continue;
             }
         };
 
-        eprintln!(
-            "Parsed {}: {} features, scale 1:{}, ref ({:.4}, {:.4})",
-            path.file_name().unwrap_or_default().display(),
-            cell.features.len(),
-            cell.native_scale,
-            cell.ref_lat,
-            cell.ref_lon,
+        info!(
+            file = %path.file_name().unwrap_or_default().display(),
+            features = cell.features.len(),
+            scale = cell.native_scale,
+            ref_lat = format_args!("{:.4}", cell.ref_lat),
+            ref_lon = format_args!("{:.4}", cell.ref_lon),
+            "parsed",
         );
 
         // Expand combined bounds
@@ -99,38 +108,32 @@ fn main() -> Result<()> {
         };
         let outpath = args.outdir.join(format!("{acronym}.geojson"));
         let json = serde_json::to_string(&fc)?;
+        debug!(path = %outpath.display(), "writing layer");
         fs::write(&outpath, json)
             .with_context(|| format!("writing {}", outpath.display()))?;
         written_layers.push(acronym.clone());
     }
     written_layers.sort();
 
-    eprintln!(
-        "Wrote {} layer files to {}",
-        written_layers.len(),
-        args.outdir.display()
-    );
+    info!(layers = written_layers.len(), dir = %args.outdir.display(), "wrote GeoJSON layers");
 
     // Write style.json
     let style_path = args.outdir.join("style.json");
     fs::write(&style_path, style::STYLE_JSON)
         .with_context(|| format!("writing {}", style_path.display()))?;
-    eprintln!("Wrote style.json");
+    info!(path = %style_path.display(), "wrote style.json");
 
     // Print tippecanoe command hint
-    eprintln!("\nNext step — generate tiles with tippecanoe:");
-    let layer_args: Vec<String> = written_layers
+    info!("next step: generate tiles with tippecanoe");
+    let layer_args = written_layers
         .iter()
-        .map(|l| format!("  -l {l} {l}.geojson"))
-        .collect();
-    eprintln!(
-        "cd {} && tippecanoe -o chart.mbtiles --no-tile-compression \\",
-        args.outdir.display()
+        .map(|l| format!("-l {l} {l}.geojson"))
+        .collect::<Vec<_>>()
+        .join(" \\\n  ");
+    info!(
+        "tippecanoe command:\n  cd {} && tippecanoe -o chart.mbtiles --no-tile-compression \\\n  {layer_args} \\\n  --minimum-zoom=7 --maximum-zoom=14",
+        args.outdir.display(),
     );
-    for arg in &layer_args {
-        eprintln!("{arg} \\");
-    }
-    eprintln!("  --minimum-zoom=7 --maximum-zoom=14");
 
     Ok(())
 }
