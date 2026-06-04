@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use rayon::prelude::*;
 use tracing::{debug, info, warn};
 
 /// Returns the current UTC time as an ISO 8601 string (seconds precision).
@@ -103,60 +104,72 @@ fn main() -> Result<()> {
     fs::create_dir_all(&args.outdir)
         .with_context(|| format!("creating output dir {}", args.outdir.display()))?;
 
-    // Accumulate all layers across files into a single map
-    let mut all_layers: std::collections::HashMap<String, Vec<geojson::Feature>> =
-        std::collections::HashMap::new();
+    // Parse and convert all files in parallel, then merge sequentially.
+    type LayerMap = std::collections::HashMap<String, Vec<geojson::Feature>>;
+    let parsed: Vec<([f64; 4], LayerMap)> = inputs
+        .par_iter()
+        .filter_map(|path| {
+            let data = match fs::read(path) {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(path = %path.display(), "skipping: {e}");
+                    return None;
+                }
+            };
+            let cell = match osenc::parse_file(&data) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(path = %path.display(), "skipping: {e}");
+                    return None;
+                }
+            };
+            info!(
+                file = %path.file_name().unwrap_or_default().display(),
+                features = cell.features.len(),
+                scale = cell.native_scale,
+                ref_lat = format_args!("{:.4}", cell.ref_lat),
+                ref_lon = format_args!("{:.4}", cell.ref_lon),
+                "parsed",
+            );
+            let bounds = cell.bounds;
+            let layer_map: LayerMap = convert::cell_to_geojson(&cell)
+                .into_iter()
+                .map(|(k, fc)| (k, fc.features))
+                .collect();
+            Some((bounds, layer_map))
+        })
+        .collect();
 
+    // Sequential merge
+    let mut all_layers: LayerMap = std::collections::HashMap::new();
     let mut combined_bounds = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
-
-    for path in &inputs {
-        let data =
-            fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-
-        let cell = match osenc::parse_file(&data) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(path = %path.display(), "skipping: {e}");
-                continue;
-            }
-        };
-
-        info!(
-            file = %path.file_name().unwrap_or_default().display(),
-            features = cell.features.len(),
-            scale = cell.native_scale,
-            ref_lat = format_args!("{:.4}", cell.ref_lat),
-            ref_lon = format_args!("{:.4}", cell.ref_lon),
-            "parsed",
-        );
-
-        // Expand combined bounds
-        combined_bounds[0] = combined_bounds[0].min(cell.bounds[0]);
-        combined_bounds[1] = combined_bounds[1].min(cell.bounds[1]);
-        combined_bounds[2] = combined_bounds[2].max(cell.bounds[2]);
-        combined_bounds[3] = combined_bounds[3].max(cell.bounds[3]);
-
-        let layers = convert::cell_to_geojson(&cell);
-        for (acronym, fc) in layers {
-            all_layers.entry(acronym).or_default().extend(fc.features);
+    for (bounds, layers) in parsed {
+        combined_bounds[0] = combined_bounds[0].min(bounds[0]);
+        combined_bounds[1] = combined_bounds[1].min(bounds[1]);
+        combined_bounds[2] = combined_bounds[2].max(bounds[2]);
+        combined_bounds[3] = combined_bounds[3].max(bounds[3]);
+        for (acronym, features) in layers {
+            all_layers.entry(acronym).or_default().extend(features);
         }
     }
 
-    // Write one GeoJSON file per layer
-    let mut written_layers: Vec<String> = Vec::new();
-    for (acronym, features) in &all_layers {
-        let fc = geojson::FeatureCollection {
-            bbox: None,
-            features: features.clone(),
-            foreign_members: None,
-        };
-        let outpath = args.outdir.join(format!("{acronym}.geojson"));
-        let json = serde_json::to_string(&fc)?;
-        debug!(path = %outpath.display(), "writing layer");
-        fs::write(&outpath, json)
-            .with_context(|| format!("writing {}", outpath.display()))?;
-        written_layers.push(acronym.clone());
-    }
+    // Serialize and write one GeoJSON file per layer, in parallel.
+    let mut written_layers: Vec<String> = all_layers
+        .par_iter()
+        .map(|(acronym, features)| {
+            let fc = geojson::FeatureCollection {
+                bbox: None,
+                features: features.clone(),
+                foreign_members: None,
+            };
+            let outpath = args.outdir.join(format!("{acronym}.geojson"));
+            let json = serde_json::to_string(&fc)?;
+            debug!(path = %outpath.display(), "writing layer");
+            fs::write(&outpath, &json)
+                .with_context(|| format!("writing {}", outpath.display()))?;
+            Ok(acronym.clone())
+        })
+        .collect::<Result<Vec<_>>>()?;
     written_layers.sort();
 
     info!(layers = written_layers.len(), dir = %args.outdir.display(), "wrote GeoJSON layers");
