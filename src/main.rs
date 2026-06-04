@@ -28,18 +28,6 @@ struct Args {
     #[arg(short, long, default_value = "out")]
     outdir: PathBuf,
 
-    /// Tile URL template for the style.json source
-    /// (use {z}/{x}/{y} placeholders)
-    #[arg(long, default_value = "{z}/{x}/{y}.pbf")]
-    tile_url: String,
-
-    /// Minimum zoom level for the style source
-    #[arg(long, default_value_t = 7)]
-    min_zoom: u8,
-
-    /// Maximum zoom level for the style source
-    #[arg(long, default_value_t = 14)]
-    max_zoom: u8,
 }
 
 fn main() -> Result<()> {
@@ -124,10 +112,8 @@ fn main() -> Result<()> {
     );
 
     // Write style.json
-    let style =
-        style::generate_style(&args.tile_url, combined_bounds, args.min_zoom, args.max_zoom);
     let style_path = args.outdir.join("style.json");
-    fs::write(&style_path, serde_json::to_string_pretty(&style)?)
+    fs::write(&style_path, style::STYLE_JSON)
         .with_context(|| format!("writing {}", style_path.display()))?;
     eprintln!("Wrote style.json");
 
@@ -144,7 +130,7 @@ fn main() -> Result<()> {
     for arg in &layer_args {
         eprintln!("{arg} \\");
     }
-    eprintln!("  --minimum-zoom={} --maximum-zoom={}", args.min_zoom, args.max_zoom);
+    eprintln!("  --minimum-zoom=7 --maximum-zoom=14");
 
     Ok(())
 }
