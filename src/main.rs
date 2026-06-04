@@ -6,10 +6,49 @@ mod style;
 
 use std::fs;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use tracing::{debug, info, warn};
+
+/// Returns the current UTC time as an ISO 8601 string (seconds precision).
+fn chrono_now() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // Format: YYYY-MM-DDTHH:MM:SSZ
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    let days = secs / 86400; // days since 1970-01-01
+    // Compute calendar date from days
+    let (year, month, day) = days_to_ymd(days);
+    format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
+    // Gregorian calendar calculation
+    let mut year = 1970u64;
+    loop {
+        let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+        let days_in_year = if leap { 366 } else { 365 };
+        if days < days_in_year { break; }
+        days -= days_in_year;
+        year += 1;
+    }
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let month_days = [31u64, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut month = 1u64;
+    for &md in &month_days {
+        if days < md { break; }
+        days -= md;
+        month += 1;
+    }
+    (year, month, days + 1)
+}
+
 
 /// Convert decrypted OSENC (.oesu) chart files to `GeoJSON` + `MapLibre` style JSON.
 ///
@@ -29,8 +68,13 @@ struct Args {
     #[arg(short, long, default_value = "out")]
     outdir: PathBuf,
 
+    /// Human-readable chart name (defaults to output directory name)
+    #[arg(long)]
+    name: Option<String>,
+
 }
 
+#[allow(clippy::too_many_lines)] // CLI entry point: parsing + I/O + hints
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -123,6 +167,31 @@ fn main() -> Result<()> {
         .with_context(|| format!("writing {}", style_path.display()))?;
     info!(path = %style_path.display(), "wrote style.json");
 
+    // Derive chart id / name from the output directory
+    let chart_id = args
+        .outdir
+        .file_name().map_or_else(|| "enc-chart".to_owned(), |n| n.to_string_lossy().into_owned());
+    let chart_name = args.name.as_deref().unwrap_or(&chart_id).to_owned();
+
+    // Write metadata.json (Signal K charts plugin format)
+    let metadata = serde_json::json!({
+        "id":          chart_id,
+        "name":        chart_name,
+        "description": "OSENC chart converted by osenc2geojson",
+        "type":        "mapstyleJSON",
+        "format":      "pbf",
+        "created":     chrono_now(),
+        "minZoom":     7,
+        "maxZoom":     14,
+        "bounds":      combined_bounds,
+        "tilemapUrl":  "{z}/{x}/{y}.pbf",
+        "styleUrl":    "style.json"
+    });
+    let meta_path = args.outdir.join("metadata.json");
+    fs::write(&meta_path, serde_json::to_string_pretty(&metadata)?)
+        .with_context(|| format!("writing {}", meta_path.display()))?;
+    info!(path = %meta_path.display(), "wrote metadata.json");
+
     // Print tippecanoe command hint
     info!("next step: generate tiles with tippecanoe");
     let layer_args = written_layers
@@ -130,9 +199,37 @@ fn main() -> Result<()> {
         .map(|l| format!("-l {l} {l}.geojson"))
         .collect::<Vec<_>>()
         .join(" \\\n  ");
+    let out = args.outdir.display();
     info!(
-        "tippecanoe command:\n  cd {} && tippecanoe -o chart.mbtiles --no-tile-compression \\\n  {layer_args} \\\n  --minimum-zoom=7 --maximum-zoom=14",
-        args.outdir.display(),
+        "\n\
+── Step 1: generate tiles ──────────────────────────────────────────\n\
+  cd {out} && tippecanoe -o chart.mbtiles --no-tile-compression \\\n\
+  {layer_args} \\\n\
+  --minimum-zoom=7 --maximum-zoom=14\n\
+\n\
+── Step 2: serve the tiles (pick one) ──────────────────────────────\n\
+\n\
+  Option A — martin tile server (serves .mbtiles directly):\n\
+    cargo install martin\n\
+    martin {out}/chart.mbtiles\n\
+    # tiles at  http://localhost:3000/chart/{{z}}/{{x}}/{{y}}\n\
+\n\
+  Option B — tileserver-gl (serves .mbtiles directly):\n\
+    docker run --rm -v {out}:/data -p 8080:8080 maptiler/tileserver-gl\n\
+\n\
+  Option C — .pmtiles (single file, HTTP range-request servable):\n\
+    pmtiles convert {out}/chart.mbtiles {out}/chart.pmtiles\n\
+    # serve statically via any HTTP server with range support\n\
+\n\
+  Option D — flat {{}}/{{z}}/{{x}}/{{y}}.pbf directory tree:\n\
+    mb-util --image-format=pbf {out}/chart.mbtiles {out}/tiles\n\
+\n\
+── Step 3: Signal K integration ────────────────────────────────────\n\
+  The output dir already contains metadata.json and style.json.\n\
+  Add the output directory as a chart path in the Signal K charts plugin.\n\
+  Set the tile URL in the plugin to point at whichever server you chose.\n\
+  The style.json is served from the same directory and referenced\n\
+  by metadata.json as \"styleUrl\": \"style.json\"."
     );
 
     Ok(())
