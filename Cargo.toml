@@ -1,0 +1,24 @@
+[package]
+name = "osenc2geojson"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+geojson = "0.24"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all      = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery  = { level = "warn", priority = -1 }
+cargo    = { level = "warn", priority = -1 }
+# Private tool — not published to crates.io.
+cargo_common_metadata   = "allow"
+# Transitive dependency conflicts, not in our control.
+multiple_crate_versions = "allow"
