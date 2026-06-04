@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use geojson::{Feature, FeatureCollection, Geometry, Value};
+use geojson::{Feature, FeatureCollection, Geometry, GeometryValue};
 use serde_json::{json, Map, Value as JsonValue};
 
 use crate::osenc::{AttrValue, OsencCell};
@@ -50,47 +50,47 @@ pub fn cell_to_geojson(
             crate::osenc::Geometry::None => None,
 
             crate::osenc::Geometry::Point { lon, lat } => Some(Geometry::new(
-                Value::Point(vec![*lon, *lat]),
+                GeometryValue::Point { coordinates: vec![*lon, *lat].into() },
             )),
 
             crate::osenc::Geometry::MultiPoint(pts) => {
-                let coords: Vec<Vec<f64>> = pts
+                let coords = pts
                     .iter()
                     .map(|[lon, lat, depth]| {
                         if *depth == 0.0 {
-                            vec![*lon, *lat]
+                            vec![*lon, *lat].into()
                         } else {
-                            vec![*lon, *lat, *depth]
+                            vec![*lon, *lat, *depth].into()
                         }
                     })
                     .collect();
-                Some(Geometry::new(Value::MultiPoint(coords)))
+                Some(Geometry::new(GeometryValue::MultiPoint { coordinates: coords }))
             }
 
             crate::osenc::Geometry::Line(rings) => {
                 if rings.len() == 1 {
-                    let coords: Vec<Vec<f64>> =
-                        rings[0].iter().map(|[lon, lat]| vec![*lon, *lat]).collect();
-                    Some(Geometry::new(Value::LineString(coords)))
+                    let coords =
+                        rings[0].iter().map(|[lon, lat]| vec![*lon, *lat].into()).collect();
+                    Some(Geometry::new(GeometryValue::LineString { coordinates: coords }))
                 } else {
-                    let coords: Vec<Vec<Vec<f64>>> = rings
+                    let coords = rings
                         .iter()
-                        .map(|r| r.iter().map(|[lon, lat]| vec![*lon, *lat]).collect())
+                        .map(|r| r.iter().map(|[lon, lat]| vec![*lon, *lat].into()).collect())
                         .collect();
-                    Some(Geometry::new(Value::MultiLineString(coords)))
+                    Some(Geometry::new(GeometryValue::MultiLineString { coordinates: coords }))
                 }
             }
 
             crate::osenc::Geometry::Area(rings) => {
                 // Outer ring + optional inner rings
-                let coords: Vec<Vec<Vec<f64>>> = rings
+                let coords: Vec<_> = rings
                     .iter()
-                    .map(|r| r.iter().map(|[lon, lat]| vec![*lon, *lat]).collect())
+                    .map(|r| r.iter().map(|[lon, lat]| vec![*lon, *lat].into()).collect())
                     .collect();
                 if coords.is_empty() {
                     None
                 } else {
-                    Some(Geometry::new(Value::Polygon(coords)))
+                    Some(Geometry::new(GeometryValue::Polygon { coordinates: coords }))
                 }
             }
         };
