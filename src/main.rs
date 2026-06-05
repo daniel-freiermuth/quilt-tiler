@@ -50,6 +50,24 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
     (year, month, days + 1)
 }
 
+/// Compute the ideal tile zoom level for a chart at a given native scale (1:N).
+///
+/// Formula: `Z = floor(log2(earth_circumference / (256 * 0.00028 * N)))`
+/// where `0.00028` m/px is a standard screen pixel size at 90 DPI.
+/// Combined constant: `40_075_016 / (256 * 0.00028) ≈ 559_082_264`.
+///
+/// Result is clamped to `[0, 22]`.
+const ZOOM_K: f64 = 559_082_264.0;
+fn zoom_from_scale(native_scale: u32) -> u8 {
+    if native_scale == 0 {
+        return 14;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    // Safety: value is clamped to [0.0, 22.0] before cast
+    let z = (ZOOM_K / f64::from(native_scale)).log2().floor().clamp(0.0, 22.0) as u8;
+    z
+}
+
 
 /// Convert decrypted OSENC (.oesu) chart files to `GeoJSON` + `MapLibre` style JSON.
 ///
@@ -74,6 +92,8 @@ struct Args {
     name: Option<String>,
 
 }
+
+type LayerMap = std::collections::HashMap<String, Vec<geojson::Feature>>;
 
 #[allow(clippy::too_many_lines)] // CLI entry point: parsing + I/O + hints
 fn main() -> Result<()> {
@@ -105,8 +125,7 @@ fn main() -> Result<()> {
         .with_context(|| format!("creating output dir {}", args.outdir.display()))?;
 
     // Parse and convert all files in parallel, then merge sequentially.
-    type LayerMap = std::collections::HashMap<String, Vec<geojson::Feature>>;
-    let parsed: Vec<([f64; 4], LayerMap)> = inputs
+    let parsed: Vec<([f64; 4], u32, LayerMap)> = inputs
         .par_iter()
         .filter_map(|path| {
             let data = match fs::read(path) {
@@ -132,18 +151,23 @@ fn main() -> Result<()> {
                 "parsed",
             );
             let bounds = cell.bounds;
+            let native_scale = cell.native_scale;
             let layer_map: LayerMap = convert::cell_to_geojson(&cell)
                 .into_iter()
                 .map(|(k, fc)| (k, fc.features))
                 .collect();
-            Some((bounds, layer_map))
+            Some((bounds, native_scale, layer_map))
         })
         .collect();
 
     // Sequential merge
     let mut all_layers: LayerMap = std::collections::HashMap::new();
     let mut combined_bounds = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
-    for (bounds, layers) in parsed {
+    let mut min_native_scale = u32::MAX; // most detailed cell
+    let mut max_native_scale = 0u32;     // coarsest cell
+    for (bounds, native_scale, layers) in parsed {
+        min_native_scale = min_native_scale.min(native_scale);
+        max_native_scale = max_native_scale.max(native_scale);
         combined_bounds[0] = combined_bounds[0].min(bounds[0]);
         combined_bounds[1] = combined_bounds[1].min(bounds[1]);
         combined_bounds[2] = combined_bounds[2].max(bounds[2]);
@@ -172,6 +196,13 @@ fn main() -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     written_layers.sort();
 
+    // Compute zoom levels from the actual native scales observed across all cells.
+    // max_zoom: ideal zoom for the most detailed cell (smallest native_scale).
+    // min_zoom: two levels below the coarsest cell's ideal zoom, floored at 0.
+    let max_zoom = zoom_from_scale(if min_native_scale == u32::MAX { 22_000 } else { min_native_scale });
+    let min_zoom = zoom_from_scale(max_native_scale).saturating_sub(2);
+    info!(min_zoom, max_zoom, min_scale = min_native_scale, max_scale = max_native_scale, "zoom range computed from native scales");
+
     info!(layers = written_layers.len(), dir = %args.outdir.display(), "wrote GeoJSON layers");
 
     // Write style.json
@@ -194,8 +225,8 @@ fn main() -> Result<()> {
         "type":        "mapstyleJSON",
         "format":      "pbf",
         "created":     chrono_now(),
-        "minZoom":     7,
-        "maxZoom":     14,
+        "minZoom":     min_zoom,
+        "maxZoom":     max_zoom,
         "bounds":      combined_bounds,
         "tilemapUrl":  "{z}/{x}/{y}.pbf",
         "styleUrl":    "style.json"
@@ -218,7 +249,7 @@ fn main() -> Result<()> {
 ── Step 1: generate tiles ──────────────────────────────────────────\n\
   cd {out} && tippecanoe -o chart.mbtiles --no-tile-compression \\\n\
   {layer_args} \\\n\
-  --minimum-zoom=7 --maximum-zoom=14\n\
+  --minimum-zoom={min_zoom} --maximum-zoom={max_zoom}\n\
 \n\
 ── Step 2: serve the tiles (pick one) ──────────────────────────────\n\
 \n\
