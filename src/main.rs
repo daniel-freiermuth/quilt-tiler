@@ -247,7 +247,7 @@ fn main() -> Result<()> {
     info!(
         "\n\
 ── Step 1: generate tiles ──────────────────────────────────────────\n\
-  cd {out} && tippecanoe -o chart.mbtiles --no-tile-compression \\\n\
+  cd {out} && tippecanoe -o chart.mbtiles --no-tile-compression --drop-densest-as-needed \\\n\
   {layer_args} \\\n\
   --minimum-zoom={min_zoom} --maximum-zoom={max_zoom}\n\
 \n\

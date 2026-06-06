@@ -45,7 +45,38 @@ pub fn cell_to_geojson(
         let tippecanoe = json!({ "layer": acronym });
         props.insert("tippecanoe".into(), tippecanoe);
 
-        // Build GeoJSON geometry
+        // Build GeoJSON geometry.
+        // SOUNDG MultiPoint is special: tippecanoe drops Z coordinates, losing
+        // all depth values. Split each sounding point into a separate Point
+        // feature with depth stored as the VALDCO property instead.
+        if let crate::osenc::Geometry::MultiPoint(pts) = &feat.geometry {
+            for [lon, lat, depth] in pts {
+                let mut snd_props = props.clone();
+                // Overwrite VALDCO with the actual sounding depth.
+                // Format to at most 1 decimal place, dropping trailing zero.
+                let depth_str = if (depth - depth.round()).abs() < 0.05 {
+                    #[allow(clippy::cast_possible_truncation)] // clamped by the abs() check above
+                    let d = *depth as i32;
+                    format!("{d}")
+                } else {
+                    format!("{depth:.1}")
+                };
+                snd_props.insert("VALDCO".into(), json!(depth_str));
+                let feature = Feature {
+                    bbox: None,
+                    geometry: Some(Geometry::new(GeometryValue::Point {
+                        coordinates: vec![*lon, *lat].into(),
+                    })),
+                    id: None,
+                    properties: Some(snd_props),
+                    foreign_members: None,
+                };
+                by_layer.entry(acronym.clone()).or_default().push(feature);
+            }
+            continue;
+        }
+
+        // Build GeoJSON geometry for all other types
         let geom = match &feat.geometry {
             crate::osenc::Geometry::None => None,
 
@@ -53,19 +84,7 @@ pub fn cell_to_geojson(
                 GeometryValue::Point { coordinates: vec![*lon, *lat].into() },
             )),
 
-            crate::osenc::Geometry::MultiPoint(pts) => {
-                let coords = pts
-                    .iter()
-                    .map(|[lon, lat, depth]| {
-                        if *depth == 0.0 {
-                            vec![*lon, *lat].into()
-                        } else {
-                            vec![*lon, *lat, *depth].into()
-                        }
-                    })
-                    .collect();
-                Some(Geometry::new(GeometryValue::MultiPoint { coordinates: coords }))
-            }
+            crate::osenc::Geometry::MultiPoint(_) => unreachable!("handled above"),
 
             crate::osenc::Geometry::Line(rings) => {
                 if rings.len() == 1 {
