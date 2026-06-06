@@ -91,6 +91,18 @@ struct Args {
     #[arg(long)]
     name: Option<String>,
 
+    /// Safety depth in metres: the DEPCNT contour at exactly this depth is
+    /// highlighted red, and DEPARE areas shallower than this are drawn in
+    /// dark blue. Set this to your vessel's maximum draft plus a safety margin.
+    #[arg(long, default_value_t = 3.0)]
+    safety_depth: f64,
+
+    /// Upper boundary of the shallow-but-navigable zone in metres. DEPARE
+    /// areas between safety-depth and shoal-depth get a medium blue; deeper
+    /// areas get a very light blue.
+    #[arg(long, default_value_t = 10.0)]
+    shoal_depth: f64,
+
 }
 
 type LayerMap = std::collections::HashMap<String, Vec<geojson::Feature>>;
@@ -207,7 +219,10 @@ fn main() -> Result<()> {
 
     // Write style.json
     let style_path = args.outdir.join("style.json");
-    fs::write(&style_path, style::STYLE_JSON)
+    fs::write(
+        &style_path,
+        style::build_style(args.safety_depth, args.shoal_depth),
+    )
         .with_context(|| format!("writing {}", style_path.display()))?;
     info!(path = %style_path.display(), "wrote style.json");
 
