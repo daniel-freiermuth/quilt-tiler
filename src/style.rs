@@ -19,10 +19,13 @@ const STYLE_JSON: &str = include_str!("style.json");
 /// * `shoal_depth` — upper boundary of the "shallow but navigable" zone.
 ///   DEPARE areas between `safety_depth` and `shoal_depth` get a medium blue;
 ///   areas deeper than `shoal_depth` get a very light blue (open water).
+/// * `tile_url` — full MVT tile URL template, e.g.
+///   `http://localhost:3000/chart/{z}/{x}/{y}`.  Embedded in `sources.enc`.
+/// * `min_zoom` / `max_zoom` — zoom range for the tile source.
 ///
 /// # Panics
 /// Panics if the embedded `style.json` is malformed (compile-time guarantee).
-pub fn build_style(safety_depth: f64, shoal_depth: f64) -> String {
+pub fn build_style(safety_depth: f64, shoal_depth: f64, tile_url: &str, min_zoom: u8, max_zoom: u8) -> String {
     use serde_json::{json, Value};
 
     let mut style: Value =
@@ -106,5 +109,18 @@ pub fn build_style(safety_depth: f64, shoal_depth: f64) -> String {
     }
 
     style["layers"] = Value::Array(new_layers);
+
+    // --- inject sources block so the style is self-contained ---------------
+    // MapLibre requires every source referenced in layers to be defined here.
+    // The caller supplies the actual tile URL (e.g. from martin or tileserver-gl).
+    style["sources"] = json!({
+        "enc": {
+            "type": "vector",
+            "tiles": [tile_url],
+            "minzoom": min_zoom,
+            "maxzoom": max_zoom
+        }
+    });
+
     serde_json::to_string_pretty(&style).expect("style serialisation cannot fail")
 }

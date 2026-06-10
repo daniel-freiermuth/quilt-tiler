@@ -103,6 +103,15 @@ struct Args {
     #[arg(long, default_value_t = 10.0)]
     shoal_depth: f64,
 
+    /// Full tile URL template that the style source should point to,
+    /// e.g. `http://localhost:3000/chart/{z}/{x}/{y}`.
+    /// This is embedded in the `sources.enc` block of `style.json` so `MapLibre`
+    /// can find the tiles.  Use `{z}`, `{x}`, `{y}` as placeholders.
+    /// If omitted the source block is written with a placeholder so you can
+    /// edit it manually before serving.
+    #[arg(long, default_value = "http://localhost:3000/chart/{z}/{x}/{y}")]
+    tile_url: String,
+
 }
 
 type LayerMap = std::collections::HashMap<String, Vec<geojson::Feature>>;
@@ -221,7 +230,7 @@ fn main() -> Result<()> {
     let style_path = args.outdir.join("style.json");
     fs::write(
         &style_path,
-        style::build_style(args.safety_depth, args.shoal_depth),
+        style::build_style(args.safety_depth, args.shoal_depth, &args.tile_url, min_zoom, max_zoom),
     )
         .with_context(|| format!("writing {}", style_path.display()))?;
     info!(path = %style_path.display(), "wrote style.json");
