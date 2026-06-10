@@ -59,7 +59,7 @@ pub enum Geometry {
 pub struct Feature {
     pub type_code: u16,
     pub id: u16,
-    pub primitive: u8, // 1=point, 2=line, 3=area, 4=no-geometry
+    pub primitive: u8, // GEO_POINT=0, GEO_LINE=1, GEO_AREA=2, GEO_META=3 (matches OpenCPN GeoPrim_t enum)
     pub attributes: Vec<Attribute>,
     pub geometry: Geometry,
 }
