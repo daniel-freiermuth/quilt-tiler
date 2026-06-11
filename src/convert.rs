@@ -100,9 +100,9 @@ pub fn cell_to_geojson(
                 }
             }
 
-            crate::osenc::Geometry::Area(rings) => {
+            crate::osenc::Geometry::Area(area) => {
                 // Outer ring + optional inner rings
-                let coords: Vec<_> = rings
+                let coords: Vec<_> = area.rings
                     .iter()
                     .map(|r| r.iter().map(|[lon, lat]| vec![*lon, *lat].into()).collect())
                     .collect();

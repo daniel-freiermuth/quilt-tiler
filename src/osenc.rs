@@ -9,7 +9,7 @@
 //!   Pass 2 – collect VET (96) and VCT (97) tables, then resolve geometry.
 
 use std::collections::HashMap;
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::io::{Cursor, Read};
 
 use anyhow::{Context, Result};
 
@@ -46,13 +46,61 @@ pub struct Attribute {
     pub value: AttrValue,
 }
 
+/// OpenGL primitive type stored in the OSENC TriPrim chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriPrimType {
+    Triangles     = 4, // GL_TRIANGLES
+    TriangleStrip = 5, // GL_TRIANGLE_STRIP
+    TriangleFan   = 6, // GL_TRIANGLE_FAN
+}
+
+impl TriPrimType {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            4 => Self::Triangles,
+            5 => Self::TriangleStrip,
+            6 => Self::TriangleFan,
+            _ => panic!("unknown TriPrim type {v} — update TriPrimType::from_u8"),
+        }
+    }
+}
+
+/// One tessellation primitive from the TriPrim chain of an area record.
+#[derive(Debug, Clone)]
+pub struct TriPrim {
+    pub prim_type: TriPrimType,
+    /// Bounding box [W, S, E, N] in WGS84 degrees.
+    pub bbox: [f64; 4],
+    /// Vertices as [lon, lat] pairs, resolved from Spherical Mercator.
+    pub vertices: Vec<[f64; 2]>,
+}
+
+/// Fully resolved area geometry.
+#[derive(Debug, Clone)]
+pub struct AreaGeometry {
+    /// Closed coordinate rings. First ring is the outer boundary;
+    /// subsequent rings are inner rings (holes) or sub-polygons.
+    pub rings: Vec<Vec<[f64; 2]>>,
+    /// Per-ring OGR vertex counts from the LOD-reduced tessellation step.
+    /// Not directly related to the number of edge-ref triples per ring.
+    pub vertex_counts: Vec<u32>,
+    /// Pre-tessellated triangle primitives for GPU-accelerated fill rendering.
+    pub tri_prims: Vec<TriPrim>,
+    /// Mystery per-edge u32 array written by the o-charts server between the
+    /// TriPrim chain and the edge table. OpenCPN never reads it.
+    /// Length equals the edge count when present, empty otherwise.
+    /// Meaning unknown; single-edge cases match the edge RCID but this does
+    /// not generalise to multi-edge features.
+    pub extra_edge_data: Vec<u32>,
+}
+
 #[derive(Debug, Clone)]
 pub enum Geometry {
     None,
     Point { lon: f64, lat: f64 },
     MultiPoint(Vec<[f64; 3]>), // [lon, lat, depth]
-    Line(Vec<Vec<[f64; 2]>>),  // list of rings/strokes, each a list of [lon, lat]
-    Area(Vec<Vec<[f64; 2]>>),  // outer ring + inner rings, each [lon, lat]
+    Line(Vec<Vec<[f64; 2]>>),  // list of strokes, each a list of [lon, lat]
+    Area(AreaGeometry),
 }
 
 #[derive(Debug, Clone)]
@@ -104,13 +152,29 @@ struct RawFeature {
     raw_geometry: RawGeometry,
 }
 
+/// Internal TriPrim before SM → WGS84 coordinate conversion.
+#[derive(Debug)]
+struct RawTriPrim {
+    prim_type: u8,
+    /// [W, S, E, N] — already stored as WGS84 degrees in the OSENC file.
+    bbox: [f64; 4],
+    /// SM (east, north) coordinate pairs, one per vertex.
+    vertices: Vec<[f32; 2]>,
+}
+
 #[derive(Debug)]
 enum RawGeometry {
     None,
     Point { lon: f64, lat: f64 },
-    MultiPoint(Vec<[f32; 3]>),           // (east, north, depth) in SM
-    Line(Vec<[i32; 3]>),                  // edge ref triples
-    Area { contour_count: u32, edge_refs: Vec<[i32; 3]> },
+    MultiPoint(Vec<[f32; 3]>),  // (east, north, depth) in SM
+    Line(Vec<[i32; 3]>),        // edge ref triples
+    Area {
+        contour_count: u32,
+        vertex_counts: Vec<u32>,
+        tri_prims: Vec<RawTriPrim>,
+        edge_refs: Vec<[i32; 3]>,
+        extra_edge_data: Vec<u32>,
+    },
 }
 
 // ── Reader helpers ───────────────────────────────────────────────────────────
@@ -324,32 +388,96 @@ pub fn parse_file(data: &[u8]) -> Result<OsencCell> {
 
             FEATURE_GEOMETRY_RECORD_AREA => {
                 if payload_len >= 44 {
-                    // 4×f64 extent, u32 contour_count, u32 triprim_count, u32 edge_count
+                    // Fixed header: 4×f64 extent + u32 contour_count + u32 triprim_count + u32 edge_count
                     let _s = read_f64(&mut p)?;
                     let _n = read_f64(&mut p)?;
                     let _w = read_f64(&mut p)?;
                     let _e = read_f64(&mut p)?;
                     let contour_count = read_u32(&mut p)?;
-                    let _triprim_count = read_u32(&mut p)?;
+                    let triprim_count = read_u32(&mut p)? as usize;
                     let edge_count = read_u32(&mut p)? as usize;
 
-                    // Skip the TriPrim chain that follows the header.
-                    // Each TriPrim: u8 type, u32 nVert, 4×f64 bbox, nVert×2×f32 verts
-                    // Edge refs are at the very END of the payload.
-                    // Seek there directly.
-                    let edge_table_bytes = edge_count * 12; // 3×i32 per edge ref
-                    let edge_table_start = payload_len.saturating_sub(edge_table_bytes);
-                    p.seek(SeekFrom::Start(edge_table_start as u64))?;
+                    // Per-contour OGR vertex counts (contour_count × u32).
+                    // These are LOD-reduced vertex counts used for tessellation;
+                    // not directly related to edge-ref counts.
+                    let n_contours = contour_count as usize;
+                    let mut vertex_counts = Vec::with_capacity(n_contours);
+                    for k in 0..n_contours {
+                        anyhow::ensure!(
+                            p.position() as usize + 4 <= payload_len,
+                            "truncated vertex count array at entry {k}/{n_contours}"
+                        );
+                        vertex_counts.push(read_u32(&mut p)?);
+                    }
+
+                    // Walk the TriPrim chain.
+                    // Each entry: u8 type, u32 nVert, 4×f64 bbox, nVert×2×f32 vertices.
+                    // The bbox is stored as [minlon, maxlon, minlat, maxlat] in WGS84.
+                    let mut tri_prims = Vec::with_capacity(triprim_count);
+                    for k in 0..triprim_count {
+                        anyhow::ensure!(
+                            p.position() as usize + 5 <= payload_len,
+                            "truncated TriPrim header at entry {k}/{triprim_count}"
+                        );
+                        let prim_type = read_u8(&mut p)?;
+                        let nvert = read_u32(&mut p)? as usize;
+                        anyhow::ensure!(
+                            p.position() as usize + 32 + nvert * 8 <= payload_len,
+                            "truncated TriPrim body at entry {k}/{triprim_count} (nvert={nvert})"
+                        );
+                        // Reader (BuildPolyTessGeo): minxt, maxxt, minyt, maxyt → W, E, S, N
+                        // (spec says S,N,W,E but is wrong — reader is authoritative)
+                        let minlon = read_f64(&mut p)?;
+                        let maxlon = read_f64(&mut p)?;
+                        let minlat = read_f64(&mut p)?;
+                        let maxlat = read_f64(&mut p)?;
+                        let mut vertices = Vec::with_capacity(nvert);
+                        for _ in 0..nvert {
+                            let east  = read_f32(&mut p)?;
+                            let north = read_f32(&mut p)?;
+                            vertices.push([east, north]);
+                        }
+                        tri_prims.push(RawTriPrim {
+                            prim_type,
+                            bbox: [minlon, minlat, maxlon, maxlat], // → [W, S, E, N]
+                            vertices,
+                        });
+                    }
+
+                    // After the TriPrim chain: edge entries in o-charts' 4-int
+                    // interleaved format:
+                    //   [start_node, edge_id, end_node, x]  per entry
+                    // where x is an unknown u32 field written by the o-charts server.
+                    // The OSENC spec defines only 3-int entries; OpenCPN reads
+                    // edge_count*3*sizeof(int) from next_byte and therefore
+                    // misreads every entry after the 1st — tolerated because it
+                    // only uses edge_id for VET lookup and ignores node topology.
+                    let cursor = p.position() as usize;
+                    let remaining = payload_len.saturating_sub(cursor);
+                    anyhow::ensure!(
+                        remaining == edge_count * 16,
+                        "unexpected {} bytes for edge section (expected {})",
+                        remaining, edge_count * 16,
+                    );
 
                     let mut edge_refs = Vec::with_capacity(edge_count);
+                    let mut extra_edge_data = Vec::with_capacity(edge_count);
                     for _ in 0..edge_count {
                         let start_node = read_i32(&mut p)?;
-                        let edge_id = read_i32(&mut p)?;
-                        let end_node = read_i32(&mut p)?;
+                        let edge_id   = read_i32(&mut p)?;
+                        let end_node  = read_i32(&mut p)?;
+                        extra_edge_data.push(read_u32(&mut p)?);
                         edge_refs.push([start_node, edge_id, end_node]);
                     }
+
                     if let Some(ref mut f) = current {
-                        f.raw_geometry = RawGeometry::Area { contour_count, edge_refs };
+                        f.raw_geometry = RawGeometry::Area {
+                            contour_count,
+                            vertex_counts,
+                            tri_prims,
+                            edge_refs,
+                            extra_edge_data,
+                        };
                     }
                 }
             }
@@ -509,18 +637,112 @@ fn resolve_geometry(
             }
         }
 
-        RawGeometry::Area { contour_count, edge_refs } => {
-            // Area geometry: edge_refs describe one or more rings.
-            // contour_count tells us how many rings; we split at natural
-            // start/end node boundaries.
-            // Simplification: treat all edge_refs as one outer ring.
-            // Most chart cells have simple polygons; inner rings (holes) are rare.
-            let _ = contour_count;
-            let coords = build_ring(&edge_refs, vet, vct, true);
-            if coords.is_empty() {
+        RawGeometry::Area { contour_count, vertex_counts, tri_prims, edge_refs, extra_edge_data } => {
+            // Split the flat edge_refs list into individual rings (contours).
+            // The first ring is the outer boundary; subsequent rings are inner rings
+            // (holes) or sub-polygons. GeoJSON Polygon supports this layout.
+            //
+            // S57 topology guarantees that within a single feature's edge list,
+            // a ring ends when its last edge's end_node == the ring's first start_node
+            // (closure). If closure is never detected (e.g. due to a missing VCT
+            // entry stored as -1/-2), the remaining edges are force-closed at the end.
+
+            if edge_refs.is_empty() {
+                tracing::warn!(
+                    expected = contour_count,
+                    got = 0,
+                    "no contours provided"
+                );
+                return Geometry::None;
+            }
+
+            let expected_rings = contour_count as usize;
+            let total_edges = edge_refs.len();
+            let mut rings: Vec<Vec<[f64; 2]>> = Vec::with_capacity(expected_rings);
+            let mut ring_start = 0usize;
+            let mut prev_edge_end = edge_refs[0][0];
+
+            for i in 0..total_edges {
+                let [start_node, _edge, end_node] = edge_refs[i];
+
+                if prev_edge_end != start_node {
+                    tracing::error!(
+                        edge_index = i,
+                        end_node,
+                        next_start_node = edge_refs.get(i + 1).map(|r| r[0]),
+                        edges = ?&edge_refs[i..i + 2],
+                        "topology break: non-contiguous edge sequence at index {i}"
+                    );
+                    return Geometry::None;
+                }
+                prev_edge_end = end_node;
+
+                let is_last = i + 1 == total_edges;
+
+                // A ring closes when its last edge's end_node equals the start_node
+                // of the ring's first edge.
+                let ring_closed = end_node == edge_refs[ring_start][0];
+
+                if ring_closed || is_last {
+                    let ring_coords = build_ring(&edge_refs[ring_start..=i], vet, vct, true);
+                    if ring_coords.len() >= 4 {
+                        rings.push(ring_coords);
+                    } else {
+                        tracing::warn!(
+                            ring = rings.len() + 1,
+                            vertices = ring_coords.len(),
+                            edge_refs = ?&edge_refs[ring_start..=i],
+                            "skipping degenerate ring with insufficient vertices"
+                        );
+                    }
+                    if !is_last {
+                        ring_start = i + 1;
+                        prev_edge_end = edge_refs[ring_start][0];
+                    }
+                }
+            }
+
+            if rings.len() != expected_rings {
+                if expected_rings <= 5 || (rings.len() as i64 - expected_rings as i64).abs() <= 2 {
+                    tracing::warn!(
+                        expected = expected_rings,
+                        got = rings.len(),
+                        edge_refs = ?edge_refs,
+                        "area ring count mismatch"
+                    );
+                } else {
+                    tracing::warn!(
+                        expected = expected_rings,
+                        got = rings.len(),
+                        "area ring count mismatch"
+                    );
+                }
+            }
+
+            // Resolve TriPrim vertices from SM coords to WGS84.
+            let resolved_tri_prims = tri_prims
+                .into_iter()
+                .map(|tp| TriPrim {
+                    prim_type: TriPrimType::from_u8(tp.prim_type),
+                    bbox: tp.bbox, // already WGS84
+                    vertices: tp.vertices
+                        .iter()
+                        .map(|&[e, n]| {
+                            crate::georef::from_sm(f64::from(e), f64::from(n), ref_lat, ref_lon)
+                        })
+                        .collect(),
+                })
+                .collect();
+
+            if rings.is_empty() {
                 Geometry::None
             } else {
-                Geometry::Area(vec![coords])
+                Geometry::Area(AreaGeometry {
+                    rings,
+                    vertex_counts,
+                    tri_prims: resolved_tri_prims,
+                    extra_edge_data,
+                })
             }
         }
     }
