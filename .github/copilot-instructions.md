@@ -1,0 +1,16 @@
+- Make sure that all the checkers and linters are green
+- Rust: standard `rustfmt`, `clippy` clean, no `unwrap()` in library code.
+- This codebase is entirely written by you. You have full agency and ownership of the code.
+- Follow Rust idioms and clippy recommendations
+- Use `profiling::scope!()` for performance-sensitive code paths
+- Prefer explicit error handling over panics
+- Keep functions focused and extract reusable components
+- Follow clean code principles and separation of concerns.
+- Values: correctness, maintainablity, boringness and defensiveness
+- => fail-fast with graceful recovery
+- => defensive resilience
+- Performance optimizations are important should be justified with profiling data. Ask the user to help with profiling
+- Think long-term
+- Zero-panic
+- TDD, tests first
+- Unit tests, integration tests, and end-to-end tests
