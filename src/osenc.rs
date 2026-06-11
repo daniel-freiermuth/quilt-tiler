@@ -86,12 +86,6 @@ pub struct AreaGeometry {
     pub vertex_counts: Vec<u32>,
     /// Pre-tessellated triangle primitives for GPU-accelerated fill rendering.
     pub tri_prims: Vec<TriPrim>,
-    /// Mystery per-edge u32 array written by the o-charts server between the
-    /// TriPrim chain and the edge table. OpenCPN never reads it.
-    /// Length equals the edge count when present, empty otherwise.
-    /// Meaning unknown; single-edge cases match the edge RCID but this does
-    /// not generalise to multi-edge features.
-    pub extra_edge_data: Vec<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -167,13 +161,12 @@ enum RawGeometry {
     None,
     Point { lon: f64, lat: f64 },
     MultiPoint(Vec<[f32; 3]>),  // (east, north, depth) in SM
-    Line(Vec<[i32; 3]>),        // edge ref triples
+    Line(Vec<[i32; 4]>),        // edge ref triples with direction
     Area {
         contour_count: u32,
         vertex_counts: Vec<u32>,
         tri_prims: Vec<RawTriPrim>,
-        edge_refs: Vec<[i32; 3]>,
-        extra_edge_data: Vec<u32>,
+        edge_refs: Vec<[i32; 4]>,
     },
 }
 
@@ -378,7 +371,8 @@ pub fn parse_file(data: &[u8]) -> Result<OsencCell> {
                         let start_node = read_i32(&mut p)?;
                         let edge_id = read_i32(&mut p)?;
                         let end_node = read_i32(&mut p)?;
-                        edge_refs.push([start_node, edge_id, end_node]);
+                        let dir = read_i32(&mut p)?;
+                        edge_refs.push([start_node, edge_id, end_node, dir]);
                     }
                     if let Some(ref mut f) = current {
                         f.raw_geometry = RawGeometry::Line(edge_refs);
@@ -461,13 +455,12 @@ pub fn parse_file(data: &[u8]) -> Result<OsencCell> {
                     );
 
                     let mut edge_refs = Vec::with_capacity(edge_count);
-                    let mut extra_edge_data = Vec::with_capacity(edge_count);
                     for _ in 0..edge_count {
                         let start_node = read_i32(&mut p)?;
                         let edge_id   = read_i32(&mut p)?;
                         let end_node  = read_i32(&mut p)?;
-                        extra_edge_data.push(read_u32(&mut p)?);
-                        edge_refs.push([start_node, edge_id, end_node]);
+                        let dir  = read_i32(&mut p)?;
+                        edge_refs.push([start_node, edge_id, end_node, dir]);
                     }
 
                     if let Some(ref mut f) = current {
@@ -476,7 +469,6 @@ pub fn parse_file(data: &[u8]) -> Result<OsencCell> {
                             vertex_counts,
                             tri_prims,
                             edge_refs,
-                            extra_edge_data,
                         };
                     }
                 }
@@ -637,7 +629,7 @@ fn resolve_geometry(
             }
         }
 
-        RawGeometry::Area { contour_count, vertex_counts, tri_prims, edge_refs, extra_edge_data } => {
+        RawGeometry::Area { contour_count, vertex_counts, tri_prims, edge_refs } => {
             // Split the flat edge_refs list into individual rings (contours).
             // The first ring is the outer boundary; subsequent rings are inner rings
             // (holes) or sub-polygons. GeoJSON Polygon supports this layout.
@@ -663,7 +655,7 @@ fn resolve_geometry(
             let mut prev_edge_end = edge_refs[0][0];
 
             for i in 0..total_edges {
-                let [start_node, _edge, end_node] = edge_refs[i];
+                let [start_node, _edge, end_node, _dir] = edge_refs[i];
 
                 if prev_edge_end != start_node {
                     tracing::error!(
@@ -741,7 +733,6 @@ fn resolve_geometry(
                     rings,
                     vertex_counts,
                     tri_prims: resolved_tri_prims,
-                    extra_edge_data,
                 })
             }
         }
@@ -754,14 +745,14 @@ fn resolve_geometry(
 /// `close` = true appends the first point at the end (for polygons).
 #[allow(clippy::cast_sign_loss)] // RCID values in start/end fields are always non-negative
 fn build_ring(
-    edge_refs: &[[i32; 3]],
+    edge_refs: &[[i32; 4]],
     vet: &HashMap<u32, Vec<[f64; 2]>>,
     vct: &HashMap<u32, [f64; 2]>,
     close: bool,
 ) -> Vec<[f64; 2]> {
     let mut coords: Vec<[f64; 2]> = Vec::new();
 
-    for [start_rcid, edge_rcid, _end_rcid] in edge_refs {
+    for [start_rcid, edge_rcid, _end_rcid, _dir] in edge_refs {
         // Prepend start connected node
         if let Some(&[lon, lat]) = vct.get(&(*start_rcid as u32))
             && (coords.is_empty() || coords.last() != Some(&[lon, lat])) {
@@ -785,7 +776,7 @@ fn build_ring(
     }
 
     // Append final end node from the last edge ref
-    if let Some([_, _, end_rcid]) = edge_refs.last()
+    if let Some([_, _, end_rcid, _]) = edge_refs.last()
         && let Some(&[lon, lat]) = vct.get(&(*end_rcid as u32))
             && coords.last() != Some(&[lon, lat]) {
                 coords.push([lon, lat]);
