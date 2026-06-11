@@ -75,8 +75,11 @@ fn zoom_from_scale(native_scale: u32) -> u8 {
 /// plus a style.json suitable for use as a mapstyleJSON chart in Signal K.
 ///
 /// Feed the `GeoJSON` files to tippecanoe to produce vector tiles:
-///   tippecanoe -o chart.mbtiles --no-tile-compression \
-///     -l DEPARE depare.geojson -l LNDARE lndare.geojson ...
+///   cd <outdir> && tippecanoe -o chart.mbtiles --no-tile-compression \
+///     --drop-densest-as-needed --minimum-zoom=N --maximum-zoom=N *.geojson
+///
+/// tippecanoe automatically uses the filename (without .geojson) as the
+/// layer name, so no `-l` flags are needed.
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
@@ -262,18 +265,13 @@ fn main() -> Result<()> {
 
     // Print tippecanoe command hint
     info!("next step: generate tiles with tippecanoe");
-    let layer_args = written_layers
-        .iter()
-        .map(|l| format!("-l {l} {l}.geojson"))
-        .collect::<Vec<_>>()
-        .join(" \\\n  ");
     let out = args.outdir.display();
     info!(
         "\n\
 ── Step 1: generate tiles ──────────────────────────────────────────\n\
   cd {out} && tippecanoe -o chart.mbtiles --no-tile-compression --drop-densest-as-needed \\\n\
-  {layer_args} \\\n\
-  --minimum-zoom={min_zoom} --maximum-zoom={max_zoom}\n\
+  --minimum-zoom={min_zoom} --maximum-zoom={max_zoom} *.geojson\n\
+  # tippecanoe uses the filename as the layer name automatically\n\
 \n\
 ── Step 2: serve the tiles (pick one) ──────────────────────────────\n\
 \n\
