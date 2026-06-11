@@ -1,6 +1,7 @@
 {
   "version": 8,
   "name": "OSENC Chart",
+  "sprite": "https://mapresources.skippo.cloud/20260507/sprite/light/sprite",
   "layers": [
     {
       "id": "LNDARE",
@@ -246,41 +247,105 @@
     },
     {
       "id": "WRECKS",
-      "type": "circle",
+      "type": "symbol",
       "source": "enc",
       "source-layer": "WRECKS",
-      "minzoom": 11,
-      "paint": {
-        "circle-color": "#e74c3c",
-        "circle-radius": 4,
-        "circle-stroke-color": "#922b21",
-        "circle-stroke-width": 1
-      }
+      "minzoom": 13,
+      "layout": {
+        "icon-image": [
+          "case",
+          ["match", ["get", "CATWRK"], [2], true, false],
+          [
+            "step",
+            ["coalesce", ["get", "VALSOU"], 0],
+            "K24_Wreck_showing_hull",
+            0, "K40_Obstruction_3",
+            3.001, "K40_Obstruction_2",
+            6.001, "K40_Obstruction_1"
+          ],
+          ["match", ["get", "CATWRK"], [1], true, false], "K29_Wreck_notdangerous",
+          ["match", ["get", "CATWRK"], [4, 5], true, false], "K24_Wreck_showing_hull",
+          "K28_Wreck_dangerous_3"
+        ],
+        "icon-size": 1,
+        "icon-allow-overlap": true,
+        "icon-ignore-placement": true
+      },
+      "paint": {}
     },
     {
       "id": "OBSTRN",
-      "type": "circle",
+      "type": "symbol",
       "source": "enc",
       "source-layer": "OBSTRN",
-      "minzoom": 11,
-      "paint": {
-        "circle-color": "#e67e22",
-        "circle-radius": 3,
-        "circle-stroke-color": "#784212",
-        "circle-stroke-width": 1
-      }
+      "minzoom": 13,
+      "filter": ["==", ["geometry-type"], "Point"],
+      "layout": {
+        "icon-image": [
+          "match",
+          ["get", "CATOBS"],
+          [1], "K43_1_Submerged_stump",
+          [5], "K46_Fish_haven_3",
+          [7], "K31_Foul_ground",
+          [
+            "step",
+            ["coalesce", ["get", "VALSOU"], 0],
+            "K40_Obstruction_5",
+            0, "K40_Obstruction_3",
+            3.001, "K40_Obstruction_2",
+            6.001, "K40_Obstruction_1"
+          ]
+        ],
+        "icon-size": 1,
+        "icon-allow-overlap": true,
+        "icon-ignore-placement": true
+      },
+      "paint": {}
     },
     {
       "id": "UWTROC",
-      "type": "circle",
+      "type": "symbol",
       "source": "enc",
       "source-layer": "UWTROC",
-      "minzoom": 11,
+      "minzoom": 14,
+      "layout": {
+        "icon-image": [
+          "match",
+          ["get", "WATLEV"],
+          1, "K11b_Rock_uncovers",
+          2, "K10_LandPoint",
+          3, "K13a_Dangerous_underwater_rk",
+          4, "K11b_Rock_uncovers",
+          5, "K12a_Rock_awash",
+          6, "K11b_Rock_uncovers",
+          7, "K11b_Rock_uncovers",
+          "NO_SYMBOL"
+        ],
+        "icon-size": 1,
+        "icon-allow-overlap": true,
+        "icon-ignore-placement": true
+      },
+      "paint": {}
+    },
+    {
+      "id": "UWTROC-depth",
+      "type": "symbol",
+      "source": "enc",
+      "source-layer": "UWTROC",
+      "minzoom": 14,
+      "filter": ["has", "VALSOU"],
+      "layout": {
+        "text-field": ["concat", "(", ["to-string", ["get", "VALSOU"]], ")"],
+        "text-font": ["Roboto Italic"],
+        "text-size": 10,
+        "text-offset": [0.5, 0.35],
+        "text-anchor": "top-left",
+        "text-optional": true
+      },
       "paint": {
-        "circle-color": "#c0392b",
-        "circle-radius": 3,
-        "circle-stroke-color": "#7b241c",
-        "circle-stroke-width": 1
+        "text-color": "#1a3a5c",
+        "text-halo-color": "rgba(255,255,255,0.8)",
+        "text-halo-width": 1
       }
     },
     {
