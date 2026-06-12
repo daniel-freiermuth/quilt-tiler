@@ -675,6 +675,15 @@ fn resolve_geometry(
                 // of the ring's first edge.
                 let ring_closed = end_node == edge_refs[ring_start][0];
 
+                if is_last && !ring_closed {
+                    tracing::warn!(
+                        edge_index = i,
+                        end_node,
+                        first_start_node = edge_refs[ring_start][0],
+                        "force-closing unclosed ring at end of edge list"
+                    );
+                }
+
                 if ring_closed || is_last {
                     let ring_coords = build_ring(&edge_refs[ring_start..=i], vet, vct, true);
                     if ring_coords.len() >= 4 {
