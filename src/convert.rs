@@ -17,6 +17,7 @@ use crate::s57::{attribute_acronym, object_acronym};
 
 pub fn cell_to_geojson(
     cell: &OesuCell,
+    minzoom: u8,
 ) -> HashMap<String, FeatureCollection> {
     let mut by_layer: HashMap<String, Vec<Feature>> = HashMap::new();
 
@@ -41,8 +42,8 @@ pub fn cell_to_geojson(
             props.insert(key, val);
         }
 
-        // tippecanoe layer hint
-        let tippecanoe = json!({ "layer": acronym });
+        // tippecanoe layer + minzoom hint (maxzoom added later by quilting).
+        let tippecanoe = json!({ "layer": acronym, "minzoom": minzoom });
         props.insert("tippecanoe".into(), tippecanoe);
 
         // Build GeoJSON geometry.

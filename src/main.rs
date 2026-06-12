@@ -1,4 +1,5 @@
 mod convert;
+mod quilt;
 mod s57;
 mod style;
 
@@ -117,6 +118,15 @@ struct Args {
 
 type LayerMap = std::collections::HashMap<String, Vec<geojson::Feature>>;
 
+/// Output of the parallel parse step, carrying everything the quilting merge needs.
+struct ParsedChart {
+    bounds:      [f64; 4],
+    native_scale: u32,
+    coverage:    Vec<Vec<[f64; 2]>>,
+    no_coverage:  Vec<Vec<[f64; 2]>>,
+    layers:      LayerMap,
+}
+
 #[allow(clippy::too_many_lines)] // CLI entry point: parsing + I/O + hints
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -146,8 +156,8 @@ fn main() -> Result<()> {
     fs::create_dir_all(&args.outdir)
         .with_context(|| format!("creating output dir {}", args.outdir.display()))?;
 
-    // Parse and convert all files in parallel, then merge sequentially.
-    let parsed: Vec<([f64; 4], u32, LayerMap)> = inputs
+    // Parse and convert all files in parallel; the quilting merge is sequential.
+    let mut parsed: Vec<ParsedChart> = inputs
         .par_iter()
         .filter_map(|path| {
             let data = match fs::read(path) {
@@ -172,30 +182,48 @@ fn main() -> Result<()> {
                 ref_lon = format_args!("{:.4}", cell.ref_lon),
                 "parsed",
             );
-            let bounds = cell.bounds;
+            let minzoom    = zoom_from_scale(cell.native_scale);
+            let bounds     = cell.bounds;
             let native_scale = cell.native_scale;
-            let layer_map: LayerMap = convert::cell_to_geojson(&cell)
+            let layer_map: LayerMap = convert::cell_to_geojson(&cell, minzoom)
                 .into_iter()
                 .map(|(k, fc)| (k, fc.features))
                 .collect();
-            Some((bounds, native_scale, layer_map))
+            let oesu::OesuCell { coverage, no_coverage, .. } = cell;
+            Some(ParsedChart { bounds, native_scale, coverage, no_coverage, layers: layer_map })
         })
         .collect();
 
-    // Sequential merge
+    // Sort finest → coarsest (smallest native_scale number = most detailed).
+    parsed.sort_unstable_by_key(|c| c.native_scale);
+
+    // Quilting merge: process finest→coarsest, accumulate covered_zones.
     let mut all_layers: LayerMap = std::collections::HashMap::new();
     let mut combined_bounds = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
-    let mut min_native_scale = u32::MAX; // most detailed cell
-    let mut max_native_scale = 0u32;     // coarsest cell
-    for (bounds, native_scale, layers) in parsed {
-        min_native_scale = min_native_scale.min(native_scale);
-        max_native_scale = max_native_scale.max(native_scale);
-        combined_bounds[0] = combined_bounds[0].min(bounds[0]);
-        combined_bounds[1] = combined_bounds[1].min(bounds[1]);
-        combined_bounds[2] = combined_bounds[2].max(bounds[2]);
-        combined_bounds[3] = combined_bounds[3].max(bounds[3]);
-        for (acronym, features) in layers {
-            all_layers.entry(acronym).or_default().extend(features);
+    let mut min_native_scale = u32::MAX;
+    let mut max_native_scale = 0u32;
+    let mut covered_zones: Vec<quilt::CoveredZone> = Vec::new();
+
+    for chart in parsed {
+        min_native_scale = min_native_scale.min(chart.native_scale);
+        max_native_scale = max_native_scale.max(chart.native_scale);
+        combined_bounds[0] = combined_bounds[0].min(chart.bounds[0]);
+        combined_bounds[1] = combined_bounds[1].min(chart.bounds[1]);
+        combined_bounds[2] = combined_bounds[2].max(chart.bounds[2]);
+        combined_bounds[3] = combined_bounds[3].max(chart.bounds[3]);
+
+        let chart_minzoom   = zoom_from_scale(chart.native_scale);
+        let effective_covr  = quilt::build_effective_covr(&chart.coverage, &chart.no_coverage);
+
+        for (acronym, features) in chart.layers {
+            let layer = all_layers.entry(acronym).or_default();
+            for feat in features {
+                layer.extend(quilt::quilt_feature(feat, &covered_zones));
+            }
+        }
+
+        if let Some(zone) = quilt::CoveredZone::new(effective_covr, chart_minzoom) {
+            covered_zones.push(zone);
         }
     }
 
