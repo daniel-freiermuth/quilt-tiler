@@ -1,4 +1,4 @@
-//! Convert a parsed `OsencCell` into a map of `GeoJSON` `FeatureCollections`,
+//! Convert a parsed `OesuCell` into a map of `GeoJSON` `FeatureCollections`,
 //! one per S-57 object class acronym (e.g. "DEPARE", "LNDARE").
 //!
 //! Each `GeoJSON` feature includes:
@@ -12,11 +12,11 @@ use std::collections::HashMap;
 use geojson::{Feature, FeatureCollection, Geometry, GeometryValue};
 use serde_json::{json, Map, Value as JsonValue};
 
-use crate::osenc::{AttrValue, OsencCell};
+use crate::oesu::{AttrValue, OesuCell};
 use crate::s57::{attribute_acronym, object_acronym};
 
 pub fn cell_to_geojson(
-    cell: &OsencCell,
+    cell: &OesuCell,
 ) -> HashMap<String, FeatureCollection> {
     let mut by_layer: HashMap<String, Vec<Feature>> = HashMap::new();
 
@@ -49,7 +49,7 @@ pub fn cell_to_geojson(
         // SOUNDG MultiPoint is special: tippecanoe drops Z coordinates, losing
         // all depth values. Split each sounding point into a separate Point
         // feature with depth stored as the VALDCO property instead.
-        if let crate::osenc::Geometry::MultiPoint(pts) = &feat.geometry {
+        if let crate::oesu::Geometry::MultiPoint(pts) = &feat.geometry {
             for [lon, lat, depth] in pts {
                 let mut snd_props = props.clone();
                 // Overwrite VALDCO with the actual sounding depth.
@@ -78,15 +78,15 @@ pub fn cell_to_geojson(
 
         // Build GeoJSON geometry for all other types
         let geom = match &feat.geometry {
-            crate::osenc::Geometry::None => None,
+            crate::oesu::Geometry::None => None,
 
-            crate::osenc::Geometry::Point { lon, lat } => Some(Geometry::new(
+            crate::oesu::Geometry::Point { lon, lat } => Some(Geometry::new(
                 GeometryValue::Point { coordinates: vec![*lon, *lat].into() },
             )),
 
-            crate::osenc::Geometry::MultiPoint(_) => unreachable!("handled above"),
+            crate::oesu::Geometry::MultiPoint(_) => unreachable!("handled above"),
 
-            crate::osenc::Geometry::Line(rings) => {
+            crate::oesu::Geometry::Line(rings) => {
                 if rings.len() == 1 {
                     let coords =
                         rings[0].iter().map(|[lon, lat]| vec![*lon, *lat].into()).collect();
@@ -100,7 +100,7 @@ pub fn cell_to_geojson(
                 }
             }
 
-            crate::osenc::Geometry::Area(area) => {
+            crate::oesu::Geometry::Area(area) => {
                 // Outer ring + optional inner rings
                 let coords: Vec<_> = area.rings
                     .iter()

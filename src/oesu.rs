@@ -120,7 +120,7 @@ pub struct NodeEntry {
 }
 
 #[derive(Debug)]
-pub struct OsencCell {
+pub struct OesuCell {
     #[allow(dead_code)]
     pub name: String,
     pub native_scale: u32,
@@ -221,7 +221,7 @@ fn read_cstring(c: &mut Cursor<&[u8]>, max: usize) -> Result<String> {
     clippy::cast_possible_truncation, // Cursor positions are bounded by payload_len (≤ u32)
     clippy::similar_names,           // sw/nw/ne/se and resolved_vct/resolved_vet are domain vocab
 )]
-pub fn parse_file(data: &[u8]) -> Result<OsencCell> {
+pub fn parse_file(data: &[u8]) -> Result<OesuCell> {
     let mut name = String::new();
     let mut native_scale: u32 = 0;
     let mut senc_version: u16 = 0;
@@ -582,7 +582,7 @@ pub fn parse_file(data: &[u8]) -> Result<OsencCell> {
         })
         .collect();
 
-    Ok(OsencCell {
+    Ok(OesuCell {
         name,
         native_scale,
         senc_version,

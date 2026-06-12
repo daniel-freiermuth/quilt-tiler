@@ -1,6 +1,6 @@
 mod convert;
 mod georef;
-mod osenc;
+mod oesu;
 mod s57;
 mod style;
 
@@ -159,7 +159,7 @@ fn main() -> Result<()> {
                     return None;
                 }
             };
-            let cell = match osenc::parse_file(&data) {
+            let cell = match oesu::parse_file(&data) {
                 Ok(c) => c,
                 Err(e) => {
                     warn!(path = %path.display(), "skipping: {e}");
@@ -248,7 +248,7 @@ fn main() -> Result<()> {
     let metadata = serde_json::json!({
         "id":          chart_id,
         "name":        chart_name,
-        "description": "OSENC chart converted by osenc2geojson",
+        "description": "OESU chart converted by oesu2geojson",
         "type":        "mapstyleJSON",
         "format":      "pbf",
         "created":     chrono_now(),
