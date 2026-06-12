@@ -398,12 +398,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "oesu"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tracing",
+]
+
+[[package]]
 name = "oesu2geojson"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
  "geojson",
+ "oesu",
  "rayon",
  "serde_json",
  "tracing",

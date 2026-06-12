@@ -8,6 +8,8 @@
 //!   Pass 1 – collect features (records 64/65/80-83) and cell metadata (100).
 //!   Pass 2 – collect VET (96) and VCT (97) tables, then resolve geometry.
 
+mod georef;
+
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
 

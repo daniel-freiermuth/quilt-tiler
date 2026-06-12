@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use geojson::{Feature, FeatureCollection, Geometry, GeometryValue};
 use serde_json::{json, Map, Value as JsonValue};
 
-use crate::oesu::{AttrValue, OesuCell};
+use oesu::{AttrValue, OesuCell};
 use crate::s57::{attribute_acronym, object_acronym};
 
 pub fn cell_to_geojson(
@@ -49,7 +49,7 @@ pub fn cell_to_geojson(
         // SOUNDG MultiPoint is special: tippecanoe drops Z coordinates, losing
         // all depth values. Split each sounding point into a separate Point
         // feature with depth stored as the VALDCO property instead.
-        if let crate::oesu::Geometry::MultiPoint(pts) = &feat.geometry {
+        if let oesu::Geometry::MultiPoint(pts) = &feat.geometry {
             for [lon, lat, depth] in pts {
                 let mut snd_props = props.clone();
                 // Overwrite VALDCO with the actual sounding depth.
@@ -78,15 +78,15 @@ pub fn cell_to_geojson(
 
         // Build GeoJSON geometry for all other types
         let geom = match &feat.geometry {
-            crate::oesu::Geometry::None => None,
+            oesu::Geometry::None => None,
 
-            crate::oesu::Geometry::Point { lon, lat } => Some(Geometry::new(
+            oesu::Geometry::Point { lon, lat } => Some(Geometry::new(
                 GeometryValue::Point { coordinates: vec![*lon, *lat].into() },
             )),
 
-            crate::oesu::Geometry::MultiPoint(_) => unreachable!("handled above"),
+            oesu::Geometry::MultiPoint(_) => unreachable!("handled above"),
 
-            crate::oesu::Geometry::Line(rings) => {
+            oesu::Geometry::Line(rings) => {
                 if rings.len() == 1 {
                     let coords =
                         rings[0].iter().map(|[lon, lat]| vec![*lon, *lat].into()).collect();
@@ -100,7 +100,7 @@ pub fn cell_to_geojson(
                 }
             }
 
-            crate::oesu::Geometry::Area(area) => {
+            oesu::Geometry::Area(area) => {
                 // Outer ring + optional inner rings
                 let coords: Vec<_> = area.rings
                     .iter()

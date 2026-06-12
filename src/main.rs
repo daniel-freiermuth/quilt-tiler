@@ -1,6 +1,4 @@
 mod convert;
-mod georef;
-mod oesu;
 mod s57;
 mod style;
 
