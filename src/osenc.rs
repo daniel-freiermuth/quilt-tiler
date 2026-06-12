@@ -752,7 +752,7 @@ fn build_ring(
 ) -> Vec<[f64; 2]> {
     let mut coords: Vec<[f64; 2]> = Vec::new();
 
-    for [start_rcid, edge_rcid, _end_rcid, _dir] in edge_refs {
+    for [start_rcid, edge_rcid, _end_rcid, dir] in edge_refs {
         // Prepend start connected node
         if let Some(&[lon, lat]) = vct.get(&(*start_rcid as u32))
             && (coords.is_empty() || coords.last() != Some(&[lon, lat])) {
@@ -763,10 +763,9 @@ fn build_ring(
             continue;
         }
 
-        let reverse = *edge_rcid < 0;
-        let eid = edge_rcid.unsigned_abs();
+        let reverse = *dir == 1;
 
-        if let Some(pts) = vet.get(&eid) {
+        if let Some(pts) = vet.get(&(*edge_rcid as u32)) {
             if reverse {
                 coords.extend(pts.iter().rev().copied());
             } else {
