@@ -1,4 +1,103 @@
-// Auto-generated from OpenCPN s57objectclasses.csv and s57attributes.csv
+//! S-57 Electronic Navigational Chart data model.
+//!
+//! Shared types produced by chart parsers (OESU, native S-57, …) and
+//! consumed by tile writers and other chart processing tools.
+
+// ── Feature data model ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum AttrValue {
+    Int(u32),
+    Double(f64),
+    Str(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct Attribute {
+    pub code: u16,
+    pub value: AttrValue,
+}
+
+/// OpenGL primitive type stored in the OSENC `TriPrim` chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriPrimType {
+    Triangles     = 4, // GL_TRIANGLES
+    TriangleStrip = 5, // GL_TRIANGLE_STRIP
+    TriangleFan   = 6, // GL_TRIANGLE_FAN
+}
+
+impl TriPrimType {
+    /// Returns `None` for unrecognised values instead of panicking.
+    #[must_use]
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            4 => Some(Self::Triangles),
+            5 => Some(Self::TriangleStrip),
+            6 => Some(Self::TriangleFan),
+            _ => None,
+        }
+    }
+}
+
+/// One tessellation primitive from the `TriPrim` chain of an area record.
+#[derive(Debug, Clone)]
+pub struct TriPrim {
+    pub prim_type: TriPrimType,
+    /// Bounding box [W, S, E, N] in WGS84 degrees.
+    pub bbox: [f64; 4],
+    /// Vertices as [lon, lat] pairs, resolved from Spherical Mercator.
+    pub vertices: Vec<[f64; 2]>,
+}
+
+/// Fully resolved area geometry.
+#[derive(Debug, Clone)]
+pub struct AreaGeometry {
+    /// Closed coordinate rings.  First ring is the outer boundary;
+    /// subsequent rings are inner rings (holes) or sub-polygons.
+    pub rings: Vec<Vec<[f64; 2]>>,
+    /// Per-ring OGR vertex counts from the LOD-reduced tessellation step.
+    pub vertex_counts: Vec<u32>,
+    /// Pre-tessellated triangle primitives for GPU-accelerated fill rendering.
+    pub tri_prims: Vec<TriPrim>,
+}
+
+#[derive(Debug, Clone)]
+pub enum Geometry {
+    None,
+    Point { lon: f64, lat: f64 },
+    MultiPoint(Vec<[f64; 3]>), // [lon, lat, depth]
+    Line(Vec<Vec<[f64; 2]>>),  // list of strokes, each a list of [lon, lat]
+    Area(AreaGeometry),
+}
+
+#[derive(Debug, Clone)]
+pub struct Feature {
+    pub type_code: u16,
+    pub id: u16,
+    /// `GEO_POINT`=0, `GEO_LINE`=1, `GEO_AREA`=2, `GEO_META`=3 (matches `OpenCPN` `GeoPrim_t`).
+    pub primitive: u8,
+    pub attributes: Vec<Attribute>,
+    pub geometry: Geometry,
+}
+
+// ── Cell ─────────────────────────────────────────────────────────────────────
+
+/// A parsed S-57 navigational chart cell ready for tile encoding.
+///
+/// Common intermediate type between chart parsers (OESU, native S-57, …)
+/// and consumers (tile writer, style generator, …).  Parsers produce it;
+/// consumers read it.
+#[derive(Debug)]
+pub struct S57Cell {
+    pub name: String,
+    pub native_scale: u32,
+    /// Geographic bounds `[west, south, east, north]` in WGS84 degrees.
+    pub bounds: [f64; 4],
+    pub features: Vec<Feature>,
+}
+
+// ── Object-class and attribute code tables ───────────────────────────────────
+// Auto-generated from OpenCPN s57objectclasses.csv and s57attributes.csv.
 
 pub static OBJECT_CLASSES: &[(u16, &str)] = &[
     (1, "ADMARE"),
@@ -566,34 +665,13 @@ pub static ATTRIBUTES: &[(u16, &str)] = &[
     (50000, "catgeo"),
 ];
 
+#[must_use]
 pub fn object_acronym(code: u16) -> Option<&'static str> {
     OBJECT_CLASSES.iter().find(|(c, _)| *c == code).map(|(_, a)| *a)
 }
 
+#[must_use]
 pub fn attribute_acronym(code: u16) -> Option<&'static str> {
     ATTRIBUTES.iter().find(|(c, _)| *c == code).map(|(_, a)| *a)
 }
 
-/// A parsed S-57 navigational chart cell ready for tile encoding.
-///
-/// Common intermediate type between chart parsers (OESU, native S-57, …)
-/// and the tile writer.  Parsers produce it; consumers read it.
-#[derive(Debug)]
-pub struct S57Cell {
-    pub name: String,
-    pub native_scale: u32,
-    /// Geographic bounds `[west, south, east, north]` in WGS84 degrees.
-    pub bounds: [f64; 4],
-    pub features: Vec<oesu::Feature>,
-}
-
-impl From<oesu::OesuCell> for S57Cell {
-    fn from(c: oesu::OesuCell) -> Self {
-        Self {
-            name: c.name,
-            native_scale: c.native_scale,
-            bounds: c.bounds,
-            features: c.features,
-        }
-    }
-}

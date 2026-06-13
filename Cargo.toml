@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "oesu"]
+members = [".", "oesu", "s57"]
 
 [package]
 name = "oesu2geojson"
@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 oesu            = { path = "oesu" }
+s57             = { path = "s57" }
 fast-mvt        = { version = "0.3", features = ["writer"] }
 pmtiles         = { version = "0.23", default-features = false, features = ["write"] }
 martin-tile-utils = "0.7"

@@ -1,0 +1,540 @@
+{
+  "layers": [
+    {
+      "id": "LNDARE",
+      "paint": {
+        "fill-color": "#f5e9c8",
+        "fill-outline-color": "#c8b880"
+      },
+      "source": "enc",
+      "source-layer": "LNDARE",
+      "type": "fill"
+    },
+    {
+      "id": "BUAARE",
+      "paint": {
+        "fill-color": "#e8d8a0",
+        "fill-outline-color": "#c8b880"
+      },
+      "source": "enc",
+      "source-layer": "BUAARE",
+      "type": "fill"
+    },
+    {
+      "id": "DEPARE",
+      "paint": {
+        "fill-color": [
+          "step",
+          [
+            "to-number",
+            [
+              "get",
+              "DRVAL1"
+            ],
+            9999
+          ],
+          "#5b9bd5",
+          3.0,
+          "#aed6f1",
+          10.0,
+          "#d6eaf8"
+        ],
+        "fill-outline-color": "#5dade2"
+      },
+      "source": "enc",
+      "source-layer": "DEPARE",
+      "type": "fill"
+    },
+    {
+      "id": "DRGARE",
+      "paint": {
+        "fill-color": "#a9cce3"
+      },
+      "source": "enc",
+      "source-layer": "DRGARE",
+      "type": "fill"
+    },
+    {
+      "id": "RESARE",
+      "paint": {
+        "fill-color": "rgba(200, 0, 0, 0.08)",
+        "fill-outline-color": "rgba(200, 0, 0, 0.6)"
+      },
+      "source": "enc",
+      "source-layer": "RESARE",
+      "type": "fill"
+    },
+    {
+      "id": "SEAARE",
+      "paint": {
+        "fill-color": "rgba(100, 149, 237, 0.05)",
+        "fill-outline-color": "rgba(100, 149, 237, 0.4)"
+      },
+      "source": "enc",
+      "source-layer": "SEAARE",
+      "type": "fill"
+    },
+    {
+      "id": "COALNE",
+      "paint": {
+        "line-color": "#5d6d7e",
+        "line-width": 1.5
+      },
+      "source": "enc",
+      "source-layer": "COALNE",
+      "type": "line"
+    },
+    {
+      "id": "SLCONS",
+      "paint": {
+        "line-color": "#808b96",
+        "line-width": 1
+      },
+      "source": "enc",
+      "source-layer": "SLCONS",
+      "type": "line"
+    },
+    {
+      "id": "DEPCNT",
+      "paint": {
+        "line-color": "#5dade2",
+        "line-opacity": 0.7,
+        "line-width": 0.5
+      },
+      "source": "enc",
+      "source-layer": "DEPCNT",
+      "type": "line"
+    },
+    {
+      "filter": [
+        "==",
+        [
+          "to-number",
+          [
+            "get",
+            "VALDCO"
+          ],
+          -1.0
+        ],
+        3.0
+      ],
+      "id": "DEPCNT-safety",
+      "paint": {
+        "line-color": "#e74c3c",
+        "line-opacity": 1.0,
+        "line-width": 2.0
+      },
+      "source": "enc",
+      "source-layer": "DEPCNT",
+      "type": "line"
+    },
+    {
+      "id": "NAVLNE",
+      "paint": {
+        "line-color": "#884ea0",
+        "line-dasharray": [
+          4,
+          2
+        ],
+        "line-width": 1
+      },
+      "source": "enc",
+      "source-layer": "NAVLNE",
+      "type": "line"
+    },
+    {
+      "id": "RECTRC",
+      "paint": {
+        "line-color": "#884ea0",
+        "line-width": 1
+      },
+      "source": "enc",
+      "source-layer": "RECTRC",
+      "type": "line"
+    },
+    {
+      "id": "TRAFIC",
+      "paint": {
+        "line-color": "#884ea0",
+        "line-dasharray": [
+          6,
+          3
+        ],
+        "line-width": 1
+      },
+      "source": "enc",
+      "source-layer": "TRAFIC",
+      "type": "line"
+    },
+    {
+      "id": "SOUNDG",
+      "layout": {
+        "symbol-placement": "point",
+        "text-allow-overlap": false,
+        "text-field": [
+          "get",
+          "VALDCO"
+        ],
+        "text-font": [
+          "Roboto Regular"
+        ],
+        "text-size": 10
+      },
+      "minzoom": 13,
+      "paint": {
+        "text-color": "#1a5276",
+        "text-halo-color": "rgba(255,255,255,0.8)",
+        "text-halo-width": 1
+      },
+      "source": "enc",
+      "source-layer": "SOUNDG",
+      "type": "symbol"
+    },
+    {
+      "id": "BOYLAT",
+      "minzoom": 10,
+      "paint": {
+        "circle-color": [
+          "match",
+          [
+            "get",
+            "COLOUR"
+          ],
+          "3",
+          "#e74c3c",
+          "4",
+          "#2ecc71",
+          "#888888"
+        ],
+        "circle-radius": 5,
+        "circle-stroke-color": "#ffffff",
+        "circle-stroke-width": 1
+      },
+      "source": "enc",
+      "source-layer": "BOYLAT",
+      "type": "circle"
+    },
+    {
+      "id": "BOYCAR",
+      "minzoom": 10,
+      "paint": {
+        "circle-color": "#f39c12",
+        "circle-radius": 5,
+        "circle-stroke-color": "#000000",
+        "circle-stroke-width": 1
+      },
+      "source": "enc",
+      "source-layer": "BOYCAR",
+      "type": "circle"
+    },
+    {
+      "id": "BOYSPP",
+      "minzoom": 10,
+      "paint": {
+        "circle-color": "#f1c40f",
+        "circle-radius": 5,
+        "circle-stroke-color": "#000000",
+        "circle-stroke-width": 1
+      },
+      "source": "enc",
+      "source-layer": "BOYSPP",
+      "type": "circle"
+    },
+    {
+      "id": "BCNLAT",
+      "minzoom": 10,
+      "paint": {
+        "circle-color": [
+          "match",
+          [
+            "get",
+            "COLOUR"
+          ],
+          "3",
+          "#e74c3c",
+          "4",
+          "#2ecc71",
+          "#888888"
+        ],
+        "circle-radius": 4,
+        "circle-stroke-color": "#ffffff",
+        "circle-stroke-width": 1
+      },
+      "source": "enc",
+      "source-layer": "BCNLAT",
+      "type": "circle"
+    },
+    {
+      "id": "BCNSPP",
+      "minzoom": 10,
+      "paint": {
+        "circle-color": "#f1c40f",
+        "circle-radius": 4,
+        "circle-stroke-color": "#000000",
+        "circle-stroke-width": 1
+      },
+      "source": "enc",
+      "source-layer": "BCNSPP",
+      "type": "circle"
+    },
+    {
+      "id": "LIGHTS",
+      "minzoom": 10,
+      "paint": {
+        "circle-color": "#f7dc6f",
+        "circle-radius": 4,
+        "circle-stroke-color": "#d4ac0d",
+        "circle-stroke-width": 1.5
+      },
+      "source": "enc",
+      "source-layer": "LIGHTS",
+      "type": "circle"
+    },
+    {
+      "id": "WRECKS",
+      "layout": {
+        "icon-allow-overlap": true,
+        "icon-ignore-placement": true,
+        "icon-image": [
+          "case",
+          [
+            "match",
+            [
+              "get",
+              "CATWRK"
+            ],
+            [
+              2
+            ],
+            true,
+            false
+          ],
+          [
+            "step",
+            [
+              "coalesce",
+              [
+                "get",
+                "VALSOU"
+              ],
+              0
+            ],
+            "K24_Wreck_showing_hull",
+            0,
+            "K40_Obstruction_3",
+            3.001,
+            "K40_Obstruction_2",
+            6.001,
+            "K40_Obstruction_1"
+          ],
+          [
+            "match",
+            [
+              "get",
+              "CATWRK"
+            ],
+            [
+              1
+            ],
+            true,
+            false
+          ],
+          "K29_Wreck_notdangerous",
+          [
+            "match",
+            [
+              "get",
+              "CATWRK"
+            ],
+            [
+              4,
+              5
+            ],
+            true,
+            false
+          ],
+          "K24_Wreck_showing_hull",
+          "K28_Wreck_dangerous_3"
+        ],
+        "icon-size": 1
+      },
+      "minzoom": 13,
+      "paint": {},
+      "source": "enc",
+      "source-layer": "WRECKS",
+      "type": "symbol"
+    },
+    {
+      "filter": [
+        "==",
+        [
+          "geometry-type"
+        ],
+        "Point"
+      ],
+      "id": "OBSTRN",
+      "layout": {
+        "icon-allow-overlap": true,
+        "icon-ignore-placement": true,
+        "icon-image": [
+          "match",
+          [
+            "get",
+            "CATOBS"
+          ],
+          [
+            1
+          ],
+          "K43_1_Submerged_stump",
+          [
+            5
+          ],
+          "K46_Fish_haven_3",
+          [
+            7
+          ],
+          "K31_Foul_ground",
+          [
+            "step",
+            [
+              "coalesce",
+              [
+                "get",
+                "VALSOU"
+              ],
+              0
+            ],
+            "K40_Obstruction_5",
+            0,
+            "K40_Obstruction_3",
+            3.001,
+            "K40_Obstruction_2",
+            6.001,
+            "K40_Obstruction_1"
+          ]
+        ],
+        "icon-size": 1
+      },
+      "minzoom": 13,
+      "paint": {},
+      "source": "enc",
+      "source-layer": "OBSTRN",
+      "type": "symbol"
+    },
+    {
+      "id": "UWTROC",
+      "layout": {
+        "icon-allow-overlap": true,
+        "icon-ignore-placement": true,
+        "icon-image": [
+          "match",
+          [
+            "get",
+            "WATLEV"
+          ],
+          1,
+          "K11b_Rock_uncovers",
+          2,
+          "K10_LandPoint",
+          3,
+          "K13a_Dangerous_underwater_rk",
+          4,
+          "K11b_Rock_uncovers",
+          5,
+          "K12a_Rock_awash",
+          6,
+          "K11b_Rock_uncovers",
+          7,
+          "K11b_Rock_uncovers",
+          "NO_SYMBOL"
+        ],
+        "icon-size": 1
+      },
+      "minzoom": 14,
+      "paint": {},
+      "source": "enc",
+      "source-layer": "UWTROC",
+      "type": "symbol"
+    },
+    {
+      "filter": [
+        "has",
+        "VALSOU"
+      ],
+      "id": "UWTROC-depth",
+      "layout": {
+        "text-anchor": "top-left",
+        "text-field": [
+          "concat",
+          "(",
+          [
+            "to-string",
+            [
+              "get",
+              "VALSOU"
+            ]
+          ],
+          ")"
+        ],
+        "text-font": [
+          "Roboto Italic"
+        ],
+        "text-offset": [
+          0.5,
+          0.35
+        ],
+        "text-optional": true,
+        "text-size": 10
+      },
+      "minzoom": 14,
+      "paint": {
+        "text-color": "#1a3a5c",
+        "text-halo-color": "rgba(255,255,255,0.8)",
+        "text-halo-width": 1
+      },
+      "source": "enc",
+      "source-layer": "UWTROC",
+      "type": "symbol"
+    },
+    {
+      "id": "BOYLAT-label",
+      "layout": {
+        "text-anchor": "top",
+        "text-field": [
+          "get",
+          "OBJNAM"
+        ],
+        "text-font": [
+          "Roboto Regular"
+        ],
+        "text-offset": [
+          0,
+          1.2
+        ],
+        "text-size": 10
+      },
+      "minzoom": 12,
+      "paint": {
+        "text-color": "#1a5276",
+        "text-halo-color": "rgba(255,255,255,0.8)",
+        "text-halo-width": 1
+      },
+      "source": "enc",
+      "source-layer": "BOYLAT",
+      "type": "symbol"
+    }
+  ],
+  "name": "OSENC Chart",
+  "sources": {
+    "enc": {
+      "maxzoom": 18,
+      "minzoom": 8,
+      "tiles": [
+        "http://localhost:3000/chart/{z}/{x}/{y}"
+      ],
+      "type": "vector"
+    }
+  },
+  "sprite": "https://mapresources.skippo.cloud/20260507/sprite/light/sprite",
+  "version": 8
+}

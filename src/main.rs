@@ -5,7 +5,6 @@
 //! into a `PMTiles` v3 archive alongside `<stem>.style.json` and
 //! `<stem>.metadata.json`.
 
-mod s57;
 mod style;
 mod tiles;
 mod zoom;
@@ -118,8 +117,7 @@ fn main() -> Result<()> {
                 }
             };
             match oesu::parse_file(&data) {
-                Ok(oesu_cell) => {
-                    let cell = s57::S57Cell::from(oesu_cell);
+                Ok(cell) => {
                     let z = zoom_from_scale(cell.native_scale);
                     info!(
                         name = %cell.name,

@@ -19,7 +19,7 @@ use pmtiles::{PmTilesWriter, TileCoord, TileType};
 use tracing::info;
 use rayon::prelude::*;
 
-use crate::s57::{attribute_acronym, object_acronym};
+use s57::{attribute_acronym, object_acronym};
 use crate::zoom::zoom_from_scale;
 
 const EXTENT: f64 = 4096.0;
@@ -37,7 +37,7 @@ type EncodedTile = (u64, u8, u32, u32, Vec<u8>);
 /// MVT byte blobs — valid because `Tile { repeated Layer layers = 3 }` is a
 /// protobuf repeated field; concatenating two encoded Tile messages unions
 /// their layers.
-pub fn write_pmtiles(cells: &[crate::s57::S57Cell], output: &Path) -> Result<(u8, u8)> {
+pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path) -> Result<(u8, u8)> {
     // Accumulate raw MVT bytes per TileID; BTreeMap keeps entries in sorted order,
     // matching the PMTiles Hilbert-curve requirement without a separate sort pass.
     let mut tile_bytes: BTreeMap<u64, (TileCoord, Vec<u8>)> = BTreeMap::new();
@@ -107,7 +107,7 @@ pub fn write_pmtiles(cells: &[crate::s57::S57Cell], output: &Path) -> Result<(u8
 /// `(tile_id, zoom, col, row, bytes)` tuples ready for insertion into the merge map.
 ///
 /// Pure (read-only on `cell`) and safe to call from multiple threads simultaneously.
-fn encode_cell_at_zoom(cell: &crate::s57::S57Cell, zoom: u8) -> Result<Vec<EncodedTile>> {
+fn encode_cell_at_zoom(cell: &s57::S57Cell, zoom: u8) -> Result<Vec<EncodedTile>> {
     let [west, south, east, north] = cell.bounds;
     let (col_lo, row_lo, col_hi, row_hi) = bbox_to_xyz(west, south, east, north, zoom);
     let mut result = Vec::new();
@@ -127,7 +127,7 @@ fn encode_cell_at_zoom(cell: &crate::s57::S57Cell, zoom: u8) -> Result<Vec<Encod
 /// Encode all features from `cell` that intersect `tile_wgs84` into a raw MVT
 /// byte blob.  Returns an empty `Vec` when no features land in the tile.
 fn encode_cell_features(
-    cell: &crate::s57::S57Cell,
+    cell: &s57::S57Cell,
     tile_wgs84: [f64; 4],
     tile_merc: [f64; 4],
 ) -> Result<Vec<u8>> {
@@ -196,7 +196,7 @@ fn to_px(lon: f64, lat: f64, merc: [f64; 4]) -> fast_mvt::MvtCoord {
 
 // ── Feature intersection test ────────────────────────────────────────────────
 
-fn feat_intersects(feat: &oesu::Feature, tile: [f64; 4]) -> bool {
+fn feat_intersects(feat: &s57::Feature, tile: [f64; 4]) -> bool {
     let Some((fw, fs, fe, fn_)) = feat_bbox(feat) else {
         return false;
     };
@@ -204,17 +204,17 @@ fn feat_intersects(feat: &oesu::Feature, tile: [f64; 4]) -> bool {
     fw <= tile[2] && fe >= tile[0] && fs <= tile[3] && fn_ >= tile[1]
 }
 
-fn feat_bbox(feat: &oesu::Feature) -> Option<(f64, f64, f64, f64)> {
+fn feat_bbox(feat: &s57::Feature) -> Option<(f64, f64, f64, f64)> {
     match &feat.geometry {
-        oesu::Geometry::None => None,
-        oesu::Geometry::Point { lon, lat } => Some((*lon, *lat, *lon, *lat)),
-        oesu::Geometry::MultiPoint(pts) => {
+        s57::Geometry::None => None,
+        s57::Geometry::Point { lon, lat } => Some((*lon, *lat, *lon, *lat)),
+        s57::Geometry::MultiPoint(pts) => {
             bbox_of(pts.iter().map(|p| (p[0], p[1])))
         }
-        oesu::Geometry::Line(strokes) => {
+        s57::Geometry::Line(strokes) => {
             bbox_of(strokes.iter().flat_map(|s| s.iter()).map(|p| (p[0], p[1])))
         }
-        oesu::Geometry::Area(ag) => {
+        s57::Geometry::Area(ag) => {
             bbox_of(ag.rings.iter().flat_map(|r| r.iter()).map(|p| (p[0], p[1])))
         }
     }
@@ -397,20 +397,20 @@ fn clip_ring_half_plane(
 /// All geometry is clipped to `tile_wgs84`: line strokes are split at tile
 /// boundaries, polygon rings are clipped via Sutherland-Hodgman.  `MultiPoint`
 /// soundings are additionally filtered to their exact containing tile.
-fn to_mvt_features(feat: &oesu::Feature, tile_wgs84: [f64; 4], merc: [f64; 4]) -> Vec<MvtFeature> {
+fn to_mvt_features(feat: &s57::Feature, tile_wgs84: [f64; 4], merc: [f64; 4]) -> Vec<MvtFeature> {
     let props = build_props(&feat.attributes);
 
     match &feat.geometry {
-        oesu::Geometry::None => vec![],
+        s57::Geometry::None => vec![],
 
-        oesu::Geometry::Point { lon, lat } => {
+        s57::Geometry::Point { lon, lat } => {
             let c = to_px(*lon, *lat, merc);
             let mut f = MvtFeature::new(MvtGeometry::Point(MvtPoint::new(c.x, c.y)));
             f.properties = props;
             vec![f]
         }
 
-        oesu::Geometry::MultiPoint(pts) => pts
+        s57::Geometry::MultiPoint(pts) => pts
             .iter()
             .filter(|[lon, lat, _]| {
                 // Each sounding belongs to exactly one tile.
@@ -426,7 +426,7 @@ fn to_mvt_features(feat: &oesu::Feature, tile_wgs84: [f64; 4], merc: [f64; 4]) -
             })
             .collect(),
 
-        oesu::Geometry::Line(strokes) => {
+        s57::Geometry::Line(strokes) => {
             if strokes.is_empty() {
                 return vec![];
             }
@@ -455,7 +455,7 @@ fn to_mvt_features(feat: &oesu::Feature, tile_wgs84: [f64; 4], merc: [f64; 4]) -
             vec![f]
         }
 
-        oesu::Geometry::Area(ag) => {
+        s57::Geometry::Area(ag) => {
             if ag.rings.is_empty() {
                 return vec![];
             }
@@ -485,15 +485,15 @@ fn to_mvt_features(feat: &oesu::Feature, tile_wgs84: [f64; 4], merc: [f64; 4]) -
     }
 }
 
-fn build_props(attrs: &[oesu::Attribute]) -> Vec<(String, MvtValue)> {
+fn build_props(attrs: &[s57::Attribute]) -> Vec<(String, MvtValue)> {
     attrs
         .iter()
         .filter_map(|attr| {
             let key = attribute_acronym(attr.code)?;
             let val = match &attr.value {
-                oesu::AttrValue::Int(i) => MvtValue::UInt(u64::from(*i)),
-                oesu::AttrValue::Double(f) => MvtValue::Double(*f),
-                oesu::AttrValue::Str(s) => MvtValue::String(s.clone()),
+                s57::AttrValue::Int(i) => MvtValue::UInt(u64::from(*i)),
+                s57::AttrValue::Double(f) => MvtValue::Double(*f),
+                s57::AttrValue::Str(s) => MvtValue::String(s.clone()),
             };
             Some((key.to_string(), val))
         })

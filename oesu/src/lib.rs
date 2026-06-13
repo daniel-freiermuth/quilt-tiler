@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::io::{Cursor, Read};
 
 use anyhow::{bail, Context, Result};
+use s57::{AreaGeometry, AttrValue, Attribute, Feature, Geometry, TriPrim, TriPrimType};
 
 // ── Record type constants ────────────────────────────────────────────────────
 
@@ -56,128 +57,51 @@ const CELL_TXTDSC_INFO_FILE_RECORD: u16 = 101;
 
 const SERVER_STATUS_RECORD: u16 = 200;
 
-// ── Public data model ────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-pub enum AttrValue {
-    Int(u32),
-    Double(f64),
-    Str(String),
-}
-
-#[derive(Debug, Clone)]
-pub struct Attribute {
-    pub code: u16,
-    pub value: AttrValue,
-}
-
-/// OpenGL primitive type stored in the `OSENC` `TriPrim` chain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TriPrimType {
-    Triangles     = 4, // GL_TRIANGLES
-    TriangleStrip = 5, // GL_TRIANGLE_STRIP
-    TriangleFan   = 6, // GL_TRIANGLE_FAN
-}
-
-impl TriPrimType {
-    fn from_u8(v: u8) -> Self {
-        match v {
-            4 => Self::Triangles,
-            5 => Self::TriangleStrip,
-            6 => Self::TriangleFan,
-            _ => panic!("unknown TriPrim type {v} — update TriPrimType::from_u8"),
-        }
-    }
-}
-
-/// One tessellation primitive from the `TriPrim` chain of an area record.
-#[derive(Debug, Clone)]
-pub struct TriPrim {
-    pub prim_type: TriPrimType,
-    /// Bounding box [W, S, E, N] in WGS84 degrees.
-    pub bbox: [f64; 4],
-    /// Vertices as [lon, lat] pairs, resolved from Spherical Mercator.
-    pub vertices: Vec<[f64; 2]>,
-}
-
-/// Fully resolved area geometry.
-#[derive(Debug, Clone)]
-pub struct AreaGeometry {
-    /// Closed coordinate rings. First ring is the outer boundary;
-    /// subsequent rings are inner rings (holes) or sub-polygons.
-    pub rings: Vec<Vec<[f64; 2]>>,
-    /// Per-ring OGR vertex counts from the LOD-reduced tessellation step.
-    /// Not directly related to the number of edge-ref triples per ring.
-    pub vertex_counts: Vec<u32>,
-    /// Pre-tessellated triangle primitives for GPU-accelerated fill rendering.
-    pub tri_prims: Vec<TriPrim>,
-}
-
-#[derive(Debug, Clone)]
-pub enum Geometry {
-    None,
-    Point { lon: f64, lat: f64 },
-    MultiPoint(Vec<[f64; 3]>), // [lon, lat, depth]
-    Line(Vec<Vec<[f64; 2]>>),  // list of strokes, each a list of [lon, lat]
-    Area(AreaGeometry),
-}
-
-#[derive(Debug, Clone)]
-pub struct Feature {
-    pub type_code: u16,
-    pub id: u16,
-    /// `GEO_POINT`=0, `GEO_LINE`=1, `GEO_AREA`=2, `GEO_META`=3 (matches `OpenCPN` `GeoPrim_t`)
-    pub primitive: u8,
-    pub attributes: Vec<Attribute>,
-    pub geometry: Geometry,
-}
 
 /// An edge entry from the Vector Edge Node Table (VET, record 96 or 85).
-#[derive(Debug)]
-pub struct EdgeEntry {
+struct EdgeEntry {
     /// Intermediate (non-endpoint) points as [lon, lat] pairs — still in SM at
     /// parse time, resolved to WGS84 after the full record scan.
-    pub points: Vec<[f64; 2]>,
+    points: Vec<[f64; 2]>,
 }
 
 /// A connected node from the Vector Connected Node Table (VCT, record 97 or 86).
-#[derive(Debug)]
-pub struct NodeEntry {
-    pub lon: f64,
-    pub lat: f64,
+struct NodeEntry {
+    lon: f64,
+    lat: f64,
 }
 
-#[derive(Debug)]
-pub struct OesuCell {
-    pub name: String,
-    pub native_scale: u32,
-    pub senc_version: u16,
-    /// Original S-57 chart edition date string (e.g. "20150101").
-    pub publish_date: String,
-    pub edition: u16,
-    /// Date of the last S-57 update applied when this SENC was built.
-    pub update_date: String,
-    pub update_number: u16,
-    /// Date this SENC file was created by the encryption server.
-    pub senc_create_date: String,
-    /// Sounding datum name (e.g. "LAT", "MLLW", "MSL").
-    pub sounding_datum: String,
-    /// Days remaining on the chart license (`expireDaysRemaining` from `SERVER_STATUS`).
-    pub expire_days_remaining: u16,
-    /// Grace days remaining after the primary expiry.
-    pub grace_days_remaining: u16,
-    /// Reference lat/lon computed from `CELL_EXTENT_RECORD` centroid.
-    pub ref_lat: f64,
-    pub ref_lon: f64,
-    /// Geographic bounds [W, S, E, N] in WGS84 degrees.
-    pub bounds: [f64; 4],
-    pub features: Vec<Feature>,
-    /// Valid chart coverage polygons (`CELL_COVR`), in WGS84 [lon, lat].
-    pub coverage: Vec<Vec<[f64; 2]>>,
-    /// Explicitly excluded areas (`CELL_NOCOVR`), in WGS84 [lon, lat].
-    pub no_coverage: Vec<Vec<[f64; 2]>>,
-    /// Embedded text-description files keyed by filename (`CELL_TXTDSC`).
-    pub text_descriptions: HashMap<String, String>,
+#[allow(dead_code)] // fields parsed for cursor advancement; only name/scale/bounds/features are forwarded to S57Cell
+struct OesuCell {
+    name: String,
+    native_scale: u32,
+    senc_version: u16,
+    publish_date: String,
+    edition: u16,
+    update_date: String,
+    update_number: u16,
+    senc_create_date: String,
+    sounding_datum: String,
+    expire_days_remaining: u16,
+    grace_days_remaining: u16,
+    ref_lat: f64,
+    ref_lon: f64,
+    bounds: [f64; 4],
+    features: Vec<Feature>,
+    coverage: Vec<Vec<[f64; 2]>>,
+    no_coverage: Vec<Vec<[f64; 2]>>,
+    text_descriptions: HashMap<String, String>,
+}
+
+impl From<OesuCell> for s57::S57Cell {
+    fn from(c: OesuCell) -> Self {
+        Self {
+            name: c.name,
+            native_scale: c.native_scale,
+            bounds: c.bounds,
+            features: c.features,
+        }
+    }
 }
 
 // ── Internal parse structures ────────────────────────────────────────────────
@@ -279,7 +203,7 @@ fn read_cstring(c: &mut Cursor<&[u8]>, max: usize) -> Result<String> {
     clippy::similar_names,           // sw/nw/ne/se and resolved_vct/resolved_vet are domain vocab
     clippy::missing_errors_doc,      // private binary parser; error cases in record comments
 )]
-pub fn parse_file(data: &[u8]) -> Result<OesuCell> {
+pub fn parse_file(data: &[u8]) -> Result<s57::S57Cell> {
     // ── Prologue: validate SERVER_STATUS + version ───────────────────────────
     let (data, expire_days_remaining, grace_days_remaining) = strip_server_status(data)?;
     let senc_version = read_senc_version(data)?;
@@ -787,7 +711,7 @@ pub fn parse_file(data: &[u8]) -> Result<OesuCell> {
         coverage,
         no_coverage,
         text_descriptions,
-    })
+    }.into())
 }
 
 // ── Prologue helpers ─────────────────────────────────────────────────────────
@@ -1161,16 +1085,23 @@ fn resolve_geometry(
 
             let resolved_tri_prims = tri_prims
                 .into_iter()
-                .map(|tp| TriPrim {
-                    prim_type: TriPrimType::from_u8(tp.prim_type),
-                    bbox: tp.bbox, // already WGS84 (converted at parse time for EXT)
-                    vertices: tp
-                        .vertices
-                        .iter()
-                        .map(|&[e, n]| {
-                            crate::georef::from_sm(f64::from(e), f64::from(n), ref_lat, ref_lon)
-                        })
-                        .collect(),
+                .filter_map(|tp| {
+                    Some(TriPrim {
+                        prim_type: TriPrimType::from_u8(tp.prim_type)?,
+                        bbox: tp.bbox,
+                        vertices: tp
+                            .vertices
+                            .iter()
+                            .map(|&[e, n]| {
+                                crate::georef::from_sm(
+                                    f64::from(e),
+                                    f64::from(n),
+                                    ref_lat,
+                                    ref_lon,
+                                )
+                            })
+                            .collect(),
+                    })
                 })
                 .collect();
 
