@@ -61,7 +61,7 @@ type TileAnnotation = (u8, Vec<usize>);
 pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path, max_zoom: Option<u8>) -> Result<(u8, u8)> {
     let mut tile_bytes: BTreeMap<u64, (TileCoord, Vec<u8>)> = BTreeMap::new();
 
-    let zoom_floor       = cells.iter().map(|c| zoom_from_scale(c.native_scale)).min().unwrap_or(0);
+    let zoom_floor = cells.iter().map(|c| zoom_from_scale(c.native_scale)).min().unwrap_or(0).saturating_sub(2);
     let zoom_ceil_native = cells.iter().map(|c| zoom_from_scale(c.native_scale)).max().unwrap_or(0);
     let zoom_ceil = match max_zoom {
         Some(cap) if cap < zoom_floor => {
