@@ -58,11 +58,18 @@ type TileAnnotation = (u8, Vec<usize>);
 // The three passes share source_map, native_count, and bounds; splitting them
 // into sub-functions would just scatter those locals. Accept the length.
 #[allow(clippy::too_many_lines)]
-pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path) -> Result<(u8, u8)> {
+pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path, max_zoom: Option<u8>) -> Result<(u8, u8)> {
     let mut tile_bytes: BTreeMap<u64, (TileCoord, Vec<u8>)> = BTreeMap::new();
 
-    let zoom_floor = cells.iter().map(|c| zoom_from_scale(c.native_scale)).min().unwrap_or(0);
-    let zoom_ceil  = cells.iter().map(|c| zoom_from_scale(c.native_scale)).max().unwrap_or(0);
+    let zoom_floor       = cells.iter().map(|c| zoom_from_scale(c.native_scale)).min().unwrap_or(0);
+    let zoom_ceil_native = cells.iter().map(|c| zoom_from_scale(c.native_scale)).max().unwrap_or(0);
+    let zoom_ceil = match max_zoom {
+        Some(cap) if cap < zoom_floor => {
+            anyhow::bail!("--max-zoom {cap} is below the data's minimum zoom {zoom_floor}");
+        }
+        Some(cap) => cap.min(zoom_ceil_native),
+        None => zoom_ceil_native,
+    };
     let bounds = cells.iter().fold(
         [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY],
         |mut acc, c| {
@@ -77,7 +84,7 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path) -> Result<(u8, u8)> 
     let [bw, bs, be, bn] = if bounds[0].is_finite() { bounds } else { [-180.0, -85.0, 180.0, 85.0] };
 
     // ── Pass 1: native responsibility map ────────────────────────────────────
-    info!(cells = cells.len(), zoom_floor, zoom_ceil, "pass 1: building native tile map");
+    info!(cells = cells.len(), zoom_floor, zoom_ceil_native, zoom_ceil, "pass 1: building native tile map");
     let pb1 = ProgressBar::new(cells.len() as u64).with_style(spinner_style());
     let mut source_map: HashMap<TileKey, TileAnnotation> = HashMap::new();
     for (i, cell) in cells.iter().enumerate() {
@@ -100,12 +107,12 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path) -> Result<(u8, u8)> 
     // ── Pass 2: bottom-up fill propagation ───────────────────────────────────
     // Sequential sweep; process one zoom level at a time so children at z+1
     // are always fully annotated before we inspect them from z.
-    info!(zoom_floor, zoom_ceil, "pass 2: fill propagation");
-    let pb2 = ProgressBar::new(u64::from(zoom_ceil.saturating_sub(zoom_floor)))
+    info!(zoom_floor, zoom_ceil_native, zoom_ceil, "pass 2: fill propagation");
+    let pb2 = ProgressBar::new(u64::from(zoom_ceil_native.saturating_sub(zoom_floor)))
         .with_style(spinner_style())
         .with_message("pass 2");
     let mut new_entries: Vec<(TileKey, TileAnnotation)> = Vec::new();
-    for z in (zoom_floor..zoom_ceil).rev() {
+    for z in (zoom_floor..zoom_ceil_native).rev() {
         pb2.set_message(format!("pass 2  z={z}"));
         let (col_lo, row_lo, col_hi, row_hi) = bbox_to_xyz(bw, bs, be, bn, z);
         for col in col_lo..=col_hi {
@@ -148,6 +155,13 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path) -> Result<(u8, u8)> 
         filled = source_map.len() - native_count,
         "pass 2 done",
     );
+
+    // Drop tiles above the zoom cap before encoding; they have already served
+    // as fill-down sources for every tile at ≤ zoom_ceil in pass 2.
+    if zoom_ceil < zoom_ceil_native {
+        source_map.retain(|&(z, _, _), _| z <= zoom_ceil);
+        info!(retained = source_map.len(), zoom_ceil, "zoom cap applied");
+    }
 
     // ── Pass 3: parallel encode ───────────────────────────────────────────────
     info!(annotated_tiles = source_map.len(), "pass 3: encoding tiles");

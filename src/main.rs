@@ -93,6 +93,12 @@ struct Args {
     /// Defaults to the output file stem.
     #[arg(long)]
     name: Option<String>,
+
+    /// Cap the output at this zoom level.  Charts natively rendered at higher
+    /// zooms still fill down correctly to `--max-zoom`.  Useful to cut build
+    /// time and output size during development.
+    #[arg(long)]
+    max_zoom: Option<u8>,
 }
 
 // Rayon pool setup + style/metadata output push main past 100 lines. Accept.
@@ -175,7 +181,7 @@ fn main() -> Result<()> {
         },
     );
 
-    let (min_zoom, max_zoom) = tiles::write_pmtiles(&cells, &args.output)?;
+    let (min_zoom, out_max_zoom) = tiles::write_pmtiles(&cells, &args.output, args.max_zoom)?;
 
     // Derive output siblings from the PMTiles path unless overridden.
     let source_id = args
@@ -199,7 +205,7 @@ fn main() -> Result<()> {
         .unwrap_or("style.json")
         .to_owned();
     let style_json =
-        style::build_style(args.safety_depth, args.shoal_depth, &tile_url, min_zoom, max_zoom);
+        style::build_style(args.safety_depth, args.shoal_depth, &tile_url, min_zoom, out_max_zoom);
     std::fs::write(&style_path, &style_json)
         .with_context(|| format!("writing style to {}", style_path.display()))?;
     info!(path = %style_path.display(), "style written");
@@ -214,7 +220,7 @@ fn main() -> Result<()> {
         "format":      "pbf",
         "created":     chrono_now(),
         "minZoom":     min_zoom,
-        "maxZoom":     max_zoom,
+        "maxZoom":     out_max_zoom,
         "bounds":      bounds,
         "tilemapUrl":  tile_url,
         "styleUrl":    style_filename,
