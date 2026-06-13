@@ -19,6 +19,7 @@ use martin_tile_utils::{bbox_to_xyz, wgs84_to_webmercator, xyz_to_bbox};
 use pmtiles::{PmTilesWriter, TileCoord, TileType};
 use tracing::{debug, info};
 use rayon::prelude::*;
+use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
 
 use s57::{attribute_acronym, object_acronym};
 use crate::zoom::zoom_from_scale;
@@ -77,6 +78,7 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path) -> Result<(u8, u8)> 
 
     // ── Pass 1: native responsibility map ────────────────────────────────────
     info!(cells = cells.len(), zoom_floor, zoom_ceil, "pass 1: building native tile map");
+    let pb1 = ProgressBar::new(cells.len() as u64).with_style(spinner_style());
     let mut source_map: HashMap<TileKey, TileAnnotation> = HashMap::new();
     for (i, cell) in cells.iter().enumerate() {
         let z = zoom_from_scale(cell.native_scale);
@@ -89,7 +91,9 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path) -> Result<(u8, u8)> 
                     .1.push(i);
             }
         }
+        pb1.inc(1);
     }
+    pb1.finish_and_clear();
     let native_count = source_map.len();
     info!(native_tiles = native_count, "pass 1 done");
 
@@ -97,8 +101,12 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path) -> Result<(u8, u8)> 
     // Sequential sweep; process one zoom level at a time so children at z+1
     // are always fully annotated before we inspect them from z.
     info!(zoom_floor, zoom_ceil, "pass 2: fill propagation");
+    let pb2 = ProgressBar::new(u64::from(zoom_ceil.saturating_sub(zoom_floor)))
+        .with_style(spinner_style())
+        .with_message("pass 2");
     let mut new_entries: Vec<(TileKey, TileAnnotation)> = Vec::new();
     for z in (zoom_floor..zoom_ceil).rev() {
+        pb2.set_message(format!("pass 2  z={z}"));
         let (col_lo, row_lo, col_hi, row_hi) = bbox_to_xyz(bw, bs, be, bn, z);
         for col in col_lo..=col_hi {
             for row in row_lo..=row_hi {
@@ -132,7 +140,9 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path) -> Result<(u8, u8)> 
         let added = new_entries.len();
         source_map.extend(std::mem::take(&mut new_entries));
         debug!(z, added, total = source_map.len(), "pass 2: zoom done");
+        pb2.inc(1);
     }
+    pb2.finish_and_clear();
     info!(
         annotated_tiles = source_map.len(),
         filled = source_map.len() - native_count,
@@ -141,8 +151,10 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path) -> Result<(u8, u8)> 
 
     // ── Pass 3: parallel encode ───────────────────────────────────────────────
     info!(annotated_tiles = source_map.len(), "pass 3: encoding tiles");
+    let pb3 = ProgressBar::new(source_map.len() as u64).with_style(bar_style());
     let tiles: Vec<EncodedTile> = source_map
         .par_iter()
+        .progress_with(pb3.clone())
         .map(|(&(z, col, row), (_, idxs))| -> Result<Option<EncodedTile>> {
             let tile_wgs84 = xyz_to_bbox(z, col, row, col, row);
             let tile_merc  = tile_mercator_bbox(tile_wgs84);
@@ -157,6 +169,7 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path) -> Result<(u8, u8)> 
         .into_iter()
         .flatten()
         .collect();
+    pb3.finish_and_clear();
     info!(tiles = tiles.len(), "pass 3 done");
 
     for (id, z, col, row, bytes) in tiles {
@@ -174,9 +187,12 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path) -> Result<(u8, u8)> 
         .create(file)
         .context("creating PMTiles writer")?;
 
+    let pb4 = ProgressBar::new(tile_bytes.len() as u64).with_style(bar_style());
     for (_, (coord, bytes)) in tile_bytes {
         writer.add_tile(coord, &bytes).context("writing tile")?;
+        pb4.inc(1);
     }
+    pb4.finish_and_clear();
     writer.finalize().context("finalizing PMTiles")?;
 
     info!(output = %output.display(), "PMTiles written");
@@ -205,6 +221,27 @@ fn find_native_ancestor(
         }
     }
     None
+}
+
+// ── Progress bar styles ──────────────────────────────────────────────────────
+
+/// Counter spinner for fast passes (pass 1, pass 2): shows elapsed + pos/len.
+#[allow(clippy::literal_string_with_formatting_args)] // indicatif template syntax, not format args
+fn spinner_style() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "  {spinner:.green} {msg:20}  {elapsed_precise}  {pos}/{len}",
+    )
+    .unwrap_or_else(|_| ProgressStyle::default_spinner())
+}
+
+/// Wide progress bar for slow passes (pass 3, `PMTiles` write): adds rate + ETA.
+#[allow(clippy::literal_string_with_formatting_args)] // indicatif template syntax, not format args
+fn bar_style() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "  {spinner:.green} {msg:20}  {elapsed_precise}  [{wide_bar:.cyan/blue}]  {human_pos}/{human_len}  ({per_sec}, {eta})",
+    )
+    .unwrap_or_else(|_| ProgressStyle::default_bar())
+    .progress_chars("=>-")
 }
 
 /// Encode all features from `cell` that intersect `tile_wgs84` into a raw MVT
