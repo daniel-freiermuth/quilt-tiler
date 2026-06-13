@@ -58,11 +58,14 @@ type TileAnnotation = (u8, Vec<usize>);
 // The three passes share source_map, native_count, and bounds; splitting them
 // into sub-functions would just scatter those locals. Accept the length.
 #[allow(clippy::too_many_lines)]
-pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path, max_zoom: Option<u8>) -> Result<(u8, u8)> {
+pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path, max_zoom: Option<u8>, zoom_offset: f64) -> Result<(u8, u8)> {
     let mut tile_bytes: BTreeMap<u64, (TileCoord, Vec<u8>)> = BTreeMap::new();
 
-    let zoom_floor = cells.iter().map(|c| zoom_from_scale(c.native_scale)).min().unwrap_or(0).saturating_sub(2);
-    let zoom_ceil_native = cells.iter().map(|c| zoom_from_scale(c.native_scale)).max().unwrap_or(0);
+    // Scale-to-zoom with user offset applied and result clamped to [0, 22].
+    let zoom = |scale: u32| zoom_from_scale(scale, zoom_offset);
+
+    let zoom_floor       = cells.iter().map(|c| zoom(c.native_scale)).min().unwrap_or(0).saturating_sub(2);
+    let zoom_ceil_native = cells.iter().map(|c| zoom(c.native_scale)).max().unwrap_or(0);
     let zoom_ceil = match max_zoom {
         Some(cap) if cap < zoom_floor => {
             anyhow::bail!("--max-zoom {cap} is below the data's minimum zoom {zoom_floor}");
@@ -88,7 +91,7 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path, max_zoom: Option<u8>
     let pb1 = ProgressBar::new(cells.len() as u64).with_style(spinner_style());
     let mut source_map: HashMap<TileKey, TileAnnotation> = HashMap::new();
     for (i, cell) in cells.iter().enumerate() {
-        let z = zoom_from_scale(cell.native_scale);
+        let z = zoom(cell.native_scale);
         let [west, south, east, north] = cell.bounds;
         let (col_lo, row_lo, col_hi, row_hi) = bbox_to_xyz(west, south, east, north, z);
         for col in col_lo..=col_hi {

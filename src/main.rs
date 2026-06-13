@@ -99,6 +99,12 @@ struct Args {
     /// time and output size during development.
     #[arg(long)]
     max_zoom: Option<u8>,
+
+    /// Shift every chart's native zoom level by this amount (positive = finer,
+    /// negative = coarser).  Applied in log₂ space before flooring, so fractional
+    /// values shift the scale breakpoints between zoom levels.
+    #[arg(long, default_value_t = 0.0)]
+    zoom_offset: f64,
 }
 
 // Rayon pool setup + style/metadata output push main past 100 lines. Accept.
@@ -149,7 +155,7 @@ fn main() -> Result<()> {
             };
             match oesu::parse_file(&data) {
                 Ok(cell) => {
-                    let z = zoom_from_scale(cell.native_scale);
+                    let z = zoom_from_scale(cell.native_scale, args.zoom_offset);
                     info!(
                         name = %cell.name,
                         scale = cell.native_scale,
@@ -181,7 +187,7 @@ fn main() -> Result<()> {
         },
     );
 
-    let (min_zoom, out_max_zoom) = tiles::write_pmtiles(&cells, &args.output, args.max_zoom)?;
+    let (min_zoom, out_max_zoom) = tiles::write_pmtiles(&cells, &args.output, args.max_zoom, args.zoom_offset)?;
 
     // Derive output siblings from the PMTiles path unless overridden.
     let source_id = args
