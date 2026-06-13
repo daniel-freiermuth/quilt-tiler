@@ -4,8 +4,10 @@
 //! Each `GeoJSON` feature includes:
 //!   - geometry: Point / `MultiPoint` / `LineString` / Polygon
 //!   - properties: decoded S-57 attributes by acronym name
-//!   - properties\["layer"\]: the S-57 acronym (for tippecanoe layer assignment)
-//!   - `"tippecanoe"`: `{"layer": "<ACRONYM>"}`
+//!   - properties["layer"]: the S-57 acronym (for tippecanoe layer assignment)
+//!   - top-level `"tippecanoe"`: `{"layer": "<ACRONYM>", "minzoom": N}` — placed
+//!     in `foreign_members` (Feature top level), NOT inside properties, so that
+//!     tippecanoe correctly gates feature inclusion by zoom level.
 
 use std::collections::HashMap;
 
@@ -42,9 +44,10 @@ pub fn cell_to_geojson(
             props.insert(key, val);
         }
 
-        // tippecanoe layer + minzoom hint (maxzoom added later by quilting).
+        // tippecanoe zoom control — must be a top-level Feature key (foreign_members),
+        // NOT inside properties; tippecanoe only reads minzoom/maxzoom gating from
+        // the feature top level, ignoring the same keys when nested inside properties.
         let tippecanoe = json!({ "layer": acronym, "minzoom": minzoom });
-        props.insert("tippecanoe".into(), tippecanoe);
 
         // Build GeoJSON geometry.
         // SOUNDG MultiPoint is special: tippecanoe drops Z coordinates, losing
@@ -70,7 +73,11 @@ pub fn cell_to_geojson(
                     })),
                     id: None,
                     properties: Some(snd_props),
-                    foreign_members: None,
+                    foreign_members: Some({
+                        let mut fm = Map::new();
+                        fm.insert("tippecanoe".into(), tippecanoe.clone());
+                        fm
+                    }),
                 };
                 by_layer.entry(acronym.clone()).or_default().push(feature);
             }
@@ -120,7 +127,11 @@ pub fn cell_to_geojson(
             geometry: geom,
             id: None,
             properties: Some(props),
-            foreign_members: None,
+            foreign_members: Some({
+                let mut fm = Map::new();
+                fm.insert("tippecanoe".into(), tippecanoe);
+                fm
+            }),
         };
 
         by_layer.entry(acronym).or_default().push(feature);

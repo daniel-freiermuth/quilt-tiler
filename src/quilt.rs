@@ -8,18 +8,26 @@
 //! # Processing order
 //!
 //! Charts are sorted finest → coarsest (smallest `native_scale` number first).
-//! The `covered_zones` list accumulates each chart's effective COVR as we go.
+//! The `covered_zones` list accumulates each chart's feature bounding box as we go.
 //! When processing a coarser chart its features are tested against all already-
-//! seen finer zones:
+//! seen finer zones, and the **coarsest covering zone** (lowest minzoom > feature's
+//! own minzoom) determines `maxzoom`. This ensures a minzoom=12 feature in an area
+//! covered by both a minzoom=14 and a minzoom=15 chart hands off at zoom 13 (when
+//! the minzoom=14 chart kicks in) — not at zoom 14, which would leave both the
+//! minzoom=12 and minzoom=14 charts visible simultaneously at zoom 14.
 //!
-//! - **Polygon features**: split across zone boundaries with `BooleanOps` so
-//!   each piece gets the exact `maxzoom` for its geographic sub-area.
-//! - **All other types**: representative-point containment test (centroid/
-//!   midpoint); the whole feature gets a single `maxzoom`.
-//! - **Open territory** (no finer chart covers the point): no `maxzoom` — the
-//!   feature is visible at all zoom levels above its `minzoom`.
-
-use geo::{BooleanOps, BoundingRect, Contains, Coord, LineString, MultiPolygon, Point, Polygon, Rect};
+//! Zone geometry is the chart's feature **bounding box** (not the COVR polygon)
+//! because COVR only covers navigable water; coastline features (COALNE) run
+//! along the shore and land — outside the water-only COVR but inside the chart's
+//! spatial extent. Using the bbox ensures those features are correctly attributed.
+//!
+//! - **Polygon features**: split across zone boundaries with `BooleanOps` (zones
+//!   processed coarsest-first so each piece gets the right `maxzoom`).
+//! - **Line features**: intersection test — if any segment of the line crosses
+//!   into a finer zone the whole feature gets the coarsest covering zone's maxzoom.
+//! - **Point and other types**: containment test on the representative point.
+//! - **Open territory** (no finer zone covers the geometry): no `maxzoom`.
+use geo::{BooleanOps, BoundingRect, Contains, Coord, Intersects, LineString, MultiPolygon, Point, Polygon, Rect};
 use geojson::{Feature, Geometry, GeometryValue, Position};
 use serde_json::json;
 
@@ -44,20 +52,42 @@ impl CoveredZone {
 
 // ── Public functions ─────────────────────────────────────────────────────────
 
-/// Build the effective coverage polygon for one chart:
-///   `effective = union(COVR polygons) − union(NOCOVR polygons)`
-pub fn build_effective_covr(
-    coverage:    &[Vec<[f64; 2]>],
+/// Build the effective zone polygon for one chart.
+///
+/// The zone represents "everywhere this chart has features" — used to detect
+/// that a coarser chart's feature falls in an area already covered by this
+/// finer one. The COVR polygon covers only navigable water, which misses
+/// coastline (COALNE) features running along the shore or on land. Using the
+/// chart's overall feature bounding box as the zone correctly captures those.
+///
+/// NOCOVR areas are subtracted so classified/restricted sub-areas don't
+/// suppress coarser features unnecessarily.
+///
+/// `bounds` is `[west, south, east, north]` in WGS84 degrees.
+pub fn build_effective_zone(
+    bounds:      [f64; 4],
     no_coverage: &[Vec<[f64; 2]>],
 ) -> MultiPolygon<f64> {
-    if coverage.is_empty() {
+    let [west, south, east, north] = bounds;
+    // Guard against degenerate charts with no spatial extent.
+    if west >= east || south >= north {
         return MultiPolygon::new(vec![]);
     }
-    let covr = rings_to_multipoly(coverage);
+    let bbox_poly = Polygon::new(
+        LineString::from(vec![
+            Coord { x: west,  y: south },
+            Coord { x: east,  y: south },
+            Coord { x: east,  y: north },
+            Coord { x: west,  y: north },
+            Coord { x: west,  y: south },
+        ]),
+        vec![],
+    );
+    let zone = MultiPolygon::new(vec![bbox_poly]);
     if no_coverage.is_empty() {
-        return covr;
+        return zone;
     }
-    covr.difference(&rings_to_multipoly(no_coverage))
+    zone.difference(&rings_to_multipoly(no_coverage))
 }
 
 /// Convert COVR/NOCOVR ring lists (WGS84 `[lon, lat]` pairs) to a
@@ -85,22 +115,54 @@ pub fn rings_to_multipoly(rings: &[Vec<[f64; 2]>]) -> MultiPolygon<f64> {
 ///
 /// - Polygon features straddling a zone boundary are split into pieces, each
 ///   with its own `maxzoom`.
-/// - All other geometry types use a representative-point containment test.
-/// - Features whose representative point is in open territory are returned
-///   unchanged (their `minzoom` was already stamped by `cell_to_geojson`).
+/// - Line features use a full intersection test so that long coastlines
+///   spanning many small harbour COVRs are correctly handed off.
+/// - Point and other types use a representative-point containment test.
+/// - Features in open territory (no finer zone covers the geometry) are
+///   returned unchanged.
 pub fn quilt_feature(feat: Feature, covered_zones: &[CoveredZone]) -> Vec<Feature> {
-    // Polygon: full BooleanOps split across zone boundaries.
-    if !covered_zones.is_empty() {
-        if let Some(geom) = &feat.geometry {
-            if let GeometryValue::Polygon { coordinates: rings } = &geom.value {
+    if covered_zones.is_empty() {
+        return vec![feat];
+    }
+    if let Some(geom) = &feat.geometry {
+        match &geom.value {
+            // Polygon: split across zone boundaries so each piece gets its own maxzoom.
+            GeometryValue::Polygon { coordinates: rings } => {
                 if let Some(poly) = geojson_rings_to_geo_poly(rings) {
                     return split_and_annotate(feat, poly, covered_zones);
                 }
             }
+            // Line: intersection test — a long coastline can cross many harbour COVRs;
+            // testing only the midpoint would miss most of them.
+            GeometryValue::LineString { coordinates: pts } => {
+                let line = pts_to_linestring(pts);
+                if let Some(mz) = maxzoom_for_line(covered_zones, &line) {
+                    let mut f = feat;
+                    add_maxzoom(&mut f, mz);
+                    return vec![f];
+                }
+                return vec![feat];
+            }
+            GeometryValue::MultiLineString { coordinates: lines } => {
+                // Finest zone that intersects any component line wins.
+                let mz = lines
+                    .iter()
+                    .filter_map(|pts| {
+                        let line = pts_to_linestring(pts);
+                        maxzoom_for_line(covered_zones, &line)
+                    })
+                    .max();
+                if let Some(mz) = mz {
+                    let mut f = feat;
+                    add_maxzoom(&mut f, mz);
+                    return vec![f];
+                }
+                return vec![feat];
+            }
+            _ => {}
         }
     }
-
-    // Non-polygon (or no zones yet): centroid/midpoint containment test.
+    // Point, MultiPoint, and unrecognised types: representative-point test.
     if let Some(pt) = representative_point(&feat) {
         if let Some(mz) = maxzoom_for_point(covered_zones, &pt) {
             let mut f = feat;
@@ -111,11 +173,12 @@ pub fn quilt_feature(feat: Feature, covered_zones: &[CoveredZone]) -> Vec<Featur
     vec![feat]
 }
 
-/// Add a `maxzoom` entry to a feature's existing `tippecanoe` property.
-/// `minzoom` is already present from `cell_to_geojson`.
+/// Add a `maxzoom` entry to a feature's top-level `tippecanoe` object.
+/// The object lives in `foreign_members` (not `properties`) so tippecanoe
+/// picks it up for zoom gating.
 pub fn add_maxzoom(feature: &mut Feature, maxzoom: u8) {
-    let props = feature.properties.get_or_insert_with(serde_json::Map::new);
-    let tc = props.entry("tippecanoe").or_insert_with(|| json!({}));
+    let fm = feature.foreign_members.get_or_insert_with(serde_json::Map::new);
+    let tc = fm.entry("tippecanoe").or_insert_with(|| json!({}));
     if let Some(obj) = tc.as_object_mut() {
         obj.insert("maxzoom".into(), json!(maxzoom));
     }
@@ -185,8 +248,14 @@ fn ring_centroid(ring: &[Position]) -> Option<Point<f64>> {
 /// Return the `maxzoom` value for the finest covered zone that contains `pt`,
 /// or `None` if the point is in open territory (no finer chart covers it).
 ///
-/// When multiple zones overlap the point, the finest one (highest `minzoom`)
-/// wins — it is the last chart to hand off ownership at that location.
+/// Return the `maxzoom` value for the coarsest covered zone that contains `pt`,
+/// or `None` if the point is in open territory.
+///
+/// The coarsest covering zone (lowest `minzoom` > feature's own `minzoom`) wins
+/// because that is the "next finer chart" this feature hands off to. Using the
+/// finest zone would over-cap intermediate-scale features (e.g. a minzoom=12
+/// feature would be suppressed until zoom 14 when a minzoom=15 chart covers it,
+/// but the minzoom=14 chart already handles zoom 14 — so the cap should be 13).
 fn maxzoom_for_point(zones: &[CoveredZone], pt: &Point<f64>) -> Option<u8> {
     let (px, py) = (pt.x(), pt.y());
     zones
@@ -198,8 +267,29 @@ fn maxzoom_for_point(zones: &[CoveredZone], pt: &Point<f64>) -> Option<u8> {
                 && z.poly.contains(pt)
         })
         .map(|z| z.minzoom)
-        .max()
+        .min()                   // coarsest covering zone = first chart to take over
         .map(|mz| mz.saturating_sub(1))
+}
+
+/// Return the `maxzoom` for the coarsest covered zone that intersects `line`.
+/// See `maxzoom_for_point` for why `min` (not `max`) is the right aggregation.
+fn maxzoom_for_line(zones: &[CoveredZone], line: &LineString<f64>) -> Option<u8> {
+    let line_bbox = line.bounding_rect()?;
+    zones
+        .iter()
+        .filter(|z| rects_overlap(&line_bbox, &z.bbox) && z.poly.intersects(line))
+        .map(|z| z.minzoom)
+        .min()                   // coarsest covering zone = first chart to take over
+        .map(|mz| mz.saturating_sub(1))
+}
+
+/// Convert GeoJSON `Position` list to a `geo::LineString`.
+fn pts_to_linestring(pts: &[Position]) -> LineString<f64> {
+    LineString::from_iter(
+        pts.iter()
+            .filter(|p| p.len() >= 2)
+            .map(|p| Coord { x: p[0], y: p[1] }),
+    )
 }
 
 // ── Polygon split ─────────────────────────────────────────────────────────────
@@ -234,12 +324,17 @@ fn split_and_annotate(
         .collect()
 }
 
-/// Split `poly` across all zone boundaries. Returns `(clipped_piece, maxzoom)`
-/// pairs. Zones are processed finest-first (highest `minzoom` first) so the
-/// finest chart's boundary takes precedence at intersections.
+/// Split `poly` across zone boundaries. Returns `(piece, maxzoom)` pairs.
 ///
-/// The last entry (if non-empty) always has `maxzoom = None` — it is the
-/// open-territory remainder visible at all zoom levels above the chart's minzoom.
+/// Zones are processed **coarsest-first** (ascending `minzoom`). This ensures
+/// that a polygon area covered by both a coarser fine chart (mz=14) and a finer
+/// fine chart (mz=15) is claimed by the coarser one first (maxzoom=13), rather
+/// than by the finer one (maxzoom=14). Without this, intermediate-scale polygons
+/// would remain visible at the zoom where the coarser fine chart already handles
+/// the area, producing two overlapping layers.
+///
+/// The last entry (if non-empty) has `maxzoom = None` — open territory visible
+/// at all zoom levels above the chart's `minzoom`.
 fn split_polygon_for_zones(
     poly:  Polygon<f64>,
     zones: &[CoveredZone],
@@ -247,14 +342,13 @@ fn split_polygon_for_zones(
     let mut remaining = MultiPolygon::new(vec![poly]);
     let mut result: Vec<(MultiPolygon<f64>, Option<u8>)> = Vec::new();
 
-    // `zones` is already in finest-first order (descending minzoom) because
-    // `main` inserts charts in finest→coarsest order. No re-sort needed.
-    for zone in zones.iter() {
+    // `zones` is in finest-first order (descending minzoom); reverse to get
+    // coarsest-first (ascending minzoom) so each piece gets the right maxzoom.
+    for zone in zones.iter().rev() {
         if remaining.0.is_empty() {
             break;
         }
-        // Bbox pretest: skip zones with no geographic overlap — avoids almost
-        // all BooleanOps calls for charts whose COVR doesn't touch this polygon.
+        // Bbox pretest: skip zones with no geographic overlap.
         if let Some(rb) = remaining.bounding_rect() {
             if !rects_overlap(&rb, &zone.bbox) {
                 continue;

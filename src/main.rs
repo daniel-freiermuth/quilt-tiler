@@ -122,7 +122,6 @@ type LayerMap = std::collections::HashMap<String, Vec<geojson::Feature>>;
 struct ParsedChart {
     bounds:      [f64; 4],
     native_scale: u32,
-    coverage:    Vec<Vec<[f64; 2]>>,
     no_coverage:  Vec<Vec<[f64; 2]>>,
     layers:      LayerMap,
 }
@@ -189,8 +188,8 @@ fn main() -> Result<()> {
                 .into_iter()
                 .map(|(k, fc)| (k, fc.features))
                 .collect();
-            let oesu::OesuCell { coverage, no_coverage, .. } = cell;
-            Some(ParsedChart { bounds, native_scale, coverage, no_coverage, layers: layer_map })
+            let oesu::OesuCell { no_coverage, .. } = cell;
+            Some(ParsedChart { bounds, native_scale, no_coverage, layers: layer_map })
         })
         .collect();
 
@@ -212,8 +211,8 @@ fn main() -> Result<()> {
         combined_bounds[2] = combined_bounds[2].max(chart.bounds[2]);
         combined_bounds[3] = combined_bounds[3].max(chart.bounds[3]);
 
-        let chart_minzoom   = zoom_from_scale(chart.native_scale);
-        let effective_covr  = quilt::build_effective_covr(&chart.coverage, &chart.no_coverage);
+        let chart_minzoom = zoom_from_scale(chart.native_scale);
+        let effective_zone = quilt::build_effective_zone(chart.bounds, &chart.no_coverage);
 
         for (acronym, features) in chart.layers {
             let layer = all_layers.entry(acronym).or_default();
@@ -222,7 +221,7 @@ fn main() -> Result<()> {
             }
         }
 
-        if let Some(zone) = quilt::CoveredZone::new(effective_covr, chart_minzoom) {
+        if let Some(zone) = quilt::CoveredZone::new(effective_zone, chart_minzoom) {
             covered_zones.push(zone);
         }
     }
