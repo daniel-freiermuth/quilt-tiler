@@ -146,8 +146,8 @@ fn tile_mercator_bbox(wgs84: [f64; 4]) -> [f64; 4] {
 }
 
 /// Project `(lon, lat)` WGS84 to tile pixel coordinates `(x, y)` in
-/// `[0, 4096)` space. Coordinates outside the tile extent are valid — the
-/// MVT spec allows it, and `MapLibre` GL clips client-side.
+/// `[0, EXTENT]` space.  Geometry is clipped to the tile bbox before reaching
+/// this function, so all projected coordinates stay within the valid range.
 #[allow(clippy::cast_possible_truncation)] // deliberate floor-truncation
 fn to_px(lon: f64, lat: f64, merc: [f64; 4]) -> fast_mvt::MvtCoord {
     let (x_m, y_m) = wgs84_to_webmercator(lon, lat);
@@ -202,12 +202,163 @@ fn bbox_of(mut pts: impl Iterator<Item = (f64, f64)>) -> Option<(f64, f64, f64, 
     Some((w, s, e, n))
 }
 
+// ── Geometry clipping ─────────────────────────────────────────────────────────
+
+/// Clip a polyline stroke to the rectangle `bbox = [west, south, east, north]`.
+///
+/// Uses Liang-Barsky per-segment clipping.  A stroke that enters and exits the
+/// bbox multiple times is split into separate sub-strokes; sub-strokes with
+/// fewer than 2 vertices are discarded.
+fn clip_stroke(stroke: &[[f64; 2]], bbox: [f64; 4]) -> Vec<Vec<[f64; 2]>> {
+    let [west, south, east, north] = bbox;
+    let mut result: Vec<Vec<[f64; 2]>> = Vec::new();
+    let mut current: Vec<[f64; 2]> = Vec::new();
+
+    for seg in stroke.windows(2) {
+        let p0 = seg[0];
+        let p1 = seg[1];
+        match clip_segment_lb(p0, p1, west, south, east, north) {
+            None => {
+                // Segment fully outside — flush current sub-stroke if valid.
+                if current.len() >= 2 {
+                    result.push(std::mem::take(&mut current));
+                } else {
+                    current.clear();
+                }
+            }
+            Some((q0, q1)) => {
+                if current.is_empty() {
+                    current.push(q0);
+                } else {
+                    let last = *current.last().expect("non-empty");
+                    // Clipped start differs from last accumulated point: stroke left
+                    // the bbox and re-entered — start a new sub-stroke.
+                    if (q0[0] - last[0]).abs() > f64::EPSILON
+                        || (q0[1] - last[1]).abs() > f64::EPSILON
+                    {
+                        if current.len() >= 2 {
+                            result.push(std::mem::take(&mut current));
+                        } else {
+                            current.clear();
+                        }
+                        current.push(q0);
+                    }
+                }
+                current.push(q1);
+            }
+        }
+    }
+    if current.len() >= 2 {
+        result.push(current);
+    }
+    result
+}
+
+/// Liang-Barsky segment clipping against an axis-aligned rectangle.
+/// Returns the clipped endpoints `(q0, q1)`, or `None` when fully outside.
+#[allow(clippy::many_single_char_names)]
+fn clip_segment_lb(
+    p0: [f64; 2],
+    p1: [f64; 2],
+    west: f64,
+    south: f64,
+    east: f64,
+    north: f64,
+) -> Option<([f64; 2], [f64; 2])> {
+    let dx = p1[0] - p0[0];
+    let dy = p1[1] - p0[1];
+    let mut t0: f64 = 0.0;
+    let mut t1: f64 = 1.0;
+    // Each half-plane: p*t ≤ q — entering when p < 0, exiting when p > 0.
+    for (p, q) in [
+        (-dx, p0[0] - west),  // x ≥ west
+        (dx, east - p0[0]),   // x ≤ east
+        (-dy, p0[1] - south), // y ≥ south
+        (dy, north - p0[1]),  // y ≤ north
+    ] {
+        if p == 0.0 {
+            if q < 0.0 {
+                return None; // parallel and outside
+            }
+        } else {
+            let t = q / p;
+            if p < 0.0 {
+                t0 = t0.max(t); // entering half-plane
+            } else {
+                t1 = t1.min(t); // exiting half-plane
+            }
+            if t0 > t1 {
+                return None; // entry past exit — fully outside
+            }
+        }
+    }
+    Some((
+        [t0.mul_add(dx, p0[0]), t0.mul_add(dy, p0[1])],
+        [t1.mul_add(dx, p0[0]), t1.mul_add(dy, p0[1])],
+    ))
+}
+
+/// Clip a polygon ring to the rectangle `bbox = [west, south, east, north]`
+/// using Sutherland-Hodgman.  Returns the clipped ring; empty when the ring
+/// is entirely outside.  The ring need not be explicitly closed.
+fn clip_ring(ring: &[[f64; 2]], bbox: [f64; 4]) -> Vec<[f64; 2]> {
+    let [west, south, east, north] = bbox;
+    let r = clip_ring_half_plane(ring, |p| p[0] >= west, |a, b| {
+        let t = (west - a[0]) / (b[0] - a[0]);
+        [west, t.mul_add(b[1] - a[1], a[1])]
+    });
+    let r = clip_ring_half_plane(&r, |p| p[0] <= east, |a, b| {
+        let t = (east - a[0]) / (b[0] - a[0]);
+        [east, t.mul_add(b[1] - a[1], a[1])]
+    });
+    let r = clip_ring_half_plane(&r, |p| p[1] >= south, |a, b| {
+        let t = (south - a[1]) / (b[1] - a[1]);
+        [t.mul_add(b[0] - a[0], a[0]), south]
+    });
+    clip_ring_half_plane(&r, |p| p[1] <= north, |a, b| {
+        let t = (north - a[1]) / (b[1] - a[1]);
+        [t.mul_add(b[0] - a[0], a[0]), north]
+    })
+}
+
+/// Sutherland-Hodgman single half-plane clipping pass.
+///
+/// `inside(p)` — true when `p` is on the visible side of the clip edge.
+/// `intersect(a, b)` — intersection of segment `a→b` with the clip edge;
+/// called only when exactly one of `a`, `b` is inside.
+fn clip_ring_half_plane(
+    ring: &[[f64; 2]],
+    inside: impl Fn([f64; 2]) -> bool,
+    intersect: impl Fn([f64; 2], [f64; 2]) -> [f64; 2],
+) -> Vec<[f64; 2]> {
+    if ring.is_empty() {
+        return Vec::new();
+    }
+    let n = ring.len();
+    let mut out = Vec::with_capacity(n + 2);
+    for i in 0..n {
+        let s = ring[i];
+        let e = ring[(i + 1) % n];
+        match (inside(s), inside(e)) {
+            (true, true) => out.push(e),
+            (true, false) => out.push(intersect(s, e)),
+            (false, true) => {
+                out.push(intersect(s, e));
+                out.push(e);
+            }
+            (false, false) => {}
+        }
+    }
+    out
+}
+
 // ── Feature conversion ───────────────────────────────────────────────────────
 
 /// Convert one OESU feature to zero or more MVT features in tile pixel space.
 ///
-/// `tile_wgs84` is used to filter `MultiPoint` (soundings): only the points
-/// that fall within the tile are emitted, avoiding 20× duplication across tiles.
+/// All geometry is clipped to `tile_wgs84`: line strokes are split at tile
+/// boundaries, polygon rings are clipped via Sutherland-Hodgman.  `MultiPoint`
+/// soundings are additionally filtered to their exact containing tile.
 fn to_mvt_features(feat: &oesu::Feature, tile_wgs84: [f64; 4], merc: [f64; 4]) -> Vec<MvtFeature> {
     let props = build_props(&feat.attributes);
 
@@ -241,14 +392,21 @@ fn to_mvt_features(feat: &oesu::Feature, tile_wgs84: [f64; 4], merc: [f64; 4]) -
             if strokes.is_empty() {
                 return vec![];
             }
-            let geom = if strokes.len() == 1 {
-                let ls: MvtLineString = strokes[0]
-                    .iter()
-                    .map(|[lon, lat]| to_px(*lon, *lat, merc))
-                    .collect();
+            // Clip each stroke to the tile bbox; a stroke that exits and re-enters
+            // is split into multiple sub-strokes.
+            let clipped: Vec<Vec<[f64; 2]>> = strokes
+                .iter()
+                .flat_map(|s| clip_stroke(s, tile_wgs84))
+                .collect();
+            if clipped.is_empty() {
+                return vec![];
+            }
+            let geom = if clipped.len() == 1 {
+                let ls: MvtLineString =
+                    clipped[0].iter().map(|[lon, lat]| to_px(*lon, *lat, merc)).collect();
                 MvtGeometry::LineString(ls)
             } else {
-                let lines: Vec<MvtLineString> = strokes
+                let lines: Vec<MvtLineString> = clipped
                     .iter()
                     .map(|s| s.iter().map(|[lon, lat]| to_px(*lon, *lat, merc)).collect())
                     .collect();
@@ -263,15 +421,26 @@ fn to_mvt_features(feat: &oesu::Feature, tile_wgs84: [f64; 4], merc: [f64; 4]) -
             if ag.rings.is_empty() {
                 return vec![];
             }
-            let exterior: MvtLineString = ag.rings[0]
-                .iter()
-                .map(|[lon, lat]| to_px(*lon, *lat, merc))
-                .collect();
+            // Clip the exterior ring; drop the feature if nothing survives.
+            let exterior_pts = clip_ring(&ag.rings[0], tile_wgs84);
+            if exterior_pts.len() < 3 {
+                return vec![];
+            }
+            let exterior: MvtLineString =
+                exterior_pts.iter().map(|[lon, lat]| to_px(*lon, *lat, merc)).collect();
+            // Clip holes; discard any that vanish entirely.
             let holes: Vec<MvtLineString> = ag.rings[1..]
                 .iter()
-                .map(|r| r.iter().map(|[lon, lat]| to_px(*lon, *lat, merc)).collect())
+                .filter_map(|r| {
+                    let clipped = clip_ring(r, tile_wgs84);
+                    if clipped.len() < 3 {
+                        return None;
+                    }
+                    Some(clipped.iter().map(|[lon, lat]| to_px(*lon, *lat, merc)).collect())
+                })
                 .collect();
-            let mut f = MvtFeature::new(MvtGeometry::Polygon(MvtPolygon::new(exterior, holes)));
+            let mut f =
+                MvtFeature::new(MvtGeometry::Polygon(MvtPolygon::new(exterior, holes)));
             f.properties = props;
             vec![f]
         }
@@ -357,4 +526,94 @@ fn hilbert_xy_to_d(n: u64, mut x: u64, mut y: u64) -> u64 {
         s /= 2;
     }
     d
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── clip_stroke ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn stroke_fully_inside_is_unchanged() {
+        let bbox = [0.0_f64, 0.0, 10.0, 10.0];
+        let stroke = vec![[2.0, 2.0], [5.0, 5.0], [8.0, 8.0]];
+        assert_eq!(clip_stroke(&stroke, bbox), vec![stroke]);
+    }
+
+    #[test]
+    fn stroke_fully_outside_is_empty() {
+        let bbox = [0.0_f64, 0.0, 10.0, 10.0];
+        let stroke = vec![[11.0, 0.0], [15.0, 0.0]];
+        assert!(clip_stroke(&stroke, bbox).is_empty());
+    }
+
+    #[test]
+    fn stroke_clips_to_east_edge() {
+        let bbox = [0.0_f64, 0.0, 10.0, 10.0];
+        let stroke = vec![[2.0, 5.0], [15.0, 5.0]];
+        let result = clip_stroke(&stroke, bbox);
+        assert_eq!(result.len(), 1);
+        let [q0x, q0y] = result[0][0];
+        let [q1x, q1y] = result[0][1];
+        assert!((q0x - 2.0).abs() < 1e-10 && (q0y - 5.0).abs() < 1e-10);
+        assert!((q1x - 10.0).abs() < 1e-10 && (q1y - 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn stroke_exits_and_re_enters_splits_into_two() {
+        let bbox = [0.0_f64, 0.0, 10.0, 10.0];
+        // [2,5]→[8,5] inside; [8,5]→[12,5] exits east; [12,5]→[8,2] re-enters
+        let stroke = vec![[2.0, 5.0], [8.0, 5.0], [12.0, 5.0], [8.0, 2.0]];
+        let result = clip_stroke(&stroke, bbox);
+        assert_eq!(result.len(), 2, "expected two sub-strokes, got {result:?}");
+    }
+
+    // ── clip_ring ──────────────────────────────────────────────────────────────
+
+    #[allow(clippy::float_cmp)] // ring vertices pass through unmodified — exact equality is correct
+    #[test]
+    fn ring_fully_inside_is_unchanged() {
+        let bbox = [0.0_f64, 0.0, 10.0, 10.0];
+        let ring = vec![[1.0, 1.0], [9.0, 1.0], [9.0, 9.0], [1.0, 9.0]];
+        assert_eq!(clip_ring(&ring, bbox), ring);
+    }
+
+    #[test]
+    fn ring_fully_outside_is_empty() {
+        let bbox = [0.0_f64, 0.0, 10.0, 10.0];
+        let ring = vec![[11.0, 11.0], [19.0, 11.0], [19.0, 19.0], [11.0, 19.0]];
+        assert!(clip_ring(&ring, bbox).is_empty());
+    }
+
+    #[test]
+    fn ring_clipped_to_east_edge() {
+        let bbox = [0.0_f64, 0.0, 10.0, 10.0];
+        let ring = vec![[5.0, 1.0], [15.0, 1.0], [15.0, 9.0], [5.0, 9.0]];
+        let result = clip_ring(&ring, bbox);
+        assert!(!result.is_empty());
+        assert!(
+            result.iter().all(|[lon, _]| *lon <= 10.0 + 1e-10),
+            "all x should be ≤ east=10, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn ring_enclosing_bbox_clips_to_bbox_corners() {
+        // A large polygon that completely contains the tile bbox should clip to
+        // exactly the four corners of the bbox.
+        let bbox = [2.0_f64, 2.0, 8.0, 8.0];
+        let ring = vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
+        let result = clip_ring(&ring, bbox);
+        assert_eq!(result.len(), 4, "should produce exactly 4 corners");
+        assert!(
+            result.iter().all(|[lon, lat]| {
+                *lon >= 2.0 - 1e-10
+                    && *lon <= 8.0 + 1e-10
+                    && *lat >= 2.0 - 1e-10
+                    && *lat <= 8.0 + 1e-10
+            }),
+            "corners should be within bbox, got {result:?}"
+        );
+    }
 }
