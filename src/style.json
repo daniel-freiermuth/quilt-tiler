@@ -169,81 +169,130 @@
     },
     {
       "id": "BOYLAT",
-      "type": "circle",
+      "type": "symbol",
       "source": "enc",
       "source-layer": "BOYLAT",
       "minzoom": 10,
-      "paint": {
-        "circle-color": ["match", ["get", "COLOUR"], "3", "#e74c3c", "4", "#2ecc71", "#888888"],
-        "circle-radius": 5,
-        "circle-stroke-color": "#ffffff",
-        "circle-stroke-width": 1
-      }
+      "layout": {
+        "icon-image": [
+          "match", ["get", "BOYSHP"],
+          1, ["match", ["to-string", ["get", "COLOUR"]], "3", "Q20b_Conical_buoy_R", "4", "Q20b_Conical_buoy_G", "Q20b_Conical_buoy"],
+          2, ["match", ["to-string", ["get", "COLOUR"]], "3", "Q21b_Can_buoy_R",     "4", "Q21b_Can_buoy_G",     "Q21b_Can_buoy"],
+          4, ["match", ["to-string", ["get", "COLOUR"]], "3", "Q23b_Pillar_buoy_R",  "4", "Q23b_Pillar_buoy_G",  "Q23b_Pillar_buoy"],
+          5, ["match", ["to-string", ["get", "COLOUR"]], "3", "Q24_Spar_buoy_R",     "4", "Q24_Spar_buoy_G",     "Q24_Spar_buoy"],
+          3, "Q22a_Spherical_buoy",
+          6, "Q25a_Barrel_buoy",
+          7, "Q26_Super_buoy",
+          "Q23b_Pillar_buoy"
+        ],
+        "icon-size": 1,
+        "icon-allow-overlap": true,
+        "icon-ignore-placement": true
+      },
+      "paint": {}
     },
     {
       "id": "BOYCAR",
-      "type": "circle",
+      "type": "symbol",
       "source": "enc",
       "source-layer": "BOYCAR",
       "minzoom": 10,
-      "paint": {
-        "circle-color": "#f39c12",
-        "circle-radius": 5,
-        "circle-stroke-color": "#000000",
-        "circle-stroke-width": 1
-      }
+      "layout": {
+        "icon-image": [
+          "match", ["get", "CATCAM"],
+          1, "Q9_2_cones_points_upward_D",
+          2, "Q9_Cone_point_up_D",
+          3, "Q9_2_cones_base_to_base_D",
+          4, "Q9_Cone_point_down_D",
+          5, "Q9_2_cones_points_downward_D",
+          6, "Q9_Cone_point_down_D",
+          7, "Q9_2_cones_point_to_point_D",
+          8, "Q9_Cone_point_up_D",
+          "Q23b_Pillar_buoy"
+        ],
+        "icon-size": 1,
+        "icon-allow-overlap": true,
+        "icon-ignore-placement": true
+      },
+      "paint": {}
     },
     {
       "id": "BOYSPP",
-      "type": "circle",
+      "type": "symbol",
       "source": "enc",
       "source-layer": "BOYSPP",
       "minzoom": 10,
-      "paint": {
-        "circle-color": "#f1c40f",
-        "circle-radius": 5,
-        "circle-stroke-color": "#000000",
-        "circle-stroke-width": 1
-      }
+      "layout": {
+        "icon-image": [
+          "match", ["get", "CATSPM"],
+          14, "Q40a_Mooring_buoy",
+          "Q24_Spar_buoy"
+        ],
+        "icon-size": 1,
+        "icon-allow-overlap": true,
+        "icon-ignore-placement": true
+      },
+      "paint": {}
     },
     {
       "id": "BCNLAT",
-      "type": "circle",
+      "type": "symbol",
       "source": "enc",
       "source-layer": "BCNLAT",
       "minzoom": 10,
-      "paint": {
-        "circle-color": ["match", ["get", "COLOUR"], "3", "#e74c3c", "4", "#2ecc71", "#888888"],
-        "circle-radius": 4,
-        "circle-stroke-color": "#ffffff",
-        "circle-stroke-width": 1
-      }
+      "layout": {
+        "icon-image": [
+          "match", ["get", "BCNSHP"],
+          1, "Q90_Stake_pole",
+          2, "Q90_Stake_pole",
+          3, "Q110_Beacon_tower",
+          4, "Q111_Lattice_beacon",
+          5, "F22_Post",
+          6, "Q100_Cairn",
+          "Q81_Beacon"
+        ],
+        "icon-size": 1,
+        "icon-allow-overlap": true,
+        "icon-ignore-placement": true
+      },
+      "paint": {}
     },
     {
       "id": "BCNSPP",
-      "type": "circle",
+      "type": "symbol",
       "source": "enc",
       "source-layer": "BCNSPP",
       "minzoom": 10,
-      "paint": {
-        "circle-color": "#f1c40f",
-        "circle-radius": 4,
-        "circle-stroke-color": "#000000",
-        "circle-stroke-width": 1
-      }
+      "layout": {
+        "icon-image": "Q81_Beacon",
+        "icon-size": 1,
+        "icon-allow-overlap": true,
+        "icon-ignore-placement": true
+      },
+      "paint": {}
     },
     {
       "id": "LIGHTS",
-      "type": "circle",
+      "type": "symbol",
       "source": "enc",
       "source-layer": "LIGHTS",
       "minzoom": 10,
-      "paint": {
-        "circle-color": "#f7dc6f",
-        "circle-radius": 4,
-        "circle-stroke-color": "#d4ac0d",
-        "circle-stroke-width": 1.5
-      }
+      "layout": {
+        "icon-image": [
+          "match", ["to-string", ["get", "COLOUR"]],
+          "3",  "Light_Flare_red",
+          "4",  "Light_Flare_green",
+          "5",  "Light_Flare_blue",
+          "6",  "Light_Flare_orange",
+          "11", "Light_Flare_orange",
+          "12", "Light_Flare_magenta",
+          "Light_Flare_white"
+        ],
+        "icon-size": 1,
+        "icon-allow-overlap": true,
+        "icon-ignore-placement": true
+      },
+      "paint": {}
     },
     {
       "id": "WRECKS",
