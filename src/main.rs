@@ -50,6 +50,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Parser;
 use rayon::prelude::*;
+use rayon::ThreadPoolBuilder;
 use tracing::{info, warn};
 
 use zoom::zoom_from_scale;
@@ -94,13 +95,37 @@ struct Args {
     name: Option<String>,
 }
 
+// Rayon pool setup + style/metadata output push main past 100 lines. Accept.
+#[allow(clippy::too_many_lines)]
 fn main() -> Result<()> {
+    // Tracy must start before rayon spins up its workers so every thread
+    // is registered with the profiler from the moment it first runs.
+    #[cfg(feature = "tracy")]
+    let _tracy = tracy_client::Client::start();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info".into()),
         )
         .init();
+
+    // Register the main thread with the profiler, then build the global rayon
+    // pool so every worker calls register_thread!() before doing any work.
+    profiling::register_thread!("main");
+    ThreadPoolBuilder::new()
+        .spawn_handler(|thread| {
+            let mut b = std::thread::Builder::new();
+            if let Some(name) = thread.name() { b = b.name(name.to_owned()); }
+            if let Some(sz)   = thread.stack_size() { b = b.stack_size(sz); }
+            b.spawn(move || {
+                profiling::register_thread!();
+                thread.run();
+            })?;
+            Ok(())
+        })
+        .build_global()
+        .context("building rayon thread pool")?;
 
     let args = Args::parse();
 

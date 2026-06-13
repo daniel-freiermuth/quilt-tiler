@@ -156,6 +156,7 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path) -> Result<(u8, u8)> 
         .par_iter()
         .progress_with(pb3.clone())
         .map(|(&(z, col, row), (_, idxs))| -> Result<Option<EncodedTile>> {
+            profiling::scope!("tile");
             let tile_wgs84 = xyz_to_bbox(z, col, row, col, row);
             let tile_merc  = tile_mercator_bbox(tile_wgs84);
             let mut bytes  = Vec::<u8>::new();
@@ -246,6 +247,7 @@ fn bar_style() -> ProgressStyle {
 
 /// Encode all features from `cell` that intersect `tile_wgs84` into a raw MVT
 /// byte blob.  Returns an empty `Vec` when no features land in the tile.
+#[profiling::function]
 fn encode_cell_features(
     cell: &s57::S57Cell,
     tile_wgs84: [f64; 4],
@@ -367,6 +369,7 @@ fn bbox_of(mut pts: impl Iterator<Item = (f64, f64)>) -> Option<(f64, f64, f64, 
 /// Uses Liang-Barsky per-segment clipping.  A stroke that enters and exits the
 /// bbox multiple times is split into separate sub-strokes; sub-strokes with
 /// fewer than 2 vertices are discarded.
+#[profiling::function]
 fn clip_stroke(stroke: &[[f64; 2]], bbox: [f64; 4]) -> Vec<Vec<[f64; 2]>> {
     let [west, south, east, north] = bbox;
     let mut result: Vec<Vec<[f64; 2]>> = Vec::new();
@@ -459,6 +462,7 @@ fn clip_segment_lb(
 /// Clip a polygon ring to the rectangle `bbox = [west, south, east, north]`
 /// using Sutherland-Hodgman.  Returns the clipped ring; empty when the ring
 /// is entirely outside.  The ring need not be explicitly closed.
+#[profiling::function]
 fn clip_ring(ring: &[[f64; 2]], bbox: [f64; 4]) -> Vec<[f64; 2]> {
     let [west, south, east, north] = bbox;
     let r = clip_ring_half_plane(ring, |p| p[0] >= west, |a, b| {
@@ -517,6 +521,7 @@ fn clip_ring_half_plane(
 /// All geometry is clipped to `tile_wgs84`: line strokes are split at tile
 /// boundaries, polygon rings are clipped via Sutherland-Hodgman.  `MultiPoint`
 /// soundings are additionally filtered to their exact containing tile.
+#[profiling::function]
 fn to_mvt_features(feat: &s57::Feature, tile_wgs84: [f64; 4], merc: [f64; 4]) -> Vec<MvtFeature> {
     let props = build_props(&feat.attributes);
 
@@ -605,6 +610,7 @@ fn to_mvt_features(feat: &s57::Feature, tile_wgs84: [f64; 4], merc: [f64; 4]) ->
     }
 }
 
+#[profiling::function]
 fn build_props(attrs: &[s57::Attribute]) -> Vec<(String, MvtValue)> {
     attrs
         .iter()
@@ -622,6 +628,7 @@ fn build_props(attrs: &[s57::Attribute]) -> Vec<(String, MvtValue)> {
 
 // ── MVT tile encoding ────────────────────────────────────────────────────────
 
+#[profiling::function]
 fn encode_tile(layers: HashMap<&'static str, Vec<MvtFeature>>) -> Result<Vec<u8>> {
     let mut tile = MvtTile::new();
     for (name, features) in layers {
