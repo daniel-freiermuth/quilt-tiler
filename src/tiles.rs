@@ -1,10 +1,9 @@
 //! Direct tile writing: OESU cells → MVT tiles → `PMTiles` archive.
 //!
-//! Strategy (first pass): each chart is tiled at exactly
-//! `zoom_from_scale(native_scale)`. Charts at the same zoom level may cover
-//! overlapping or adjacent areas; their features are merged per tile.
-//! Zoom levels between scale bands are intentionally empty — `MapLibre` GL
-//! overzooms the nearest available tile automatically.
+//! Each chart is written at exactly its native zoom level.  Same-scale charts
+//! covering overlapping tiles merge correctly via protobuf repeated-field append
+//! (`Tile { repeated Layer layers }` — concatenating two encoded `Tile` blobs
+//! unions their layers).
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -18,11 +17,14 @@ use fast_mvt::{
 use martin_tile_utils::{bbox_to_xyz, wgs84_to_webmercator, xyz_to_bbox};
 use pmtiles::{PmTilesWriter, TileCoord, TileType};
 use tracing::info;
+use rayon::prelude::*;
 
 use crate::s57::{attribute_acronym, object_acronym};
 use crate::zoom::zoom_from_scale;
 
 const EXTENT: f64 = 4096.0;
+/// A single encoded tile ready for `BTreeMap` insertion: `(tile_id, zoom, col, row, mvt_bytes)`.
+type EncodedTile = (u64, u8, u32, u32, Vec<u8>);
 
 // ── Public entry point ───────────────────────────────────────────────────────
 
@@ -40,65 +42,31 @@ pub fn write_pmtiles(cells: &[oesu::OesuCell], output: &Path) -> Result<(u8, u8)
     // matching the PMTiles Hilbert-curve requirement without a separate sort pass.
     let mut tile_bytes: BTreeMap<u64, (TileCoord, Vec<u8>)> = BTreeMap::new();
 
-    let mut min_zoom = u8::MAX;
-    let mut max_zoom = u8::MIN;
-    let mut bounds = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+    // Compute zoom range and geographic bounds up-front so the parallel encoding
+    // step below can access them without shared mutable state.
+    let min_zoom = cells.iter().map(|c| zoom_from_scale(c.native_scale)).min().unwrap_or(0);
+    let max_zoom = cells.iter().map(|c| zoom_from_scale(c.native_scale)).max().unwrap_or(0);
+    let bounds = cells.iter().fold(
+        [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY],
+        |mut acc, c| {
+            let [w, s, e, n] = c.bounds;
+            acc[0] = acc[0].min(w);
+            acc[1] = acc[1].min(s);
+            acc[2] = acc[2].max(e);
+            acc[3] = acc[3].max(n);
+            acc
+        },
+    );
 
-    for cell in cells {
-        let zoom = zoom_from_scale(cell.native_scale);
-        min_zoom = min_zoom.min(zoom);
-        max_zoom = max_zoom.max(zoom);
-
-        let [west, south, east, north] = cell.bounds;
-        bounds[0] = bounds[0].min(west);
-        bounds[1] = bounds[1].min(south);
-        bounds[2] = bounds[2].max(east);
-        bounds[3] = bounds[3].max(north);
-
-        let (col_lo, row_lo, col_hi, row_hi) = bbox_to_xyz(west, south, east, north, zoom);
-
-        for col in col_lo..=col_hi {
-            for row in row_lo..=row_hi {
-                let tile_wgs84 = xyz_to_bbox(zoom, col, row, col, row);
-                let tile_merc = tile_mercator_bbox(tile_wgs84);
-
-                // Collect this chart's features for this tile.
-                let mut layers: HashMap<&'static str, Vec<MvtFeature>> = HashMap::new();
-                for feat in &cell.features {
-                    if !feat_intersects(feat, tile_wgs84) {
-                        continue;
-                    }
-                    let Some(layer_name) = object_acronym(feat.type_code) else {
-                        continue;
-                    };
-                    let feats = to_mvt_features(feat, tile_wgs84, tile_merc);
-                    if !feats.is_empty() {
-                        layers.entry(layer_name).or_default().extend(feats);
-                    }
-                }
-
-                if layers.is_empty() {
-                    continue;
-                }
-
-                // Encode immediately; drop all MvtFeature allocations.
-                let bytes = encode_tile(layers)?;
-                if bytes.is_empty() {
-                    continue;
-                }
-
-                // Merge into BTreeMap entry (appending bytes for multi-chart tiles).
-                let id = tile_id(zoom, col, row);
-                match tile_bytes.entry(id) {
-                    std::collections::btree_map::Entry::Occupied(mut e) => {
-                        e.get_mut().1.extend(bytes);
-                    }
-                    std::collections::btree_map::Entry::Vacant(e) => {
-                        let coord = TileCoord::new(zoom, col, row).context("invalid tile coord")?;
-                        e.insert((coord, bytes));
-                    }
-                }
-            }
+    // Encode all cells in parallel — each cell's tile set is fully independent.
+    // rayon's collect preserves iterator order.
+    for tiles in cells
+        .par_iter()
+        .map(|cell| encode_cell_at_zoom(cell, zoom_from_scale(cell.native_scale)))
+        .collect::<Result<Vec<_>>>()?
+    {
+        for (id, zoom, col, row, bytes) in tiles {
+            merge_tile(&mut tile_bytes, id, zoom, col, row, bytes)?;
         }
     }
 
@@ -112,8 +80,6 @@ pub fn write_pmtiles(cells: &[oesu::OesuCell], output: &Path) -> Result<(u8, u8)
     } else {
         [-180.0, -85.0, 180.0, 85.0]
     };
-    let min_zoom = if min_zoom == u8::MAX { 0 } else { min_zoom };
-    let max_zoom = if max_zoom == u8::MIN { 0 } else { max_zoom };
 
     let metadata = build_metadata();
     let file =
@@ -133,6 +99,78 @@ pub fn write_pmtiles(cells: &[oesu::OesuCell], output: &Path) -> Result<(u8, u8)
 
     info!(output = %output.display(), "PMTiles written");
     Ok((min_zoom, max_zoom))
+}
+
+// ── Per-tile helpers ─────────────────────────────────────────────────────────
+
+/// Encode all non-empty tiles produced by `cell` at `zoom` into a flat list of
+/// `(tile_id, zoom, col, row, bytes)` tuples ready for insertion into the merge map.
+///
+/// Pure (read-only on `cell`) and safe to call from multiple threads simultaneously.
+fn encode_cell_at_zoom(cell: &oesu::OesuCell, zoom: u8) -> Result<Vec<EncodedTile>> {
+    let [west, south, east, north] = cell.bounds;
+    let (col_lo, row_lo, col_hi, row_hi) = bbox_to_xyz(west, south, east, north, zoom);
+    let mut result = Vec::new();
+    for col in col_lo..=col_hi {
+        for row in row_lo..=row_hi {
+            let tile_wgs84 = xyz_to_bbox(zoom, col, row, col, row);
+            let tile_merc = tile_mercator_bbox(tile_wgs84);
+            let bytes = encode_cell_features(cell, tile_wgs84, tile_merc)?;
+            if !bytes.is_empty() {
+                result.push((tile_id(zoom, col, row), zoom, col, row, bytes));
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Encode all features from `cell` that intersect `tile_wgs84` into a raw MVT
+/// byte blob.  Returns an empty `Vec` when no features land in the tile.
+fn encode_cell_features(
+    cell: &oesu::OesuCell,
+    tile_wgs84: [f64; 4],
+    tile_merc: [f64; 4],
+) -> Result<Vec<u8>> {
+    let mut layers: HashMap<&'static str, Vec<MvtFeature>> = HashMap::new();
+    for feat in &cell.features {
+        if !feat_intersects(feat, tile_wgs84) {
+            continue;
+        }
+        let Some(layer_name) = object_acronym(feat.type_code) else {
+            continue;
+        };
+        let feats = to_mvt_features(feat, tile_wgs84, tile_merc);
+        if !feats.is_empty() {
+            layers.entry(layer_name).or_default().extend(feats);
+        }
+    }
+    if layers.is_empty() {
+        return Ok(Vec::new());
+    }
+    encode_tile(layers)
+}
+
+/// Insert or append `bytes` for tile `(zoom, col, row)` into `tile_bytes`.
+/// Appending is valid because `Tile { repeated Layer layers }` is a protobuf
+/// repeated field; concatenating two encoded `Tile` messages unions their layers.
+fn merge_tile(
+    tile_bytes: &mut BTreeMap<u64, (TileCoord, Vec<u8>)>,
+    id: u64,
+    zoom: u8,
+    col: u32,
+    row: u32,
+    bytes: Vec<u8>,
+) -> Result<()> {
+    match tile_bytes.entry(id) {
+        std::collections::btree_map::Entry::Occupied(mut e) => {
+            e.get_mut().1.extend(bytes);
+        }
+        std::collections::btree_map::Entry::Vacant(e) => {
+            let coord = TileCoord::new(zoom, col, row).context("invalid tile coord")?;
+            e.insert((coord, bytes));
+        }
+    }
+    Ok(())
 }
 
 // ── Coordinate transform ─────────────────────────────────────────────────────
