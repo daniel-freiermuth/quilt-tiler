@@ -17,8 +17,8 @@ anyhow          = "1"
 clap            = { version = "4", features = ["derive"] }
 rayon           = "1"
 profiling       = "1"
-tracy-client    = { version = "0.17", features = ["enable"], optional = true }
-indicatif       = { version = "0.17", features = ["rayon"] }
+tracy-client    = { version = "0.18.4", features = ["enable"], optional = true }
+indicatif       = { version = "0.18.4", features = ["rayon"] }
 serde_json      = "1"
 tracing         = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
