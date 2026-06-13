@@ -35,7 +35,7 @@ const EXTENT: f64 = 4096.0;
 /// MVT byte blobs — valid because `Tile { repeated Layer layers = 3 }` is a
 /// protobuf repeated field; concatenating two encoded Tile messages unions
 /// their layers.
-pub fn write_pmtiles(cells: &[oesu::OesuCell], output: &Path) -> Result<()> {
+pub fn write_pmtiles(cells: &[oesu::OesuCell], output: &Path) -> Result<(u8, u8)> {
     // Accumulate raw MVT bytes per TileID; BTreeMap keeps entries in sorted order,
     // matching the PMTiles Hilbert-curve requirement without a separate sort pass.
     let mut tile_bytes: BTreeMap<u64, (TileCoord, Vec<u8>)> = BTreeMap::new();
@@ -132,7 +132,7 @@ pub fn write_pmtiles(cells: &[oesu::OesuCell], output: &Path) -> Result<()> {
     writer.finalize().context("finalizing PMTiles")?;
 
     info!(output = %output.display(), "PMTiles written");
-    Ok(())
+    Ok((min_zoom, max_zoom))
 }
 
 // ── Coordinate transform ─────────────────────────────────────────────────────
