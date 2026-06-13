@@ -17,7 +17,7 @@ use fast_mvt::{
 };
 use martin_tile_utils::{bbox_to_xyz, wgs84_to_webmercator, xyz_to_bbox};
 use pmtiles::{PmTilesWriter, TileCoord, TileType};
-use tracing::info;
+use tracing::{debug, info};
 use rayon::prelude::*;
 
 use s57::{attribute_acronym, object_acronym};
@@ -54,6 +54,9 @@ type TileAnnotation = (u8, Vec<usize>);
 /// 3. Parallel encode.  For each annotated tile, clip each responsible cell's
 ///    geometry to the tile's WGS84 bbox, project to MVT pixel space, and merge
 ///    the resulting byte blobs via protobuf repeated-field append.
+// The three passes share source_map, native_count, and bounds; splitting them
+// into sub-functions would just scatter those locals. Accept the length.
+#[allow(clippy::too_many_lines)]
 pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path) -> Result<(u8, u8)> {
     let mut tile_bytes: BTreeMap<u64, (TileCoord, Vec<u8>)> = BTreeMap::new();
 
@@ -73,6 +76,7 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path) -> Result<(u8, u8)> 
     let [bw, bs, be, bn] = if bounds[0].is_finite() { bounds } else { [-180.0, -85.0, 180.0, 85.0] };
 
     // ── Pass 1: native responsibility map ────────────────────────────────────
+    info!(cells = cells.len(), zoom_floor, zoom_ceil, "pass 1: building native tile map");
     let mut source_map: HashMap<TileKey, TileAnnotation> = HashMap::new();
     for (i, cell) in cells.iter().enumerate() {
         let z = zoom_from_scale(cell.native_scale);
@@ -86,10 +90,13 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path) -> Result<(u8, u8)> 
             }
         }
     }
+    let native_count = source_map.len();
+    info!(native_tiles = native_count, "pass 1 done");
 
     // ── Pass 2: bottom-up fill propagation ───────────────────────────────────
     // Sequential sweep; process one zoom level at a time so children at z+1
     // are always fully annotated before we inspect them from z.
+    info!(zoom_floor, zoom_ceil, "pass 2: fill propagation");
     let mut new_entries: Vec<(TileKey, TileAnnotation)> = Vec::new();
     for z in (zoom_floor..zoom_ceil).rev() {
         let (col_lo, row_lo, col_hi, row_hi) = bbox_to_xyz(bw, bs, be, bn, z);
@@ -105,7 +112,6 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path) -> Result<(u8, u8)> 
                 let c11 = source_map.get(&(z + 1, 2 * col + 1, 2 * row + 1));
                 let ann = if let (Some(a0), Some(a1), Some(a2), Some(a3)) = (c00, c10, c01, c11) {
                     if a0.0 == a1.0 && a0.0 == a2.0 && a0.0 == a3.0 {
-                        // All four children agree on the same source zoom — propagate.
                         let mut idxs: Vec<usize> = a0.1.iter()
                             .chain(&a1.1).chain(&a2.1).chain(&a3.1)
                             .copied().collect();
@@ -123,10 +129,18 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path) -> Result<(u8, u8)> 
                 }
             }
         }
+        let added = new_entries.len();
         source_map.extend(std::mem::take(&mut new_entries));
+        debug!(z, added, total = source_map.len(), "pass 2: zoom done");
     }
+    info!(
+        annotated_tiles = source_map.len(),
+        filled = source_map.len() - native_count,
+        "pass 2 done",
+    );
 
     // ── Pass 3: parallel encode ───────────────────────────────────────────────
+    info!(annotated_tiles = source_map.len(), "pass 3: encoding tiles");
     let tiles: Vec<EncodedTile> = source_map
         .par_iter()
         .map(|(&(z, col, row), (_, idxs))| -> Result<Option<EncodedTile>> {
@@ -143,8 +157,7 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path) -> Result<(u8, u8)> 
         .into_iter()
         .flatten()
         .collect();
-
-    info!(tiles = tiles.len(), zoom_floor, zoom_ceil, "writing tiles");
+    info!(tiles = tiles.len(), "pass 3 done");
 
     for (id, z, col, row, bytes) in tiles {
         merge_tile(&mut tile_bytes, id, z, col, row, bytes)?;
