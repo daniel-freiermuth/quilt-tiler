@@ -182,7 +182,7 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path, max_zoom: Option<u8>
             let tile_merc  = tile_mercator_bbox(tile_wgs84);
             let mut bytes  = Vec::<u8>::new();
             for &i in idxs {
-                bytes.extend(encode_cell_features(&cells[i], tile_wgs84, tile_merc)?);
+                bytes.extend(encode_cell_features(&cells[i], tile_wgs84, tile_merc, z, zoom_offset)?);
             }
             if bytes.is_empty() { return Ok(None); }
             Ok(Some((tile_id(z, col, row), z, col, row, bytes)))
@@ -273,6 +273,8 @@ fn encode_cell_features(
     cell: &s57::S57Cell,
     tile_wgs84: [f64; 4],
     tile_merc: [f64; 4],
+    tile_zoom: u8,
+    zoom_offset: f64,
 ) -> Result<Vec<u8>> {
     let mut layers: HashMap<&'static str, Vec<MvtFeature>> = HashMap::new();
     for feat in &cell.features {
@@ -282,7 +284,7 @@ fn encode_cell_features(
         let Some(layer_name) = object_acronym(feat.type_code) else {
             continue;
         };
-        let feats = to_mvt_features(feat, tile_wgs84, tile_merc);
+        let feats = to_mvt_features(feat, tile_wgs84, tile_merc, tile_zoom, zoom_offset);
         if !feats.is_empty() {
             layers.entry(layer_name).or_default().extend(feats);
         }
@@ -543,7 +545,17 @@ fn clip_ring_half_plane(
 /// boundaries, polygon rings are clipped via Sutherland-Hodgman.  `MultiPoint`
 /// soundings are additionally filtered to their exact containing tile.
 #[profiling::function]
-fn to_mvt_features(feat: &s57::Feature, tile_wgs84: [f64; 4], merc: [f64; 4]) -> Vec<MvtFeature> {
+fn to_mvt_features(feat: &s57::Feature, tile_wgs84: [f64; 4], merc: [f64; 4], tile_zoom: u8, zoom_offset: f64) -> Vec<MvtFeature> {
+    // SCAMIN: skip features whose minimum display scale is finer than this tile's zoom.
+    // Code 133 = SCAMIN in the S-57 attribute table.
+    const SCAMIN_CODE: u16 = 133;
+    if let Some(attr) = feat.attributes.iter().find(|a| a.code == SCAMIN_CODE)
+        && let s57::AttrValue::Int(scamin) = attr.value
+        && zoom_from_scale(scamin, zoom_offset) > tile_zoom
+    {
+        return vec![];
+    }
+
     let props = build_props(&feat.attributes);
 
     match &feat.geometry {
