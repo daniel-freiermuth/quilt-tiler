@@ -1,11 +1,12 @@
 //! Direct tile writing: OESU cells → MVT tiles → `PMTiles` archive.
-//!
-//! Each chart is written at exactly its native zoom level.  Same-scale charts
-//! covering overlapping tiles merge correctly via protobuf repeated-field append
-//! (`Tile { repeated Layer layers }` — concatenating two encoded `Tile` blobs
-//! unions their layers).
+//! Each chart is written at its native zoom (pass 1).  A second parallel pass
+//! fills coarser tiles (fill-down) where all native child tiles are claimed, and
+//! finer tiles (fill-up) where no finer native chart exists at a given location.
+//! Same-scale charts covering overlapping tiles merge via protobuf repeated-field
+//! append (`Tile { repeated Layer layers }` — concatenating two encoded `Tile`
+//! blobs unions their layers).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::path::Path;
 
@@ -42,10 +43,9 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path) -> Result<(u8, u8)> 
     // matching the PMTiles Hilbert-curve requirement without a separate sort pass.
     let mut tile_bytes: BTreeMap<u64, (TileCoord, Vec<u8>)> = BTreeMap::new();
 
-    // Compute zoom range and geographic bounds up-front so the parallel encoding
-    // step below can access them without shared mutable state.
-    let min_zoom = cells.iter().map(|c| zoom_from_scale(c.native_scale)).min().unwrap_or(0);
-    let max_zoom = cells.iter().map(|c| zoom_from_scale(c.native_scale)).max().unwrap_or(0);
+    // Compute zoom range and aggregate geographic bounds up-front.
+    let zoom_floor = cells.iter().map(|c| zoom_from_scale(c.native_scale)).min().unwrap_or(0);
+    let zoom_ceil  = cells.iter().map(|c| zoom_from_scale(c.native_scale)).max().unwrap_or(0);
     let bounds = cells.iter().fold(
         [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY],
         |mut acc, c| {
@@ -58,11 +58,36 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path) -> Result<(u8, u8)> 
         },
     );
 
-    // Encode all cells in parallel — each cell's tile set is fully independent.
-    // rayon's collect preserves iterator order.
-    for tiles in cells
+    // ── Pass 1: native writes ─────────────────────────────────────────────────
+    // Encode each cell at its native zoom in parallel.  Record every produced
+    // tile ID into `claimed` so Pass 2 knows which tiles already have
+    // authoritative native data and must not be filled over.
+    let pass1: Vec<Vec<EncodedTile>> = cells
         .par_iter()
         .map(|cell| encode_cell_at_zoom(cell, zoom_from_scale(cell.native_scale)))
+        .collect::<Result<_>>()?;
+
+    let mut claimed: HashSet<u64> =
+        HashSet::with_capacity(pass1.iter().map(Vec::len).sum());
+    for tiles in &pass1 {
+        for &(id, ..) in tiles {
+            claimed.insert(id);
+        }
+    }
+    for tiles in pass1 {
+        for (id, zoom, col, row, bytes) in tiles {
+            merge_tile(&mut tile_bytes, id, zoom, col, row, bytes)?;
+        }
+    }
+
+    // ── Pass 2: fill-down + fill-up ───────────────────────────────────────────
+    // Each cell independently fills the coarser and finer zoom gaps it is
+    // responsible for, consulting only the immutable `claimed` set.  Collapsed
+    // into one parallel pass: fill-down and fill-up share the same per-cell
+    // `encode_cell_fill` call; the caller picks whichever zoom range applies.
+    for tiles in cells
+        .par_iter()
+        .map(|cell| encode_cell_fill(cell, zoom_floor, zoom_ceil, &claimed))
         .collect::<Result<Vec<_>>>()?
     {
         for (id, zoom, col, row, bytes) in tiles {
@@ -70,7 +95,7 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path) -> Result<(u8, u8)> 
         }
     }
 
-    info!(tiles = tile_bytes.len(), min_zoom, max_zoom, "writing tiles");
+    info!(tiles = tile_bytes.len(), zoom_floor, zoom_ceil, "writing tiles");
 
     // BTreeMap is already sorted by TileID — no separate sort needed.
 
@@ -85,8 +110,8 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path) -> Result<(u8, u8)> 
     let file =
         File::create(output).with_context(|| format!("creating {}", output.display()))?;
     let mut writer = PmTilesWriter::new(TileType::Mvt)
-        .min_zoom(min_zoom)
-        .max_zoom(max_zoom)
+        .min_zoom(zoom_floor)
+        .max_zoom(zoom_ceil)
         .bounds(bw, bs, be, bn)
         .metadata(&metadata)
         .create(file)
@@ -98,7 +123,7 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path) -> Result<(u8, u8)> 
     writer.finalize().context("finalizing PMTiles")?;
 
     info!(output = %output.display(), "PMTiles written");
-    Ok((min_zoom, max_zoom))
+    Ok((zoom_floor, zoom_ceil))
 }
 
 // ── Per-tile helpers ─────────────────────────────────────────────────────────
@@ -122,6 +147,130 @@ fn encode_cell_at_zoom(cell: &s57::S57Cell, zoom: u8) -> Result<Vec<EncodedTile>
         }
     }
     Ok(result)
+}
+
+/// Encode fill-down and fill-up tiles for one cell against the pass-1 `claimed` set.
+///
+/// **Fill-down** (tile T at zoom Z from source Z′): T is filled only when every one
+/// of the 4^(Z′−Z) child tiles of T at Z′ is natively claimed.  This prevents
+/// half-empty tiles at chart edges.  Multiple cells at the same native zoom that
+/// together cover T all contribute their bytes; the caller merges them via append.
+///
+/// **Fill-up** (tile T at zoom Z from source Z′ < Z): T is filled from the largest
+/// claimed ancestor zoom below Z.  Fill-down takes priority — if complete fine
+/// coverage exists, fill-up is skipped for that tile.
+///
+/// Pure (read-only on `cell` and `claimed`) — safe to call from rayon workers.
+fn encode_cell_fill(
+    cell: &s57::S57Cell,
+    zoom_floor: u8,
+    zoom_ceil: u8,
+    claimed: &HashSet<u64>,
+) -> Result<Vec<EncodedTile>> {
+    let native_zoom = zoom_from_scale(cell.native_scale);
+    let [west, south, east, north] = cell.bounds;
+    let mut result = Vec::new();
+
+    // Fill-down: coarser zooms below native.
+    for zoom in zoom_floor..native_zoom {
+        let (col_lo, row_lo, col_hi, row_hi) = bbox_to_xyz(west, south, east, north, zoom);
+        for col in col_lo..=col_hi {
+            for row in row_lo..=row_hi {
+                let id = tile_id(zoom, col, row);
+                if claimed.contains(&id) {
+                    continue; // native tile — leave it alone
+                }
+                if fill_down_source_zoom(zoom, col, row, zoom_ceil, claimed) != Some(native_zoom) {
+                    continue; // not our responsibility, or incomplete child coverage
+                }
+                let tile_wgs84 = xyz_to_bbox(zoom, col, row, col, row);
+                let tile_merc = tile_mercator_bbox(tile_wgs84);
+                let bytes = encode_cell_features(cell, tile_wgs84, tile_merc)?;
+                if !bytes.is_empty() {
+                    result.push((id, zoom, col, row, bytes));
+                }
+            }
+        }
+    }
+
+    // Fill-up: finer zooms above native.
+    for zoom in (native_zoom + 1)..=zoom_ceil {
+        let (col_lo, row_lo, col_hi, row_hi) = bbox_to_xyz(west, south, east, north, zoom);
+        for col in col_lo..=col_hi {
+            for row in row_lo..=row_hi {
+                let id = tile_id(zoom, col, row);
+                if claimed.contains(&id) {
+                    continue; // native tile — never overwrite
+                }
+                if fill_down_source_zoom(zoom, col, row, zoom_ceil, claimed).is_some() {
+                    continue; // fine native coverage exists; fill-down handles this
+                }
+                if fill_up_source_zoom(zoom, col, row, zoom_floor, claimed) != Some(native_zoom) {
+                    continue; // not the nearest coarser source for this location
+                }
+                let tile_wgs84 = xyz_to_bbox(zoom, col, row, col, row);
+                let tile_merc = tile_mercator_bbox(tile_wgs84);
+                let bytes = encode_cell_features(cell, tile_wgs84, tile_merc)?;
+                if !bytes.is_empty() {
+                    result.push((id, zoom, col, row, bytes));
+                }
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/// Return the smallest zoom Z′ > `zoom` such that **all** 4^(Z′−`zoom`) child
+/// tiles of `(zoom, col, row)` at Z′ are natively claimed (pass 1).
+///
+/// Pass 2 uses this to pick the fill-down source level: only fill tile T when a
+/// single finer level completely covers T, preventing half-empty seam tiles.
+/// Returns `None` when no level has complete child coverage up to `zoom_ceil`.
+fn fill_down_source_zoom(
+    zoom: u8,
+    col: u32,
+    row: u32,
+    zoom_ceil: u8,
+    claimed: &HashSet<u64>,
+) -> Option<u8> {
+    for z in (zoom + 1)..=zoom_ceil {
+        let shift = z - zoom;
+        let base_col = col << shift;
+        let base_row = row << shift;
+        let n = 1u32 << shift;
+        if (base_col..base_col + n)
+            .all(|c| (base_row..base_row + n).all(|r| claimed.contains(&tile_id(z, c, r))))
+        {
+            return Some(z);
+        }
+    }
+    None
+}
+
+/// Return the largest zoom Z′ < `zoom` whose single ancestor tile of
+/// `(zoom, col, row)` at Z′ is natively claimed (pass 1).
+///
+/// Pass 2 uses this to find the nearest coarser chart that covers a location.
+/// A coarser tile always completely contains a finer tile, so one claimed
+/// ancestor guarantees full geographic coverage — no partial-fill risk.
+/// Returns `None` when no coarser zoom has a claimed ancestor down to `zoom_floor`.
+fn fill_up_source_zoom(
+    zoom: u8,
+    col: u32,
+    row: u32,
+    zoom_floor: u8,
+    claimed: &HashSet<u64>,
+) -> Option<u8> {
+    for z in (zoom_floor..zoom).rev() {
+        let shift = zoom - z;
+        let anc_col = col >> shift;
+        let anc_row = row >> shift;
+        if claimed.contains(&tile_id(z, anc_col, anc_row)) {
+            return Some(z);
+        }
+    }
+    None
 }
 
 /// Encode all features from `cell` that intersect `tile_wgs84` into a raw MVT
