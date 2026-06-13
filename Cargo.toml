@@ -8,14 +8,15 @@ edition = "2024"
 publish = false
 
 [dependencies]
-oesu = { path = "oesu" }
-geo = "0.33"
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-rayon = "1"
-serde_json = "1"
-geojson = "1"
-tracing = "0.1"
+oesu            = { path = "oesu" }
+fast-mvt        = { version = "0.3", features = ["writer"] }
+pmtiles         = { version = "0.23", default-features = false, features = ["write"] }
+martin-tile-utils = "0.7"
+anyhow          = "1"
+clap            = { version = "4", features = ["derive"] }
+rayon           = "1"
+serde_json      = "1"
+tracing         = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [lints.rust]

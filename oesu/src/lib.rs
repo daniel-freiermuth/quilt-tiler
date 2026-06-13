@@ -71,7 +71,7 @@ pub struct Attribute {
     pub value: AttrValue,
 }
 
-/// OpenGL primitive type stored in the OSENC TriPrim chain.
+/// OpenGL primitive type stored in the `OSENC` `TriPrim` chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TriPrimType {
     Triangles     = 4, // GL_TRIANGLES
@@ -90,7 +90,7 @@ impl TriPrimType {
     }
 }
 
-/// One tessellation primitive from the TriPrim chain of an area record.
+/// One tessellation primitive from the `TriPrim` chain of an area record.
 #[derive(Debug, Clone)]
 pub struct TriPrim {
     pub prim_type: TriPrimType,
@@ -126,7 +126,7 @@ pub enum Geometry {
 pub struct Feature {
     pub type_code: u16,
     pub id: u16,
-    /// GEO_POINT=0, GEO_LINE=1, GEO_AREA=2, GEO_META=3 (matches OpenCPN GeoPrim_t)
+    /// `GEO_POINT`=0, `GEO_LINE`=1, `GEO_AREA`=2, `GEO_META`=3 (matches `OpenCPN` `GeoPrim_t`)
     pub primitive: u8,
     pub attributes: Vec<Attribute>,
     pub geometry: Geometry,
@@ -162,7 +162,7 @@ pub struct OesuCell {
     pub senc_create_date: String,
     /// Sounding datum name (e.g. "LAT", "MLLW", "MSL").
     pub sounding_datum: String,
-    /// Days remaining on the chart license (`expireDaysRemaining` from SERVER_STATUS).
+    /// Days remaining on the chart license (`expireDaysRemaining` from `SERVER_STATUS`).
     pub expire_days_remaining: u16,
     /// Grace days remaining after the primary expiry.
     pub grace_days_remaining: u16,
@@ -172,11 +172,11 @@ pub struct OesuCell {
     /// Geographic bounds [W, S, E, N] in WGS84 degrees.
     pub bounds: [f64; 4],
     pub features: Vec<Feature>,
-    /// Valid chart coverage polygons (CELL_COVR), in WGS84 [lon, lat].
+    /// Valid chart coverage polygons (`CELL_COVR`), in WGS84 [lon, lat].
     pub coverage: Vec<Vec<[f64; 2]>>,
-    /// Explicitly excluded areas (CELL_NOCOVR), in WGS84 [lon, lat].
+    /// Explicitly excluded areas (`CELL_NOCOVR`), in WGS84 [lon, lat].
     pub no_coverage: Vec<Vec<[f64; 2]>>,
-    /// Embedded text-description files keyed by filename (CELL_TXTDSC).
+    /// Embedded text-description files keyed by filename (`CELL_TXTDSC`).
     pub text_descriptions: HashMap<String, String>,
 }
 
@@ -191,13 +191,13 @@ struct RawFeature {
     raw_geometry: RawGeometry,
 }
 
-/// Internal TriPrim before SM → WGS84 coordinate conversion.
+/// Internal `TriPrim` before SM → WGS84 coordinate conversion.
 #[derive(Debug)]
 struct RawTriPrim {
     prim_type: u8,
     /// [W, S, E, N] — WGS84 degrees.
     /// For EXT records (84) the bbox is converted from SM to WGS84 at parse time,
-    /// since CELL_EXTENT_RECORD always precedes feature geometry in the stream.
+    /// since `CELL_EXTENT_RECORD` always precedes feature geometry in the stream.
     bbox: [f64; 4],
     /// SM (east, north) coordinate pairs, one per vertex.
     vertices: Vec<[f32; 2]>,
@@ -277,6 +277,7 @@ fn read_cstring(c: &mut Cursor<&[u8]>, max: usize) -> Result<String> {
     clippy::too_many_lines,          // binary format parser is inherently long
     clippy::cast_possible_truncation, // Cursor positions bounded by payload_len (≤ u32)
     clippy::similar_names,           // sw/nw/ne/se and resolved_vct/resolved_vet are domain vocab
+    clippy::missing_errors_doc,      // private binary parser; error cases in record comments
 )]
 pub fn parse_file(data: &[u8]) -> Result<OesuCell> {
     // ── Prologue: validate SERVER_STATUS + version ───────────────────────────
@@ -381,15 +382,17 @@ pub fn parse_file(data: &[u8]) -> Result<OesuCell> {
             }
 
             CELL_COVR_RECORD => {
-                match parse_covr_payload(&mut p, payload_len) {
-                    Some(covr) => raw_covr.push(covr),
-                    None => tracing::warn!("CELL_COVR_RECORD: could not parse coverage polygon"),
+                if let Some(covr) = parse_covr_payload(&mut p, payload_len) {
+                    raw_covr.push(covr);
+                } else {
+                    tracing::warn!("CELL_COVR_RECORD: could not parse coverage polygon");
                 }
             }
             CELL_NOCOVR_RECORD => {
-                match parse_covr_payload(&mut p, payload_len) {
-                    Some(covr) => raw_nocovr.push(covr),
-                    None => tracing::warn!("CELL_NOCOVR_RECORD: could not parse no-coverage polygon"),
+                if let Some(covr) = parse_covr_payload(&mut p, payload_len) {
+                    raw_nocovr.push(covr);
+                } else {
+                    tracing::warn!("CELL_NOCOVR_RECORD: could not parse no-coverage polygon");
                 }
             }
 
@@ -791,6 +794,7 @@ pub fn parse_file(data: &[u8]) -> Result<OesuCell> {
 
 /// Strip and validate the leading `SERVER_STATUS_RECORD` (200).
 /// Returns a slice starting at the next record, plus the expiry counters.
+#[allow(clippy::items_after_statements)] // PAYLOAD const follows early-exit guards; clearer here
 fn strip_server_status(data: &[u8]) -> Result<(&[u8], u16, u16)> {
     if data.len() < 6 {
         bail!("file too short to be a valid SENC stream ({} bytes)", data.len());
@@ -926,11 +930,11 @@ fn parse_covr_payload(p: &mut Cursor<&[u8]>, payload_len: usize) -> Option<RawCo
 ///
 /// If `ext` is true, the payload layout differs:
 ///   - the fixed header is 52 bytes instead of 44 (extra `f64 scale_factor`)
-///   - TriPrim bbox uses 4×i16 SM coords (scaled by `scale_factor`, then fromSM)
-///   - TriPrim vertices use `nvert × 2 × i16` (divided by `scale_factor`)
+///   - `TriPrim` bbox uses 4×i16 SM coords (scaled by `scale_factor`, then `fromSM`)
+///   - `TriPrim` vertices use `nvert × 2 × i16` (divided by `scale_factor`)
 ///
 /// For non-EXT records `scale_factor` and `ref_lat`/`ref_lon` are ignored.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::cast_possible_truncation, clippy::similar_names)]
 fn parse_area_payload(
     p: &mut Cursor<&[u8]>,
     payload_len: usize,
@@ -994,8 +998,8 @@ fn parse_area_payload(
 
             let mut verts = Vec::with_capacity(nvert);
             for _ in 0..nvert {
-                let east  = read_i16(p)? as f32 / scale_factor as f32;
-                let north = read_i16(p)? as f32 / scale_factor as f32;
+                let east  = f32::from(read_i16(p)?) / scale_factor as f32;
+                let north = f32::from(read_i16(p)?) / scale_factor as f32;
                 verts.push([east, north]);
             }
             (bbox, verts)
@@ -1048,6 +1052,7 @@ fn parse_area_payload(
 
 // ── Geometry resolution ──────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_lines)] // geometry variant dispatch is inherently long
 fn resolve_geometry(
     raw: RawGeometry,
     ref_lat: f64,
@@ -1138,7 +1143,7 @@ fn resolve_geometry(
             }
 
             if rings.len() != expected_rings {
-                if expected_rings <= 5 || (rings.len() as i64 - expected_rings as i64).abs() <= 2 {
+                if expected_rings <= 5 || rings.len().abs_diff(expected_rings) <= 2 {
                     tracing::warn!(
                         expected = expected_rings,
                         got = rings.len(),
@@ -1192,10 +1197,10 @@ fn build_ring(
     let mut coords: Vec<[f64; 2]> = Vec::new();
 
     for [start_rcid, edge_rcid, _end_rcid, dir] in edge_refs {
-        if let Some(&[lon, lat]) = vct.get(&(*start_rcid as u32)) {
-            if coords.is_empty() || coords.last() != Some(&[lon, lat]) {
-                coords.push([lon, lat]);
-            }
+        if let Some(&[lon, lat]) = vct.get(&(*start_rcid as u32))
+            && (coords.is_empty() || coords.last() != Some(&[lon, lat]))
+        {
+            coords.push([lon, lat]);
         }
 
         if *edge_rcid == 0 {
@@ -1213,12 +1218,11 @@ fn build_ring(
         }
     }
 
-    if let Some([_, _, end_rcid, _]) = edge_refs.last() {
-        if let Some(&[lon, lat]) = vct.get(&(*end_rcid as u32)) {
-            if coords.last() != Some(&[lon, lat]) {
-                coords.push([lon, lat]);
-            }
-        }
+    if let Some([_, _, end_rcid, _]) = edge_refs.last()
+        && let Some(&[lon, lat]) = vct.get(&(*end_rcid as u32))
+        && coords.last() != Some(&[lon, lat])
+    {
+        coords.push([lon, lat]);
     }
 
     if close && coords.len() >= 2 {
