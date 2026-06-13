@@ -128,20 +128,11 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path, max_zoom: Option<u8>
                     source_map.get(&(z + 1, 2 * col + 1, 2 * row + 1)),
                 ];
                 let present: Vec<&TileAnnotation> = children.iter().filter_map(|x| *x).collect();
-                let ann = if present.len() == 4 && present[1..].iter().all(|a| a.0 == present[0].0) {
-                    // All 4 children present with the same native source zoom →
-                    // clean propagation, no dedup needed across sets.
-                    let mut idxs: Vec<usize> = present.iter()
-                        .flat_map(|a| a.1.iter().copied())
-                        .collect();
-                    idxs.sort_unstable();
-                    idxs.dedup();
-                    Some((present[0].0, idxs))
-                } else if !present.is_empty() {
+                let ann = if !present.is_empty() && present.iter().all(|a| a.0 > z) {
                     // Partial children: union whatever is available.
                     // This fills overview tiles (z below the coarsest native zoom)
                     // and handles sparse intra-range coverage gaps.
-                    let source_z = present.iter().map(|a| a.0).max().unwrap();
+                    let source_z = present.iter().map(|a| a.0).min().unwrap();
                     let mut idxs: Vec<usize> = present.iter()
                         .flat_map(|a| a.1.iter().copied())
                         .collect();
@@ -149,7 +140,7 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path, max_zoom: Option<u8>
                     idxs.dedup();
                     Some((source_z, idxs))
                 } else {
-                    // No children at all: look for a coarser native ancestor.
+                    // No children at all or some down-filled children
                     find_native_ancestor(z, col, row, &source_map, zoom_floor)
                 };
                 if let Some(a) = ann {
