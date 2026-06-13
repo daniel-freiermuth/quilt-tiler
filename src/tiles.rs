@@ -1,12 +1,12 @@
 //! Direct tile writing: OESU cells → MVT tiles → `PMTiles` archive.
-//! Each chart is written at its native zoom (pass 1).  A second parallel pass
-//! fills coarser tiles (fill-down) where all native child tiles are claimed, and
-//! finer tiles (fill-up) where no finer native chart exists at a given location.
-//! Same-scale charts covering overlapping tiles merge via protobuf repeated-field
-//! append (`Tile { repeated Layer layers }` — concatenating two encoded `Tile`
-//! blobs unions their layers).
+//! Three-pass pipeline:
+//!   1. Build a `source_map` of which cells are responsible for each tile.
+//!   2. Bottom-up sweep (fine → coarse): propagate fill annotations without
+//!      re-examining individual cells — each tile checks only its 4 children.
+//!   3. Parallel encode: for each annotated tile, clip+project each responsible
+//!      cell's geometry and merge via protobuf byte-append.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::path::Path;
 
@@ -26,24 +26,37 @@ use crate::zoom::zoom_from_scale;
 const EXTENT: f64 = 4096.0;
 /// A single encoded tile ready for `BTreeMap` insertion: `(tile_id, zoom, col, row, mvt_bytes)`.
 type EncodedTile = (u64, u8, u32, u32, Vec<u8>);
+/// Key identifying a tile in the source map: `(zoom, col, row)`.
+type TileKey = (u8, u32, u32);
+/// Per-tile fill annotation: `(source_zoom, cell_indices)`.
+type TileAnnotation = (u8, Vec<usize>);
 
 // ── Public entry point ───────────────────────────────────────────────────────
 
 /// Encode all parsed `cells` as MVT tiles and write a `PMTiles` v3 archive to
-/// `output`. Tiles are written in Hilbert-curve (`TileID`) order as required by
-/// the `PMTiles` spec.
+/// `output`. Returns `(min_zoom, max_zoom)`.
 ///
-/// Memory model: each chart/tile pair is encoded to raw MVT bytes immediately.
-/// Multiple charts covering the same tile are merged by concatenating their
-/// MVT byte blobs — valid because `Tile { repeated Layer layers = 3 }` is a
-/// protobuf repeated field; concatenating two encoded Tile messages unions
-/// their layers.
+/// **Three-pass pipeline:**
+///
+/// 1. Build `source_map[(zoom, col, row)] = (source_zoom, cell_indices)`.
+///    Only native tiles are inserted here; `source_zoom == zoom` for all of them.
+///    Multiple cells at the same native zoom covering the same tile are merged.
+///
+/// 2. Bottom-up sweep, `zoom_ceil-1` → `zoom_floor`.  For each unannotated tile,
+///    inspect the 4 children at `zoom+1` (already annotated):
+///    - All 4 present, all same `source_zoom` S → annotate with `(S, union_cells)`.
+///      When `S == zoom+1` this is one-level fill-down.  When `S > zoom+1` the
+///      fill-down cascades transitively.  When `S < zoom+1` fill-up propagates
+///      upward through the tree.
+///    - Otherwise → `find_native_ancestor`: walk toward `zoom_floor` and use the
+///      first native tile that covers this location (fill-up fallback).
+///
+/// 3. Parallel encode.  For each annotated tile, clip each responsible cell's
+///    geometry to the tile's WGS84 bbox, project to MVT pixel space, and merge
+///    the resulting byte blobs via protobuf repeated-field append.
 pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path) -> Result<(u8, u8)> {
-    // Accumulate raw MVT bytes per TileID; BTreeMap keeps entries in sorted order,
-    // matching the PMTiles Hilbert-curve requirement without a separate sort pass.
     let mut tile_bytes: BTreeMap<u64, (TileCoord, Vec<u8>)> = BTreeMap::new();
 
-    // Compute zoom range and aggregate geographic bounds up-front.
     let zoom_floor = cells.iter().map(|c| zoom_from_scale(c.native_scale)).min().unwrap_or(0);
     let zoom_ceil  = cells.iter().map(|c| zoom_from_scale(c.native_scale)).max().unwrap_or(0);
     let bounds = cells.iter().fold(
@@ -57,54 +70,85 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path) -> Result<(u8, u8)> 
             acc
         },
     );
+    let [bw, bs, be, bn] = if bounds[0].is_finite() { bounds } else { [-180.0, -85.0, 180.0, 85.0] };
 
-    // ── Pass 1: native writes ─────────────────────────────────────────────────
-    // Encode each cell at its native zoom in parallel.  Record every produced
-    // tile ID into `claimed` so Pass 2 knows which tiles already have
-    // authoritative native data and must not be filled over.
-    let pass1: Vec<Vec<EncodedTile>> = cells
-        .par_iter()
-        .map(|cell| encode_cell_at_zoom(cell, zoom_from_scale(cell.native_scale)))
-        .collect::<Result<_>>()?;
-
-    let mut claimed: HashSet<u64> =
-        HashSet::with_capacity(pass1.iter().map(Vec::len).sum());
-    for tiles in &pass1 {
-        for &(id, ..) in tiles {
-            claimed.insert(id);
-        }
-    }
-    for tiles in pass1 {
-        for (id, zoom, col, row, bytes) in tiles {
-            merge_tile(&mut tile_bytes, id, zoom, col, row, bytes)?;
+    // ── Pass 1: native responsibility map ────────────────────────────────────
+    let mut source_map: HashMap<TileKey, TileAnnotation> = HashMap::new();
+    for (i, cell) in cells.iter().enumerate() {
+        let z = zoom_from_scale(cell.native_scale);
+        let [west, south, east, north] = cell.bounds;
+        let (col_lo, row_lo, col_hi, row_hi) = bbox_to_xyz(west, south, east, north, z);
+        for col in col_lo..=col_hi {
+            for row in row_lo..=row_hi {
+                source_map.entry((z, col, row))
+                    .or_insert_with(|| (z, Vec::new()))
+                    .1.push(i);
+            }
         }
     }
 
-    // ── Pass 2: fill-down + fill-up ───────────────────────────────────────────
-    // Each cell independently fills the coarser and finer zoom gaps it is
-    // responsible for, consulting only the immutable `claimed` set.  Collapsed
-    // into one parallel pass: fill-down and fill-up share the same per-cell
-    // `encode_cell_fill` call; the caller picks whichever zoom range applies.
-    for tiles in cells
+    // ── Pass 2: bottom-up fill propagation ───────────────────────────────────
+    // Sequential sweep; process one zoom level at a time so children at z+1
+    // are always fully annotated before we inspect them from z.
+    let mut new_entries: Vec<(TileKey, TileAnnotation)> = Vec::new();
+    for z in (zoom_floor..zoom_ceil).rev() {
+        let (col_lo, row_lo, col_hi, row_hi) = bbox_to_xyz(bw, bs, be, bn, z);
+        for col in col_lo..=col_hi {
+            for row in row_lo..=row_hi {
+                let key = (z, col, row);
+                if source_map.contains_key(&key) {
+                    continue;
+                }
+                let c00 = source_map.get(&(z + 1, 2 * col,     2 * row    ));
+                let c10 = source_map.get(&(z + 1, 2 * col + 1, 2 * row    ));
+                let c01 = source_map.get(&(z + 1, 2 * col,     2 * row + 1));
+                let c11 = source_map.get(&(z + 1, 2 * col + 1, 2 * row + 1));
+                let ann = if let (Some(a0), Some(a1), Some(a2), Some(a3)) = (c00, c10, c01, c11) {
+                    if a0.0 == a1.0 && a0.0 == a2.0 && a0.0 == a3.0 {
+                        // All four children agree on the same source zoom — propagate.
+                        let mut idxs: Vec<usize> = a0.1.iter()
+                            .chain(&a1.1).chain(&a2.1).chain(&a3.1)
+                            .copied().collect();
+                        idxs.sort_unstable();
+                        idxs.dedup();
+                        Some((a0.0, idxs))
+                    } else {
+                        find_native_ancestor(z, col, row, &source_map, zoom_floor)
+                    }
+                } else {
+                    find_native_ancestor(z, col, row, &source_map, zoom_floor)
+                };
+                if let Some(a) = ann {
+                    new_entries.push((key, a));
+                }
+            }
+        }
+        source_map.extend(std::mem::take(&mut new_entries));
+    }
+
+    // ── Pass 3: parallel encode ───────────────────────────────────────────────
+    let tiles: Vec<EncodedTile> = source_map
         .par_iter()
-        .map(|cell| encode_cell_fill(cell, zoom_floor, zoom_ceil, &claimed))
+        .map(|(&(z, col, row), (_, idxs))| -> Result<Option<EncodedTile>> {
+            let tile_wgs84 = xyz_to_bbox(z, col, row, col, row);
+            let tile_merc  = tile_mercator_bbox(tile_wgs84);
+            let mut bytes  = Vec::<u8>::new();
+            for &i in idxs {
+                bytes.extend(encode_cell_features(&cells[i], tile_wgs84, tile_merc)?);
+            }
+            if bytes.is_empty() { return Ok(None); }
+            Ok(Some((tile_id(z, col, row), z, col, row, bytes)))
+        })
         .collect::<Result<Vec<_>>>()?
-    {
-        for (id, zoom, col, row, bytes) in tiles {
-            merge_tile(&mut tile_bytes, id, zoom, col, row, bytes)?;
-        }
+        .into_iter()
+        .flatten()
+        .collect();
+
+    info!(tiles = tiles.len(), zoom_floor, zoom_ceil, "writing tiles");
+
+    for (id, z, col, row, bytes) in tiles {
+        merge_tile(&mut tile_bytes, id, z, col, row, bytes)?;
     }
-
-    info!(tiles = tile_bytes.len(), zoom_floor, zoom_ceil, "writing tiles");
-
-    // BTreeMap is already sorted by TileID — no separate sort needed.
-
-    // Write the PMTiles archive.
-    let [bw, bs, be, bn] = if bounds[0].is_finite() {
-        bounds
-    } else {
-        [-180.0, -85.0, 180.0, 85.0]
-    };
 
     let metadata = build_metadata();
     let file =
@@ -126,148 +170,25 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path) -> Result<(u8, u8)> 
     Ok((zoom_floor, zoom_ceil))
 }
 
-// ── Per-tile helpers ─────────────────────────────────────────────────────────
+// ── Fill helpers ─────────────────────────────────────────────────────────────
 
-/// Encode all non-empty tiles produced by `cell` at `zoom` into a flat list of
-/// `(tile_id, zoom, col, row, bytes)` tuples ready for insertion into the merge map.
+/// Walk toward `zoom_floor`, returning a clone of the first `source_map` entry
+/// found at an ancestor tile of `(z, col, row)`.
 ///
-/// Pure (read-only on `cell`) and safe to call from multiple threads simultaneously.
-fn encode_cell_at_zoom(cell: &s57::S57Cell, zoom: u8) -> Result<Vec<EncodedTile>> {
-    let [west, south, east, north] = cell.bounds;
-    let (col_lo, row_lo, col_hi, row_hi) = bbox_to_xyz(west, south, east, north, zoom);
-    let mut result = Vec::new();
-    for col in col_lo..=col_hi {
-        for row in row_lo..=row_hi {
-            let tile_wgs84 = xyz_to_bbox(zoom, col, row, col, row);
-            let tile_merc = tile_mercator_bbox(tile_wgs84);
-            let bytes = encode_cell_features(cell, tile_wgs84, tile_merc)?;
-            if !bytes.is_empty() {
-                result.push((tile_id(zoom, col, row), zoom, col, row, bytes));
-            }
-        }
-    }
-    Ok(result)
-}
-
-/// Encode fill-down and fill-up tiles for one cell against the pass-1 `claimed` set.
-///
-/// **Fill-down** (tile T at zoom Z from source Z′): T is filled only when every one
-/// of the 4^(Z′−Z) child tiles of T at Z′ is natively claimed.  This prevents
-/// half-empty tiles at chart edges.  Multiple cells at the same native zoom that
-/// together cover T all contribute their bytes; the caller merges them via append.
-///
-/// **Fill-up** (tile T at zoom Z from source Z′ < Z): T is filled from the largest
-/// claimed ancestor zoom below Z.  Fill-down takes priority — if complete fine
-/// coverage exists, fill-up is skipped for that tile.
-///
-/// Pure (read-only on `cell` and `claimed`) — safe to call from rayon workers.
-fn encode_cell_fill(
-    cell: &s57::S57Cell,
-    zoom_floor: u8,
-    zoom_ceil: u8,
-    claimed: &HashSet<u64>,
-) -> Result<Vec<EncodedTile>> {
-    let native_zoom = zoom_from_scale(cell.native_scale);
-    let [west, south, east, north] = cell.bounds;
-    let mut result = Vec::new();
-
-    // Fill-down: coarser zooms below native.
-    for zoom in zoom_floor..native_zoom {
-        let (col_lo, row_lo, col_hi, row_hi) = bbox_to_xyz(west, south, east, north, zoom);
-        for col in col_lo..=col_hi {
-            for row in row_lo..=row_hi {
-                let id = tile_id(zoom, col, row);
-                if claimed.contains(&id) {
-                    continue; // native tile — leave it alone
-                }
-                if fill_down_source_zoom(zoom, col, row, zoom_ceil, claimed) != Some(native_zoom) {
-                    continue; // not our responsibility, or incomplete child coverage
-                }
-                let tile_wgs84 = xyz_to_bbox(zoom, col, row, col, row);
-                let tile_merc = tile_mercator_bbox(tile_wgs84);
-                let bytes = encode_cell_features(cell, tile_wgs84, tile_merc)?;
-                if !bytes.is_empty() {
-                    result.push((id, zoom, col, row, bytes));
-                }
-            }
-        }
-    }
-
-    // Fill-up: finer zooms above native.
-    for zoom in (native_zoom + 1)..=zoom_ceil {
-        let (col_lo, row_lo, col_hi, row_hi) = bbox_to_xyz(west, south, east, north, zoom);
-        for col in col_lo..=col_hi {
-            for row in row_lo..=row_hi {
-                let id = tile_id(zoom, col, row);
-                if claimed.contains(&id) {
-                    continue; // native tile — never overwrite
-                }
-                if fill_down_source_zoom(zoom, col, row, zoom_ceil, claimed).is_some() {
-                    continue; // fine native coverage exists; fill-down handles this
-                }
-                if fill_up_source_zoom(zoom, col, row, zoom_floor, claimed) != Some(native_zoom) {
-                    continue; // not the nearest coarser source for this location
-                }
-                let tile_wgs84 = xyz_to_bbox(zoom, col, row, col, row);
-                let tile_merc = tile_mercator_bbox(tile_wgs84);
-                let bytes = encode_cell_features(cell, tile_wgs84, tile_merc)?;
-                if !bytes.is_empty() {
-                    result.push((id, zoom, col, row, bytes));
-                }
-            }
-        }
-    }
-
-    Ok(result)
-}
-
-/// Return the smallest zoom Z′ > `zoom` such that **all** 4^(Z′−`zoom`) child
-/// tiles of `(zoom, col, row)` at Z′ are natively claimed (pass 1).
-///
-/// Pass 2 uses this to pick the fill-down source level: only fill tile T when a
-/// single finer level completely covers T, preventing half-empty seam tiles.
-/// Returns `None` when no level has complete child coverage up to `zoom_ceil`.
-fn fill_down_source_zoom(
-    zoom: u8,
+/// During pass 2 any entry at a coarser zoom was placed there by pass 1 (native
+/// claim), because the bottom-up sweep hasn't reached those levels yet when this
+/// is called.  The first hit is therefore always a native claim.
+fn find_native_ancestor(
+    z: u8,
     col: u32,
     row: u32,
-    zoom_ceil: u8,
-    claimed: &HashSet<u64>,
-) -> Option<u8> {
-    for z in (zoom + 1)..=zoom_ceil {
-        let shift = z - zoom;
-        let base_col = col << shift;
-        let base_row = row << shift;
-        let n = 1u32 << shift;
-        if (base_col..base_col + n)
-            .all(|c| (base_row..base_row + n).all(|r| claimed.contains(&tile_id(z, c, r))))
-        {
-            return Some(z);
-        }
-    }
-    None
-}
-
-/// Return the largest zoom Z′ < `zoom` whose single ancestor tile of
-/// `(zoom, col, row)` at Z′ is natively claimed (pass 1).
-///
-/// Pass 2 uses this to find the nearest coarser chart that covers a location.
-/// A coarser tile always completely contains a finer tile, so one claimed
-/// ancestor guarantees full geographic coverage — no partial-fill risk.
-/// Returns `None` when no coarser zoom has a claimed ancestor down to `zoom_floor`.
-fn fill_up_source_zoom(
-    zoom: u8,
-    col: u32,
-    row: u32,
+    source_map: &HashMap<(u8, u32, u32), (u8, Vec<usize>)>,
     zoom_floor: u8,
-    claimed: &HashSet<u64>,
-) -> Option<u8> {
-    for z in (zoom_floor..zoom).rev() {
-        let shift = zoom - z;
-        let anc_col = col >> shift;
-        let anc_row = row >> shift;
-        if claimed.contains(&tile_id(z, anc_col, anc_row)) {
-            return Some(z);
+) -> Option<(u8, Vec<usize>)> {
+    for z_prime in (zoom_floor..z).rev() {
+        let shift = z - z_prime;
+        if let Some(ann) = source_map.get(&(z_prime, col >> shift, row >> shift)) {
+            return Some(ann.clone());
         }
     }
     None
