@@ -37,7 +37,7 @@ type EncodedTile = (u64, u8, u32, u32, Vec<u8>);
 /// MVT byte blobs — valid because `Tile { repeated Layer layers = 3 }` is a
 /// protobuf repeated field; concatenating two encoded Tile messages unions
 /// their layers.
-pub fn write_pmtiles(cells: &[oesu::OesuCell], output: &Path) -> Result<(u8, u8)> {
+pub fn write_pmtiles(cells: &[crate::s57::S57Cell], output: &Path) -> Result<(u8, u8)> {
     // Accumulate raw MVT bytes per TileID; BTreeMap keeps entries in sorted order,
     // matching the PMTiles Hilbert-curve requirement without a separate sort pass.
     let mut tile_bytes: BTreeMap<u64, (TileCoord, Vec<u8>)> = BTreeMap::new();
@@ -107,7 +107,7 @@ pub fn write_pmtiles(cells: &[oesu::OesuCell], output: &Path) -> Result<(u8, u8)
 /// `(tile_id, zoom, col, row, bytes)` tuples ready for insertion into the merge map.
 ///
 /// Pure (read-only on `cell`) and safe to call from multiple threads simultaneously.
-fn encode_cell_at_zoom(cell: &oesu::OesuCell, zoom: u8) -> Result<Vec<EncodedTile>> {
+fn encode_cell_at_zoom(cell: &crate::s57::S57Cell, zoom: u8) -> Result<Vec<EncodedTile>> {
     let [west, south, east, north] = cell.bounds;
     let (col_lo, row_lo, col_hi, row_hi) = bbox_to_xyz(west, south, east, north, zoom);
     let mut result = Vec::new();
@@ -127,7 +127,7 @@ fn encode_cell_at_zoom(cell: &oesu::OesuCell, zoom: u8) -> Result<Vec<EncodedTil
 /// Encode all features from `cell` that intersect `tile_wgs84` into a raw MVT
 /// byte blob.  Returns an empty `Vec` when no features land in the tile.
 fn encode_cell_features(
-    cell: &oesu::OesuCell,
+    cell: &crate::s57::S57Cell,
     tile_wgs84: [f64; 4],
     tile_merc: [f64; 4],
 ) -> Result<Vec<u8>> {

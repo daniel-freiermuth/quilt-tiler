@@ -574,3 +574,26 @@ pub fn attribute_acronym(code: u16) -> Option<&'static str> {
     ATTRIBUTES.iter().find(|(c, _)| *c == code).map(|(_, a)| *a)
 }
 
+/// A parsed S-57 navigational chart cell ready for tile encoding.
+///
+/// Common intermediate type between chart parsers (OESU, native S-57, …)
+/// and the tile writer.  Parsers produce it; consumers read it.
+#[derive(Debug)]
+pub struct S57Cell {
+    pub name: String,
+    pub native_scale: u32,
+    /// Geographic bounds `[west, south, east, north]` in WGS84 degrees.
+    pub bounds: [f64; 4],
+    pub features: Vec<oesu::Feature>,
+}
+
+impl From<oesu::OesuCell> for S57Cell {
+    fn from(c: oesu::OesuCell) -> Self {
+        Self {
+            name: c.name,
+            native_scale: c.native_scale,
+            bounds: c.bounds,
+            features: c.features,
+        }
+    }
+}

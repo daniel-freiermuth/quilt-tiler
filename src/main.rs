@@ -106,7 +106,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     // Parse all input files in parallel; skip files that fail to parse.
-    let cells: Vec<oesu::OesuCell> = args
+    let cells: Vec<s57::S57Cell> = args
         .input
         .par_iter()
         .filter_map(|path| {
@@ -118,7 +118,8 @@ fn main() -> Result<()> {
                 }
             };
             match oesu::parse_file(&data) {
-                Ok(cell) => {
+                Ok(oesu_cell) => {
+                    let cell = s57::S57Cell::from(oesu_cell);
                     let z = zoom_from_scale(cell.native_scale);
                     info!(
                         name = %cell.name,
