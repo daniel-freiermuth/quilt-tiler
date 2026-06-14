@@ -451,11 +451,43 @@
       "paint": {}
     },
     {
+      "id": "LIGHTS_SECTOR-arc",
+      "type": "line",
+      "source": "enc",
+      "source-layer": "LIGHTS_SECTOR",
+      "minzoom": 10,
+      "filter": ["all",
+        ["==", ["get", "kind"], "arc"],
+        ["!", ["match", ["get", "CATLIT"], ["6", "8"], true, false]]
+      ],
+      "paint": {
+        "line-color": ["get", "color"],
+        "line-width": 1.5
+      }
+    },
+    {
+      "id": "LIGHTS_SECTOR-radial",
+      "type": "line",
+      "source": "enc",
+      "source-layer": "LIGHTS_SECTOR",
+      "minzoom": 10,
+      "filter": ["all",
+        ["==", ["get", "kind"], "radial"],
+        ["!", ["match", ["get", "CATLIT"], ["6", "8"], true, false]]
+      ],
+      "paint": {
+        "line-color": ["get", "color"],
+        "line-width": 1,
+        "line-dasharray": [4, 4]
+      }
+    },
+    {
       "id": "LIGHTS",
       "type": "symbol",
       "source": "enc",
       "source-layer": "LIGHTS",
       "minzoom": 10,
+      "filter": ["!", ["match", ["get", "CATLIT"], ["6", "8"], true, false]],
       "layout": {
         "icon-image": [
           "match", ["to-string", ["get", "COLOUR"]],
@@ -472,6 +504,42 @@
         "icon-ignore-placement": true
       },
       "paint": {}
+    },
+    {
+      "id": "LIGHTS-label",
+      "type": "symbol",
+      "source": "enc",
+      "source-layer": "LIGHTS",
+      "minzoom": 11,
+      "filter": ["!", ["match", ["get", "CATLIT"], ["6", "8"], true, false]],
+      "layout": {
+        "text-field": ["concat",
+          ["match", ["get", "LITCHR"],
+            1, "F", 2, "Fl", 3, "LFl", 4, "Oc",
+            5, "VQ", 6, "UQ", 7, "Iso", 8, "Q",
+            9, "IQ", 10, "IVQ", 11, "Mo", 12, "FFl",
+            25, "Q+LFl", 26, "VQ+LFl", 27, "UQ+LFl",
+            28, "Al", 29, "AlFl", ""],
+          ["coalesce", ["get", "SIGGRP"], ""],
+          ["match", ["get", "COLOUR"],
+            "3", "R", "4", "G", "5", "Bu", "6", "Y", "11", "Or", ""],
+          ["case", ["has", "SIGPER"],
+            ["concat", " ",
+              ["number-format", ["get", "SIGPER"], {"max-fraction-digits": 1}],
+              "s"],
+            ""]
+        ],
+        "text-size": 10,
+        "text-font": ["Roboto Regular"],
+        "text-anchor": "left",
+        "text-offset": [0.9, 0.1],
+        "text-optional": true
+      },
+      "paint": {
+        "text-color": "#1e293b",
+        "text-halo-color": "rgba(255,255,255,0.9)",
+        "text-halo-width": 1.5
+      }
     },
     {
       "id": "WRECKS",

@@ -414,6 +414,42 @@ fn collect_cell_features(
             layers.entry(layer_name).or_default().extend(feats);
         }
     }
+
+    // Light sector arcs — separate pass that uses the arc bounding box for intersection
+    // rather than the point position, because arcs extend up to 1200 m beyond the light.
+    for feat in &cell.features {
+        if object_acronym(feat.type_code) != Some("LIGHTS") {
+            continue;
+        }
+        let s57::Geometry::Point { lon, lat } = &feat.geometry else { continue };
+        let (lon, lat) = (*lon, *lat);
+
+        // Honour SCAMIN: same check as to_mvt_features (attribute code 133).
+        if let Some(attr) = feat.attributes.iter().find(|a| a.code == 133)
+            && let s57::AttrValue::Int(scamin) = attr.value
+            && zoom_from_scale(scamin, zoom_offset) > tile_zoom
+        {
+            continue;
+        }
+
+        // Arc bounding box: centre ± 2×r_m (radials are 2× the arc radius).
+        let valnmr = feat.attributes.iter()
+            .find(|a| a.code == 178)
+            .and_then(|a| if let s57::AttrValue::Double(v) = a.value { Some(v) } else { None })
+            .unwrap_or(3.0);
+        let r_m   = (200.0_f64 + valnmr * 50.0).min(600.0);
+        let d_lat = r_m * 2.0 / 111_320.0;
+        let d_lon = r_m * 2.0 / (111_320.0 * lat.to_radians().cos());
+
+        if lon + d_lon < tile_wgs84[0] || lon - d_lon > tile_wgs84[2]
+            || lat + d_lat < tile_wgs84[1] || lat - d_lat > tile_wgs84[3]
+        {
+            continue;
+        }
+
+        light_sectors_to_mvt(lon, lat, &feat.attributes, tile_wgs84, tile_merc, layers);
+    }
+
     Ok(())
 }
 
@@ -778,6 +814,117 @@ fn build_props(attrs: &[s57::Attribute]) -> Vec<(String, MvtValue)> {
         })
         .collect()
 }
+// ── Light sector geometry ─────────────────────────────────────────────────────
+
+/// Map S-57 COLOUR first-value to a CSS hex string suitable for tile properties.
+/// White lights use off-white so they remain legible against light backgrounds.
+fn light_colour_hex(colour: &str) -> &'static str {
+    match colour.split(',').next().unwrap_or("").trim() {
+        "3"  => "#ee2222",  // Red
+        "4"  => "#22aa22",  // Green
+        "5"  => "#2255ee",  // Blue
+        "6"  => "#ccaa00",  // Yellow
+        "9"  => "#cc8800",  // Amber
+        "11" => "#ee7700",  // Orange
+        "12" => "#cc22cc",  // Magenta
+        _    => "#f8fafc",  // White (code 1 or unknown)
+    }
+}
+
+/// Compute the destination point at `bearing_deg` (degrees clockwise from N)
+/// and `dist_m` metres from `(lon, lat)`, using a flat-Earth approximation
+/// valid for the short distances used here (≤ 1200 m).
+fn bearing_offset(lon: f64, lat: f64, bearing_deg: f64, dist_m: f64) -> [f64; 2] {
+    let d_lat = dist_m / 111_320.0;
+    let d_lon = dist_m / (111_320.0 * lat.to_radians().cos());
+    let math_rad = (90.0 - bearing_deg).to_radians();
+    [lon + d_lon * math_rad.cos(), lat + d_lat * math_rad.sin()]
+}
+
+/// Generate arc and radial sector features for one LIGHTS point and append them
+/// to `layers["LIGHTS_SECTOR"]`.
+///
+/// Radius formula mirrors the original client-side pixel heuristic:
+/// `clamp(200 + VALNMR × 50, 200, 600)` metres, which corresponds to
+/// roughly 33–100 px at zoom 13 / latitude 58 °N.
+///
+/// Attribute codes:  CATLIT=37  COLOUR=75  SECTR1=136  SECTR2=137  VALNMR=178
+fn light_sectors_to_mvt(
+    lon: f64,
+    lat: f64,
+    attrs: &[s57::Attribute],
+    tile_wgs84: [f64; 4],
+    tile_merc: [f64; 4],
+    layers: &mut HashMap<&'static str, Vec<MvtFeature>>,
+) {
+    let mut catlit: Option<MvtValue> = None;
+    let mut colour = "";
+    let mut sectr1: Option<f64> = None;
+    let mut sectr2: Option<f64> = None;
+    let mut valnmr: f64 = 3.0;
+
+    for attr in attrs {
+        match attr.code {
+            37  => { catlit = Some(match &attr.value {
+                         s57::AttrValue::Int(i)    => MvtValue::UInt(u64::from(*i)),
+                         s57::AttrValue::Str(s)    => MvtValue::String(s.clone()),
+                         s57::AttrValue::Double(f) => MvtValue::Double(*f),
+                     }); }
+            75  => { if let s57::AttrValue::Str(s) = &attr.value { colour = s.as_str(); } }
+            136 => { if let s57::AttrValue::Double(v) = attr.value { sectr1 = Some(v); } }
+            137 => { if let s57::AttrValue::Double(v) = attr.value { sectr2 = Some(v); } }
+            178 => { if let s57::AttrValue::Double(v) = attr.value { valnmr = v; } }
+            _   => {}
+        }
+    }
+
+    let color   = light_colour_hex(colour);
+    let r_m     = (200.0_f64 + valnmr * 50.0).min(600.0_f64);
+
+    let has_sectors = matches!((sectr1, sectr2), (Some(s1), Some(s2)) if s1 != s2);
+    let (from_brg, to_brg_raw) = if has_sectors {
+        (sectr1.unwrap(), sectr2.unwrap())
+    } else {
+        (0.0, 360.0)
+    };
+    let to_brg = if to_brg_raw <= from_brg { to_brg_raw + 360.0 } else { to_brg_raw };
+
+    // Arc: one point every 3° for a smooth curve.
+    let span  = to_brg - from_brg;
+    let steps = ((span / 3.0).ceil() as usize).max(4);
+    let arc: Vec<[f64; 2]> = (0..=steps)
+        .map(|i| {
+            let brg = from_brg + span * (i as f64 / steps as f64);
+            bearing_offset(lon, lat, brg, r_m)
+        })
+        .collect();
+
+    let mut push_line = |pts: Vec<[f64; 2]>, kind: &'static str| {
+        for stroke in clip_stroke(&pts, tile_wgs84) {
+            if stroke.len() < 2 { continue; }
+            let ls: MvtLineString = stroke.iter()
+                .map(|[x, y]| to_px(*x, *y, tile_merc))
+                .collect();
+            let mut f = MvtFeature::new(MvtGeometry::LineString(ls));
+            f.properties.push(("kind".into(),  MvtValue::String(kind.into())));
+            f.properties.push(("color".into(), MvtValue::String(color.into())));
+            if let Some(ref cv) = catlit {
+                f.properties.push(("CATLIT".into(), cv.clone()));
+            }
+            layers.entry("LIGHTS_SECTOR").or_default().push(f);
+        }
+    };
+
+    push_line(arc, "arc");
+
+    // Radial boundary lines at 2× arc radius, only for sector lights.
+    if has_sectors {
+        for brg in [sectr1.unwrap(), sectr2.unwrap()] {
+            push_line(vec![[lon, lat], bearing_offset(lon, lat, brg, r_m * 2.0)], "radial");
+        }
+    }
+}
+
 
 // ── MVT tile encoding ────────────────────────────────────────────────────────
 
