@@ -644,26 +644,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "oesu2geojson"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "fast-mvt",
- "indicatif",
- "martin-tile-utils",
- "oesu",
- "pmtiles",
- "profiling",
- "rayon",
- "s57",
- "serde_json",
- "tracing",
- "tracing-subscriber",
- "tracy-client",
-]
-
-[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -736,6 +716,26 @@ checksum = "4488a4a36b9a4ba6b9334a32a39971f77c1436ec82c38707bce707699cc3bbcb"
 dependencies = [
  "quote",
  "syn",
+]
+
+[[package]]
+name = "quilt-tiler"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "fast-mvt",
+ "indicatif",
+ "martin-tile-utils",
+ "oesu",
+ "pmtiles",
+ "profiling",
+ "rayon",
+ "s57",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+ "tracy-client",
 ]
 
 [[package]]

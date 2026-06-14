@@ -2,7 +2,7 @@
 members = [".", "oesu", "s57"]
 
 [package]
-name = "oesu2geojson"
+name = "quilt-tiler"
 version = "0.1.0"
 edition = "2024"
 publish = false
