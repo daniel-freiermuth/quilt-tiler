@@ -29,8 +29,10 @@ const EXTENT: f64 = 4096.0;
 type EncodedTile = (u64, u8, u32, u32, Vec<u8>);
 /// Key identifying a tile in the source map: `(zoom, col, row)`.
 type TileKey = (u8, u32, u32);
-/// Per-tile fill annotation: `(source_zoom, cell_indices)`.
-type TileAnnotation = (u8, Vec<usize>);
+/// Per-tile fill annotation: `(source_zoom, cell_indices, is_partial)`.
+/// `is_partial` is `true` for pass-1 native tiles where the union of contributing
+/// cell bboxes does not cover the full tile; `false` for all fill-propagated tiles.
+type TileAnnotation = (u8, Vec<usize>, bool);
 
 // ── Public entry point ───────────────────────────────────────────────────────
 
@@ -89,21 +91,39 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path, max_zoom: Option<u8>
     // ── Pass 1: native responsibility map ────────────────────────────────────
     info!(cells = cells.len(), zoom_floor, zoom_ceil_native, zoom_ceil, "pass 1: building native tile map");
     let pb1 = ProgressBar::new(cells.len() as u64).with_style(spinner_style());
-    let mut source_map: HashMap<TileKey, TileAnnotation> = HashMap::new();
+    // Phase 1a: collect cell indices and per-cell coverage rectangles (clipped to
+    // tile bounds) into a raw map.
+    let mut raw_map: HashMap<TileKey, (Vec<usize>, Vec<[f64; 4]>)> = HashMap::new();
     for (i, cell) in cells.iter().enumerate() {
         let z = zoom(cell.native_scale);
         let [west, south, east, north] = cell.bounds;
         let (col_lo, row_lo, col_hi, row_hi) = bbox_to_xyz(west, south, east, north, z);
         for col in col_lo..=col_hi {
             for row in row_lo..=row_hi {
-                source_map.entry((z, col, row))
-                    .or_insert_with(|| (z, Vec::new()))
-                    .1.push(i);
+                let tile_bbox = xyz_to_bbox(z, col, row, col, row);
+                let cov = [
+                    west.max(tile_bbox[0]), south.max(tile_bbox[1]),
+                    east.min(tile_bbox[2]), north.min(tile_bbox[3]),
+                ];
+                let e = raw_map.entry((z, col, row)).or_default();
+                e.0.push(i);
+                e.1.push(cov);
             }
         }
         pb1.inc(1);
     }
     pb1.finish_and_clear();
+    // Phase 1b: compute partiality — a tile is partial when the union of its cells'
+    // clipped bboxes does not cover the full tile.  Two adjacent cells that share
+    // an exact boundary produce a union equal to the tile area and are not partial.
+    let mut source_map: HashMap<TileKey, TileAnnotation> = HashMap::with_capacity(raw_map.len());
+    for ((z, col, row), (cell_idxs, cov_rects)) in raw_map {
+        let tile_bbox = xyz_to_bbox(z, col, row, col, row);
+        let tile_area = (tile_bbox[2] - tile_bbox[0]) * (tile_bbox[3] - tile_bbox[1]);
+        let covered   = rect_union_area(&cov_rects, tile_bbox);
+        let is_partial = tile_area > 0.0 && covered < tile_area * (1.0 - 1e-6);
+        source_map.insert((z, col, row), (z, cell_idxs, is_partial));
+    }
     let native_count = source_map.len();
     info!(native_tiles = native_count, "pass 1 done");
 
@@ -141,7 +161,7 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path, max_zoom: Option<u8>
                         .collect();
                     idxs.sort_unstable();
                     idxs.dedup();
-                    Some((source_z, idxs))
+                    Some((source_z, idxs, false))
                 } else {
                     // No children at all or some down-filled children
                     find_native_ancestor(z, col, row, &source_map, zoom_floor)
@@ -176,13 +196,38 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path, max_zoom: Option<u8>
     let tiles: Vec<EncodedTile> = source_map
         .par_iter()
         .progress_with(pb3.clone())
-        .map(|(&(z, col, row), (_, idxs))| -> Result<Option<EncodedTile>> {
+        .map(|(&(z, col, row), (_, idxs, partial))| -> Result<Option<EncodedTile>> {
             profiling::scope!("tile");
             let tile_wgs84 = xyz_to_bbox(z, col, row, col, row);
             let tile_merc  = tile_mercator_bbox(tile_wgs84);
             let mut layers: HashMap<&'static str, Vec<MvtFeature>> = HashMap::new();
             for &i in idxs {
                 collect_cell_features(&cells[i], tile_wgs84, tile_merc, z, zoom_offset, &mut layers)?;
+            }
+            // For partial native tiles: look one level deeper for finer cells that
+            // cover the area not reached by the native cell(s).  Guarded by `partial`
+            // so fully-covered tiles never pay this cost and the detail does not
+            // cascade into coarser zoom levels via source_map.
+            if *partial {
+                let child_keys = [
+                    (z + 1, 2 * col,     2 * row    ),
+                    (z + 1, 2 * col + 1, 2 * row    ),
+                    (z + 1, 2 * col,     2 * row + 1),
+                    (z + 1, 2 * col + 1, 2 * row + 1),
+                ];
+                let mut seen: Vec<usize> = idxs.clone();
+                for ck in &child_keys {
+                    if let Some((child_src_z, child_idxs, _)) = source_map.get(ck) {
+                        if *child_src_z > z {
+                            for &i in child_idxs {
+                                if !seen.contains(&i) {
+                                    seen.push(i);
+                                    collect_cell_features(&cells[i], tile_wgs84, tile_merc, z, zoom_offset, &mut layers)?;
+                                }
+                            }
+                        }
+                    }
+                }
             }
             let bytes = encode_tile(layers)?;
             if bytes.is_empty() { return Ok(None); }
@@ -234,16 +279,59 @@ fn find_native_ancestor(
     z: u8,
     col: u32,
     row: u32,
-    source_map: &HashMap<(u8, u32, u32), (u8, Vec<usize>)>,
+    source_map: &HashMap<(u8, u32, u32), (u8, Vec<usize>, bool)>,
     zoom_floor: u8,
-) -> Option<(u8, Vec<usize>)> {
+) -> Option<(u8, Vec<usize>, bool)> {
     for z_prime in (zoom_floor..z).rev() {
         let shift = z - z_prime;
         if let Some(ann) = source_map.get(&(z_prime, col >> shift, row >> shift)) {
-            return Some(ann.clone());
+            // Tiles filled from an ancestor are never considered partial: the
+            // ancestor was the best available data and no finer augmentation applies.
+            return Some((ann.0, ann.1.clone(), false));
         }
     }
     None
+}
+
+/// Area of the union of `rects` clipped to `tile [W, S, E, N]`.
+///
+/// Uses coordinate-compressed sweep-line: O(N²) for N rectangles, which is
+/// acceptable because N is typically 1–4 native cells per tile.
+fn rect_union_area(rects: &[[f64; 4]], tile: [f64; 4]) -> f64 {
+    let mut xs: Vec<f64> = Vec::with_capacity(rects.len() * 2 + 2);
+    xs.push(tile[0]);
+    xs.push(tile[2]);
+    for r in rects {
+        let x0 = r[0].max(tile[0]).min(tile[2]);
+        let x1 = r[2].max(tile[0]).min(tile[2]);
+        if x0 > tile[0] { xs.push(x0); }
+        if x1 < tile[2] { xs.push(x1); }
+    }
+    xs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    xs.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
+
+    let mut area = 0.0_f64;
+    for win in xs.windows(2) {
+        let (x0, x1) = (win[0], win[1]);
+        let xmid = (x0 + x1) * 0.5;
+        // Collect y-intervals from rectangles whose x-range spans xmid.
+        let mut segs: Vec<[f64; 2]> = rects
+            .iter()
+            .filter(|r| r[0] <= xmid && r[2] >= xmid)
+            .map(|r| [r[1].max(tile[1]), r[3].min(tile[3])])
+            .filter(|[y0, y1]| y1 > y0)
+            .collect();
+        segs.sort_unstable_by(|a, b| a[0].partial_cmp(&b[0]).unwrap());
+        // Sweep to compute union length of y-intervals.
+        let mut y_cover = 0.0_f64;
+        let mut hi = tile[1];
+        for [y0, y1] in segs {
+            let lo = y0.max(hi);
+            if lo < y1 { y_cover += y1 - lo; hi = hi.max(y1); }
+        }
+        area += (x1 - x0) * y_cover;
+    }
+    area
 }
 
 // ── Progress bar styles ──────────────────────────────────────────────────────
