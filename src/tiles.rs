@@ -204,18 +204,30 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path, max_zoom: Option<u8>
             for &i in idxs {
                 collect_cell_features(&cells[i], tile_wgs84, tile_merc, z, zoom_offset, &mut layers)?;
             }
-            // For partial native tiles: look one level deeper for finer cells that
-            // cover the area not reached by the native cell(s).  Guarded by `partial`
-            // so fully-covered tiles never pay this cost and the detail does not
-            // cascade into coarser zoom levels via source_map.
+            // For partial native tiles: augment with adjacent data.
+            //
+            // Two sources, tried in order:
+            //
+            // 1. z+1 children with source_z > z  →  finer cells that clip into
+            //    this tile but were not in the pass-1 annotation (BL7II5/AL7ID6 case).
+            //
+            // 2. If no finer data found: walk up the ancestor chain looking for the
+            //    nearest coarser tile whose cells differ from the ones we already have.
+            //    This covers tiles where the native cell only clips a small fringe and
+            //    the rest of the area is owned by a coarser-scale chart (58.41N/11.26E case).
+            //
+            // Guarded by `is_partial` so fully-covered tiles pay neither cost.
             if *partial {
+                let mut seen: Vec<usize> = idxs.clone();
+
+                // — finer pass —
                 let child_keys = [
                     (z + 1, 2 * col,     2 * row    ),
                     (z + 1, 2 * col + 1, 2 * row    ),
                     (z + 1, 2 * col,     2 * row + 1),
                     (z + 1, 2 * col + 1, 2 * row + 1),
                 ];
-                let mut seen: Vec<usize> = idxs.clone();
+                let mut added_finer = false;
                 for ck in &child_keys {
                     if let Some((child_src_z, child_idxs, _)) = source_map.get(ck) {
                         if *child_src_z > z {
@@ -223,8 +235,31 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path, max_zoom: Option<u8>
                                 if !seen.contains(&i) {
                                     seen.push(i);
                                     collect_cell_features(&cells[i], tile_wgs84, tile_merc, z, zoom_offset, &mut layers)?;
+                                    added_finer = true;
                                 }
                             }
+                        }
+                    }
+                }
+
+                // — coarser pass (only when finer pass found nothing) —
+                if !added_finer {
+                    let (mut az, mut ac, mut ar) = (z, col, row);
+                    while az > zoom_floor {
+                        az -= 1;
+                        ac >>= 1;
+                        ar >>= 1;
+                        if let Some((_, anc_idxs, _)) = source_map.get(&(az, ac, ar)) {
+                            let mut added_anc = false;
+                            for &i in anc_idxs {
+                                if !seen.contains(&i) {
+                                    seen.push(i);
+                                    collect_cell_features(&cells[i], tile_wgs84, tile_merc, z, zoom_offset, &mut layers)?;
+                                    added_anc = true;
+                                }
+                            }
+                            if added_anc { break; }
+                            // ancestor's cells are a strict subset of seen — try coarser
                         }
                     }
                 }
