@@ -4,7 +4,7 @@ Quilts cell-based charts like traditional seacharts with a few meaningful mixed 
 
 Supported input formats: S57-ish (.000 (planned), decrypted oesu, osenc, GeoJSON-representations) and also raster-cells (planned).
 
-Supported output formats: mbtiles/pmtiles carrying mvt or mlt (and soon png).
+Supported output formats: mbtiles/pmtiles carrying mvt or mlt (and soon png) and an accompanying style.json.
 
 ## Usage
 
