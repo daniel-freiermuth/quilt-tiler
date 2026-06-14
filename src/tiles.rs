@@ -3,8 +3,8 @@
 //!   1. Build a `source_map` of which cells are responsible for each tile.
 //!   2. Bottom-up sweep (fine → coarse): propagate fill annotations without
 //!      re-examining individual cells — each tile checks only its 4 children.
-//!   3. Parallel encode: for each annotated tile, clip+project each responsible
-//!      cell's geometry and merge via protobuf byte-append.
+//!   3. Parallel encode: for each annotated tile, collect features from all
+//!      responsible cells into a shared layer map, then encode one MVT tile.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -52,9 +52,9 @@ type TileAnnotation = (u8, Vec<usize>);
 ///    - Otherwise → `find_native_ancestor`: walk toward `zoom_floor` and use the
 ///      first native tile that covers this location (fill-up fallback).
 ///
-/// 3. Parallel encode.  For each annotated tile, clip each responsible cell's
-///    geometry to the tile's WGS84 bbox, project to MVT pixel space, and merge
-///    the resulting byte blobs via protobuf repeated-field append.
+/// 3. Parallel encode.  For each annotated tile, collect features from all
+///    responsible cells into a shared per-object-type layer map, then encode
+///    a single MVT tile with one layer per S-57 object acronym.
 // The three passes share source_map, native_count, and bounds; splitting them
 // into sub-functions would just scatter those locals. Accept the length.
 #[allow(clippy::too_many_lines)]
@@ -180,10 +180,11 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path, max_zoom: Option<u8>
             profiling::scope!("tile");
             let tile_wgs84 = xyz_to_bbox(z, col, row, col, row);
             let tile_merc  = tile_mercator_bbox(tile_wgs84);
-            let mut bytes  = Vec::<u8>::new();
+            let mut layers: HashMap<&'static str, Vec<MvtFeature>> = HashMap::new();
             for &i in idxs {
-                bytes.extend(encode_cell_features(&cells[i], tile_wgs84, tile_merc, z, zoom_offset)?);
+                collect_cell_features(&cells[i], tile_wgs84, tile_merc, z, zoom_offset, &mut layers)?;
             }
+            let bytes = encode_tile(layers)?;
             if bytes.is_empty() { return Ok(None); }
             Ok(Some((tile_id(z, col, row), z, col, row, bytes)))
         })
@@ -266,17 +267,18 @@ fn bar_style() -> ProgressStyle {
     .progress_chars("=>-")
 }
 
-/// Encode all features from `cell` that intersect `tile_wgs84` into a raw MVT
-/// byte blob.  Returns an empty `Vec` when no features land in the tile.
+/// Collect all features from `cell` that intersect `tile_wgs84` into `layers`.
+/// Features are keyed by S-57 object acronym; entries are accumulated so that
+/// callers can call this for multiple cells and get a single merged layer map.
 #[profiling::function]
-fn encode_cell_features(
+fn collect_cell_features(
     cell: &s57::S57Cell,
     tile_wgs84: [f64; 4],
     tile_merc: [f64; 4],
     tile_zoom: u8,
     zoom_offset: f64,
-) -> Result<Vec<u8>> {
-    let mut layers: HashMap<&'static str, Vec<MvtFeature>> = HashMap::new();
+    layers: &mut HashMap<&'static str, Vec<MvtFeature>>,
+) -> Result<()> {
     for feat in &cell.features {
         if !feat_intersects(feat, tile_wgs84) {
             continue;
@@ -289,15 +291,10 @@ fn encode_cell_features(
             layers.entry(layer_name).or_default().extend(feats);
         }
     }
-    if layers.is_empty() {
-        return Ok(Vec::new());
-    }
-    encode_tile(layers)
+    Ok(())
 }
 
-/// Insert or append `bytes` for tile `(zoom, col, row)` into `tile_bytes`.
-/// Appending is valid because `Tile { repeated Layer layers }` is a protobuf
-/// repeated field; concatenating two encoded `Tile` messages unions their layers.
+/// Insert `bytes` for tile `(zoom, col, row)` into `tile_bytes`.
 fn merge_tile(
     tile_bytes: &mut BTreeMap<u64, (TileCoord, Vec<u8>)>,
     id: u64,
