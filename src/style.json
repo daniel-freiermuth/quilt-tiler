@@ -24,6 +24,17 @@
       }
     },
     {
+      "id": "BUISGL-fill",
+      "type": "fill",
+      "source": "enc",
+      "source-layer": "BUISGL",
+      "filter": ["==", ["geometry-type"], "Polygon"],
+      "paint": {
+        "fill-color": "#d5c9b0",
+        "fill-outline-color": "#9e8e6a"
+      }
+    },
+    {
       "id": "DEPARE-shoal",
       "type": "fill",
       "source": "enc",
@@ -76,6 +87,26 @@
       }
     },
     {
+      "id": "CTNARE",
+      "type": "fill",
+      "source": "enc",
+      "source-layer": "CTNARE",
+      "paint": {
+        "fill-color": "rgba(255, 165, 0, 0.06)",
+        "fill-outline-color": "rgba(200, 120, 0, 0.4)"
+      }
+    },
+    {
+      "id": "PRCARE",
+      "type": "fill",
+      "source": "enc",
+      "source-layer": "PRCARE",
+      "paint": {
+        "fill-color": "rgba(150, 80, 180, 0.06)",
+        "fill-outline-color": "rgba(120, 50, 160, 0.4)"
+      }
+    },
+    {
       "id": "SEAARE",
       "type": "fill",
       "source": "enc",
@@ -83,6 +114,17 @@
       "paint": {
         "fill-color": "rgba(100, 149, 237, 0.05)",
         "fill-outline-color": "rgba(100, 149, 237, 0.4)"
+      }
+    },
+    {
+      "id": "ACHARE",
+      "type": "fill",
+      "source": "enc",
+      "source-layer": "ACHARE",
+      "filter": ["==", ["geometry-type"], "Polygon"],
+      "paint": {
+        "fill-color": "rgba(255, 215, 0, 0.07)",
+        "fill-outline-color": "rgba(180, 140, 0, 0.5)"
       }
     },
     {
@@ -103,6 +145,91 @@
       "paint": {
         "line-color": "#808b96",
         "line-width": 1
+      }
+    },
+    {
+      "id": "CBLOHD",
+      "type": "line",
+      "source": "enc",
+      "source-layer": "CBLOHD",
+      "paint": {
+        "line-color": "#884ea0",
+        "line-width": 1,
+        "line-dasharray": [8, 3]
+      }
+    },
+    {
+      "id": "BRIDGE-fill",
+      "type": "fill",
+      "source": "enc",
+      "source-layer": "BRIDGE",
+      "filter": ["==", ["geometry-type"], "Polygon"],
+      "paint": {
+        "fill-color": ["match", ["get", "CATBRG"],
+          ["3", "4", "5", "6", "7", "8"], "#e59866",
+          ["9"], "#ccd1d1",
+          "#5d6d7e"
+        ],
+        "fill-outline-color": ["match", ["get", "CATBRG"],
+          ["3", "4", "5", "6", "7", "8"], "#ca6f1e",
+          ["9"], "#a9b7b7",
+          "#2c3e50"
+        ]
+      }
+    },
+    {
+      "id": "BRIDGE",
+      "type": "line",
+      "source": "enc",
+      "source-layer": "BRIDGE",
+      "filter": ["==", ["geometry-type"], "LineString"],
+      "paint": {
+        "line-color": ["match", ["get", "CATBRG"],
+          ["3", "4", "5", "6", "7", "8"], "#ca6f1e",
+          ["9"], "#a9b7b7",
+          "#2c3e50"
+        ],
+        "line-width": ["match", ["get", "CATBRG"],
+          ["9"], 0.75,
+          2
+        ]
+      }
+    },
+    {
+      "id": "BRIDGE-open",
+      "type": "symbol",
+      "source": "enc",
+      "source-layer": "BRIDGE",
+      "filter": ["match", ["get", "CATBRG"], ["3", "4", "5", "6", "7", "8"], true, false],
+      "layout": {
+        "icon-image": "Opening_bridge",
+        "icon-size": 1,
+        "symbol-placement": "line-center",
+        "icon-allow-overlap": true,
+        "icon-ignore-placement": true
+      },
+      "paint": {}
+    },
+    {
+      "id": "ROADWY",
+      "type": "line",
+      "source": "enc",
+      "source-layer": "ROADWY",
+      "paint": {
+        "line-color": "#808b96",
+        "line-width": 1
+      }
+    },
+    {
+      "id": "LNDELV",
+      "type": "line",
+      "source": "enc",
+      "source-layer": "LNDELV",
+      "filter": ["==", ["geometry-type"], "LineString"],
+      "paint": {
+        "line-color": "#a0785a",
+        "line-width": 0.75,
+        "line-opacity": 0.8
       }
     },
     {
@@ -138,6 +265,17 @@
       }
     },
     {
+      "id": "RCRTCL",
+      "type": "line",
+      "source": "enc",
+      "source-layer": "RCRTCL",
+      "paint": {
+        "line-color": "#1a5276",
+        "line-width": 1.5,
+        "line-dasharray": [10, 4]
+      }
+    },
+    {
       "id": "TRAFIC",
       "type": "line",
       "source": "enc",
@@ -155,7 +293,11 @@
       "source-layer": "SOUNDG",
       "minzoom": 13,
       "layout": {
-        "text-field": ["get", "VALDCO"],
+        "text-field": ["case",
+          ["<", ["get", "VALDCO"], 10],
+          ["number-format", ["get", "VALDCO"], {"max-fraction-digits": 1}],
+          ["number-format", ["get", "VALDCO"], {"max-fraction-digits": 0}]
+        ],
         "text-size": 10,
         "text-font": ["Roboto Regular"],
         "text-allow-overlap": false,
@@ -235,6 +377,29 @@
       "paint": {}
     },
     {
+      "id": "BOYSAW",
+      "type": "symbol",
+      "source": "enc",
+      "source-layer": "BOYSAW",
+      "minzoom": 10,
+      "layout": {
+        "icon-image": ["match", ["get", "BOYSHP"],
+          1, "Q20b_Conical_buoy",
+          2, "Q21b_Can_buoy",
+          3, "Q22a_Spherical_buoy",
+          4, "Q23b_Pillar_buoy",
+          5, "Q24_Spar_buoy",
+          6, "Q25a_Barrel_buoy",
+          7, "Q26_Super_buoy",
+          "Q22a_Spherical_buoy"
+        ],
+        "icon-size": 1,
+        "icon-allow-overlap": true,
+        "icon-ignore-placement": true
+      },
+      "paint": {}
+    },
+    {
       "id": "BCNLAT",
       "type": "symbol",
       "source": "enc",
@@ -265,6 +430,20 @@
       "minzoom": 10,
       "layout": {
         "icon-image": "Q81_Beacon",
+        "icon-size": 1,
+        "icon-allow-overlap": true,
+        "icon-ignore-placement": true
+      },
+      "paint": {}
+    },
+    {
+      "id": "PILBOP",
+      "type": "symbol",
+      "source": "enc",
+      "source-layer": "PILBOP",
+      "minzoom": 10,
+      "layout": {
+        "icon-image": "T1_pilot_boarding_place",
         "icon-size": 1,
         "icon-allow-overlap": true,
         "icon-ignore-placement": true
@@ -319,6 +498,50 @@
         "icon-size": 1,
         "icon-allow-overlap": true,
         "icon-ignore-placement": true
+      },
+      "paint": {}
+    },
+    {
+      "id": "LNDMRK",
+      "type": "symbol",
+      "source": "enc",
+      "source-layer": "LNDMRK",
+      "minzoom": 10,
+      "filter": ["==", ["geometry-type"], "Point"],
+      "layout": {
+        "icon-image": [
+          "match", ["get", "CATLMK"],
+          20, "E10_Church",
+          3,  "E22_Chimney",
+          6,  "E23_Flare_stack",
+          7,  "E2x_Mast",
+          18, "E25_Windmill",
+          19, "E26_Windmotor",
+          17, ["case",
+            ["==", ["coalesce", ["get", "FUNCTN"], ""], "33"], "E10_Church",
+            ["==", ["coalesce", ["get", "FUNCTN"], ""], "14"], "E21_Water_tower",
+            "E20_Tower"
+          ],
+          ""
+        ],
+        "icon-size": 1,
+        "icon-allow-overlap": true,
+        "icon-ignore-placement": true
+      },
+      "paint": {}
+    },
+    {
+      "id": "BUISGL",
+      "type": "symbol",
+      "source": "enc",
+      "source-layer": "BUISGL",
+      "minzoom": 14,
+      "filter": ["==", ["geometry-type"], "Point"],
+      "layout": {
+        "icon-image": "Building",
+        "icon-size": 1,
+        "icon-allow-overlap": false,
+        "icon-ignore-placement": false
       },
       "paint": {}
     },
@@ -384,7 +607,13 @@
       "minzoom": 14,
       "filter": ["has", "VALSOU"],
       "layout": {
-        "text-field": ["concat", "(", ["to-string", ["get", "VALSOU"]], ")"],
+        "text-field": ["concat", "(",
+          ["case",
+            ["<", ["get", "VALSOU"], 10],
+            ["number-format", ["get", "VALSOU"], {"max-fraction-digits": 1}],
+            ["number-format", ["get", "VALSOU"], {"max-fraction-digits": 0}]
+          ],
+        ")"],
         "text-font": ["Roboto Italic"],
         "text-size": 10,
         "text-offset": [0.5, 0.35],
@@ -409,6 +638,412 @@
         "text-font": ["Roboto Regular"],
         "text-offset": [0, 1.2],
         "text-anchor": "top"
+      },
+      "paint": {
+        "text-color": "#1a5276",
+        "text-halo-color": "rgba(255,255,255,0.8)",
+        "text-halo-width": 1
+      }
+    },
+    {
+      "id": "SEAARE-label",
+      "type": "symbol",
+      "source": "enc",
+      "source-layer": "SEAARE",
+      "filter": ["==", ["geometry-type"], "Point"],
+      "layout": {
+        "text-field": ["get", "OBJNAM"],
+        "text-size": 11,
+        "text-font": ["Roboto Italic"],
+        "text-optional": true
+      },
+      "paint": {
+        "text-color": "#2e86c1",
+        "text-halo-color": "rgba(255,255,255,0.7)",
+        "text-halo-width": 1.5
+      }
+    },
+    {
+      "id": "ACHARE-label",
+      "type": "symbol",
+      "source": "enc",
+      "source-layer": "ACHARE",
+      "filter": ["==", ["geometry-type"], "Point"],
+      "layout": {
+        "text-field": ["get", "OBJNAM"],
+        "text-size": 11,
+        "text-font": ["Roboto Bold"],
+        "text-optional": true
+      },
+      "paint": {
+        "text-color": "#1a5276",
+        "text-halo-color": "rgba(255,255,255,0.8)",
+        "text-halo-width": 1
+      }
+    },
+    {
+      "id": "LNDRGN-label",
+      "type": "symbol",
+      "source": "enc",
+      "source-layer": "LNDRGN",
+      "layout": {
+        "text-field": ["get", "OBJNAM"],
+        "text-size": 10,
+        "text-font": ["Roboto Italic"],
+        "text-optional": true
+      },
+      "paint": {
+        "text-color": "#5d4037",
+        "text-halo-color": "rgba(255,255,255,0.8)",
+        "text-halo-width": 1
+      }
+    },
+    {
+      "id": "LNDMRK-label",
+      "type": "symbol",
+      "source": "enc",
+      "source-layer": "LNDMRK",
+      "minzoom": 12,
+      "filter": ["==", ["geometry-type"], "Point"],
+      "layout": {
+        "text-field": ["get", "OBJNAM"],
+        "text-size": 10,
+        "text-font": ["Roboto Regular"],
+        "text-offset": [0, 1.5],
+        "text-anchor": "top",
+        "text-optional": true
+      },
+      "paint": {
+        "text-color": "#2c3e50",
+        "text-halo-color": "rgba(255,255,255,0.8)",
+        "text-halo-width": 1
+      }
+    },
+    {
+      "id": "CBLOHD-label",
+      "type": "symbol",
+      "source": "enc",
+      "source-layer": "CBLOHD",
+      "layout": {
+        "text-field": ["number-format", ["get", "VERCLR"], {"max-fraction-digits": 1}],
+        "text-size": 10,
+        "text-font": ["Roboto Regular"],
+        "symbol-placement": "line-center",
+        "text-optional": true
+      },
+      "paint": {
+        "text-color": "#884ea0",
+        "text-halo-color": "rgba(255,255,255,0.9)",
+        "text-halo-width": 1.5
+      }
+    },
+    {
+      "id": "DEPCNT-label",
+      "type": "symbol",
+      "source": "enc",
+      "source-layer": "DEPCNT",
+      "minzoom": 13,
+      "layout": {
+        "text-field": ["number-format", ["get", "VALDCO"], {"max-fraction-digits": 0}],
+        "text-size": 9,
+        "text-font": ["Roboto Regular"],
+        "symbol-placement": "line-center",
+        "symbol-spacing": 500,
+        "text-optional": true
+      },
+      "paint": {
+        "text-color": "#5dade2",
+        "text-halo-color": "rgba(255,255,255,0.85)",
+        "text-halo-width": 1.5
+      }
+    },
+    {
+      "id": "BRIDGE-label",
+      "type": "symbol",
+      "source": "enc",
+      "source-layer": "BRIDGE",
+      "layout": {
+        "text-field": ["case",
+          ["has", "VERCOP"],
+            ["concat", "clr=", ["number-format", ["get", "VERCOP"], {"max-fraction-digits": 1}],
+                       " cl=", ["number-format", ["get", "VERCCL"], {"max-fraction-digits": 1}]],
+          ["has", "VERCCL"],
+            ["concat", "cl=", ["number-format", ["get", "VERCCL"], {"max-fraction-digits": 1}]],
+          ["has", "VERCLR"],
+            ["concat", "clr=", ["number-format", ["get", "VERCLR"], {"max-fraction-digits": 1}]],
+          ""
+        ],
+        "text-size": 10,
+        "text-font": ["Roboto Regular"],
+        "symbol-placement": "point",
+        "text-optional": true
+      },
+      "paint": {
+        "text-color": "#2c3e50",
+        "text-halo-color": "rgba(255,255,255,0.9)",
+        "text-halo-width": 1.5
+      }
+    },
+    {
+      "id": "BUAARE-label",
+      "type": "symbol",
+      "source": "enc",
+      "source-layer": "BUAARE",
+      "minzoom": 9,
+      "layout": {
+        "text-field": ["get", "OBJNAM"],
+        "text-size": 12,
+        "text-font": ["Roboto Bold"],
+        "text-optional": true
+      },
+      "paint": {
+        "text-color": "#2c3e50",
+        "text-halo-color": "rgba(255,255,255,0.8)",
+        "text-halo-width": 2
+      }
+    },
+    {
+      "id": "LNDARE-label",
+      "type": "symbol",
+      "source": "enc",
+      "source-layer": "LNDARE",
+      "minzoom": 13,
+      "filter": ["==", ["geometry-type"], "Point"],
+      "layout": {
+        "text-field": ["get", "OBJNAM"],
+        "text-size": 10,
+        "text-font": ["Roboto Regular"],
+        "text-optional": true
+      },
+      "paint": {
+        "text-color": "#7d6608",
+        "text-halo-color": "rgba(255,255,255,0.8)",
+        "text-halo-width": 1
+      }
+    },
+    {
+      "id": "RESARE-label",
+      "type": "symbol",
+      "source": "enc",
+      "source-layer": "RESARE",
+      "minzoom": 14,
+      "layout": {
+        "text-field": ["get", "INFORM"],
+        "text-size": 9,
+        "text-font": ["Roboto Regular"],
+        "text-max-width": 8,
+        "text-optional": true
+      },
+      "paint": {
+        "text-color": "#922b21",
+        "text-halo-color": "rgba(255,255,255,0.8)",
+        "text-halo-width": 1
+      }
+    },
+    {
+      "id": "CTNARE-label",
+      "type": "symbol",
+      "source": "enc",
+      "source-layer": "CTNARE",
+      "minzoom": 13,
+      "filter": ["==", ["geometry-type"], "Point"],
+      "layout": {
+        "text-field": ["get", "INFORM"],
+        "text-size": 9,
+        "text-font": ["Roboto Italic"],
+        "text-max-width": 8,
+        "text-optional": true
+      },
+      "paint": {
+        "text-color": "#b7950b",
+        "text-halo-color": "rgba(255,255,255,0.8)",
+        "text-halo-width": 1
+      }
+    },
+    {
+      "id": "PRCARE-label",
+      "type": "symbol",
+      "source": "enc",
+      "source-layer": "PRCARE",
+      "minzoom": 12,
+      "layout": {
+        "text-field": ["get", "INFORM"],
+        "text-size": 9,
+        "text-font": ["Roboto Italic"],
+        "text-max-width": 8,
+        "text-optional": true
+      },
+      "paint": {
+        "text-color": "#6c3483",
+        "text-halo-color": "rgba(255,255,255,0.8)",
+        "text-halo-width": 1
+      }
+    },
+    {
+      "id": "SLOGRD-label",
+      "type": "symbol",
+      "source": "enc",
+      "source-layer": "SLOGRD",
+      "minzoom": 12,
+      "layout": {
+        "text-field": ["get", "OBJNAM"],
+        "text-size": 9,
+        "text-font": ["Roboto Italic"],
+        "text-optional": true
+      },
+      "paint": {
+        "text-color": "#6e2f1a",
+        "text-halo-color": "rgba(255,255,255,0.7)",
+        "text-halo-width": 1
+      }
+    },
+    {
+      "id": "GATCON-label",
+      "type": "symbol",
+      "source": "enc",
+      "source-layer": "GATCON",
+      "minzoom": 12,
+      "layout": {
+        "text-field": ["coalesce", ["get", "OBJNAM"], ["get", "NOBJNM"]],
+        "text-size": 9,
+        "text-font": ["Roboto Regular"],
+        "text-optional": true
+      },
+      "paint": {
+        "text-color": "#1a5276",
+        "text-halo-color": "rgba(255,255,255,0.8)",
+        "text-halo-width": 1
+      }
+    },
+    {
+      "id": "ADMARE-label",
+      "type": "symbol",
+      "source": "enc",
+      "source-layer": "ADMARE",
+      "minzoom": 11,
+      "layout": {
+        "text-field": ["get", "OBJNAM"],
+        "text-size": 10,
+        "text-font": ["Roboto Italic"],
+        "text-optional": true
+      },
+      "paint": {
+        "text-color": "#515a5a",
+        "text-halo-color": "rgba(255,255,255,0.7)",
+        "text-halo-width": 1
+      }
+    },
+    {
+      "id": "RCRTCL-label",
+      "type": "symbol",
+      "source": "enc",
+      "source-layer": "RCRTCL",
+      "layout": {
+        "text-field": ["get", "OBJNAM"],
+        "text-size": 9,
+        "text-font": ["Roboto Regular"],
+        "symbol-placement": "line-center",
+        "text-optional": true
+      },
+      "paint": {
+        "text-color": "#1a5276",
+        "text-halo-color": "rgba(255,255,255,0.8)",
+        "text-halo-width": 1
+      }
+    },
+    {
+      "id": "BOYSAW-label",
+      "type": "symbol",
+      "source": "enc",
+      "source-layer": "BOYSAW",
+      "minzoom": 12,
+      "layout": {
+        "text-field": ["get", "OBJNAM"],
+        "text-size": 10,
+        "text-font": ["Roboto Regular"],
+        "text-offset": [0, 1.2],
+        "text-anchor": "top",
+        "text-optional": true
+      },
+      "paint": {
+        "text-color": "#1a5276",
+        "text-halo-color": "rgba(255,255,255,0.8)",
+        "text-halo-width": 1
+      }
+    },
+    {
+      "id": "PILBOP-label",
+      "type": "symbol",
+      "source": "enc",
+      "source-layer": "PILBOP",
+      "minzoom": 11,
+      "layout": {
+        "text-field": ["get", "OBJNAM"],
+        "text-size": 10,
+        "text-font": ["Roboto Regular"],
+        "text-offset": [0, 1.2],
+        "text-anchor": "top",
+        "text-optional": true
+      },
+      "paint": {
+        "text-color": "#1a5276",
+        "text-halo-color": "rgba(255,255,255,0.8)",
+        "text-halo-width": 1
+      }
+    },
+    {
+      "id": "BCNSPP-label",
+      "type": "symbol",
+      "source": "enc",
+      "source-layer": "BCNSPP",
+      "minzoom": 12,
+      "layout": {
+        "text-field": ["get", "OBJNAM"],
+        "text-size": 10,
+        "text-font": ["Roboto Regular"],
+        "text-offset": [0, 1.2],
+        "text-anchor": "top",
+        "text-optional": true
+      },
+      "paint": {
+        "text-color": "#1a5276",
+        "text-halo-color": "rgba(255,255,255,0.8)",
+        "text-halo-width": 1
+      }
+    },
+    {
+      "id": "BOYCAR-label",
+      "type": "symbol",
+      "source": "enc",
+      "source-layer": "BOYCAR",
+      "minzoom": 12,
+      "layout": {
+        "text-field": ["get", "OBJNAM"],
+        "text-size": 10,
+        "text-font": ["Roboto Regular"],
+        "text-offset": [0, 1.2],
+        "text-anchor": "top",
+        "text-optional": true
+      },
+      "paint": {
+        "text-color": "#1a5276",
+        "text-halo-color": "rgba(255,255,255,0.8)",
+        "text-halo-width": 1
+      }
+    },
+    {
+      "id": "BOYSPP-label",
+      "type": "symbol",
+      "source": "enc",
+      "source-layer": "BOYSPP",
+      "minzoom": 12,
+      "layout": {
+        "text-field": ["get", "OBJNAM"],
+        "text-size": 10,
+        "text-font": ["Roboto Regular"],
+        "text-offset": [0, 1.2],
+        "text-anchor": "top",
+        "text-optional": true
       },
       "paint": {
         "text-color": "#1a5276",
