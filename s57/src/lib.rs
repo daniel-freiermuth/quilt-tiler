@@ -94,6 +94,10 @@ pub struct S57Cell {
     /// Geographic bounds `[west, south, east, north]` in WGS84 degrees.
     pub bounds: [f64; 4],
     pub features: Vec<Feature>,
+    /// Coverage polygons in WGS84 `[lon, lat]` order.  A cell may have
+    /// multiple disjoint coverage areas (outer `Vec`); each ring is a
+    /// closed polygon (inner `Vec`).  Empty when no COVR record was present.
+    pub coverage: Vec<Vec<[f64; 2]>>,
 }
 
 // ── Object-class and attribute code tables ───────────────────────────────────

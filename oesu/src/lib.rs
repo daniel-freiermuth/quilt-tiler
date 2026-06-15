@@ -100,6 +100,7 @@ impl From<OesuCell> for s57::S57Cell {
             native_scale: c.native_scale,
             bounds: c.bounds,
             features: c.features,
+            coverage: c.coverage,
         }
     }
 }
@@ -669,28 +670,22 @@ pub fn parse_file(data: &[u8]) -> Result<s57::S57Cell> {
         .collect();
 
     // ── Resolve coverage polygons ────────────────────────────────────────────
-    let coverage = raw_covr
-        .into_iter()
-        .map(|covr| {
-            covr.points
-                .into_iter()
-                .map(|[e, n]| {
-                    crate::georef::from_sm(f64::from(e), f64::from(n), ref_lat, ref_lon)
-                })
-                .collect()
-        })
-        .collect();
-    let no_coverage = raw_nocovr
-        .into_iter()
-        .map(|covr| {
-            covr.points
-                .into_iter()
-                .map(|[e, n]| {
-                    crate::georef::from_sm(f64::from(e), f64::from(n), ref_lat, ref_lon)
-                })
-                .collect()
-        })
-        .collect();
+    // COVR/NOCOVR records store points as (f32 lat_deg, f32 lon_deg) in WGS84
+    // degrees — NOT in SM metres.  Earlier code mistakenly ran from_sm() on
+    // these, mapping all points to near-centroid.  Correct interpretation:
+    // reorder to GeoJSON [lon, lat] and widen to f64.
+    fn decode_covr(raw: Vec<RawCovr>) -> Vec<Vec<[f64; 2]>> {
+        raw.into_iter()
+            .map(|covr| {
+                covr.points
+                    .into_iter()
+                    .map(|[lat, lon]| [f64::from(lon), f64::from(lat)])
+                    .collect()
+            })
+            .collect()
+    }
+    let coverage    = decode_covr(raw_covr);
+    let no_coverage = decode_covr(raw_nocovr);
 
     Ok(OesuCell {
         name,
