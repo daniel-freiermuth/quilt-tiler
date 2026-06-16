@@ -1,10 +1,11 @@
 //! Direct tile writing: OESU cells → MVT tiles → `PMTiles` archive.
 //!
-//! Three-pass pipeline:
-//!   1. Map each cell to its native tiles; store cell indices in draw order.
-//!   2. Bottom-up coverage fill: for every tile, augment from finer children
-//!      (downward) then coarser ancestors (upward) until fully covered.
-//!   3. Parallel encode: iterate each tile's cell list in draw order.
+//! For every tile `(z, col, row)` in the output zoom range, all cells whose
+//! bounding box intersects the tile are candidates.  Candidates are sorted so
+//! that the cell whose native zoom is closest to `z` from above (coarsest
+//! appropriate) goes first, then finer cells in ascending order, and finally
+//! coarser-than-`z` cells as a last resort.  Cells are added greedily until
+//! the tile bbox is covered; the rest are skipped.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -27,43 +28,27 @@ use crate::zoom::zoom_from_scale;
 const EXTENT: f64 = 4096.0;
 /// A single encoded tile ready for `BTreeMap` insertion: `(tile_id, zoom, col, row, mvt_bytes)`.
 type EncodedTile = (u64, u8, u32, u32, Vec<u8>);
-/// Key identifying a tile in the source map: `(zoom, col, row)`.
-type TileKey = (u8, u32, u32);
-/// Ordered list of cell indices for a tile, in draw order (coarsest-appropriate
-/// first, then finer cells, then coarser fallbacks last).
-type TileAnnotation = Vec<usize>;
 
 // ── Public entry point ───────────────────────────────────────────────────────
 
 /// Encode all parsed `cells` as MVT tiles and write a `PMTiles` v3 archive to
 /// `output`. Returns `(min_zoom, max_zoom)`.
-///
-/// **Three-pass pipeline:**
-///
-/// 1. Build `source_map[(zoom, col, row)] = (source_zoom, cell_indices)`.
-///    Only native tiles are inserted here; `source_zoom == zoom` for all of them.
-///    Multiple cells at the same native zoom covering the same tile are merged.
-///
-/// 2. Bottom-up sweep, `zoom_ceil-1` → `zoom_floor`.  For each unannotated tile,
-///    inspect the 4 children at `zoom+1` (already annotated):
-///    - All 4 present, all same `source_zoom` S → annotate with `(S, union_cells)`.
-///      When `S == zoom+1` this is one-level fill-down.  When `S > zoom+1` the
-///      fill-down cascades transitively.  When `S < zoom+1` fill-up propagates
-///      upward through the tree.
-///    - Otherwise → `find_native_ancestor`: walk toward `zoom_floor` and use the
-///      first native tile that covers this location (fill-up fallback).
-///
-/// 3. Parallel encode.  For each annotated tile, collect features from all
-///    responsible cells into a shared per-object-type layer map, then encode
-///    a single MVT tile with one layer per S-57 object acronym.
-// The three passes share source_map, native_count, and bounds.
-#[allow(clippy::too_many_lines)]
-pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path, max_zoom: Option<u8>, zoom_offset: f64) -> Result<(u8, u8)> {
+pub fn write_pmtiles(
+    cells: &[s57::S57Cell],
+    output: &Path,
+    max_zoom: Option<u8>,
+    zoom_offset: f64,
+) -> Result<(u8, u8)> {
     let mut tile_bytes: BTreeMap<u64, (TileCoord, Vec<u8>)> = BTreeMap::new();
 
     let zoom = |scale: u32| zoom_from_scale(scale, zoom_offset);
 
-    let zoom_floor       = cells.iter().map(|c| zoom(c.native_scale)).min().unwrap_or(0).saturating_sub(2);
+    let zoom_floor = cells
+        .iter()
+        .map(|c| zoom(c.native_scale))
+        .min()
+        .unwrap_or(0)
+        .saturating_sub(2);
     let zoom_ceil_native = cells.iter().map(|c| zoom(c.native_scale)).max().unwrap_or(0);
     let zoom_ceil = match max_zoom {
         Some(cap) if cap < zoom_floor => {
@@ -87,158 +72,116 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path, max_zoom: Option<u8>
         if b[0].is_finite() { b } else { [-180.0, -85.0, 180.0, 85.0] }
     };
 
-    // Pre-compute native zoom per cell; used in the sort key and pass 2.
+    // Pre-compute native zoom per cell to avoid re-calling zoom_from_scale in
+    // the hot loop (called once per candidate per tile).
     let cell_zoom: Vec<u8> = cells.iter().map(|c| zoom(c.native_scale)).collect();
 
-    // Draw-order sort key for zoom `z`: z-exact cells first (key 0), then
-    // ascending through finer cells (1, 2, …), then coarser cells last
-    // (sorted by distance from z, finest-coarse first).
-    let draw_key = |cell_index: usize, tile_zoom: u8| -> (bool, i32) {
-        let nz = i32::from(cell_zoom[cell_index]);
-        let zi = i32::from(tile_zoom);
-        (nz < zi, if nz >= zi { nz } else { -nz })
-    };
-
-    // ── Pass 1 ───────────────────────────────────────────────────────────────
-    // Map each cell to the native tiles it covers; store cell indices in draw
-    // order for that tile's zoom level.
-    info!(cells = cells.len(), zoom_floor, zoom_ceil_native, zoom_ceil, "pass 1: building native tile map");
-    let pb1 = ProgressBar::new(cells.len() as u64).with_style(spinner_style());
-    let mut source_map: HashMap<TileKey, TileAnnotation> = HashMap::new();
-    for (i, cell) in cells.iter().enumerate() {
-        let z = cell_zoom[i];
-        let [west, south, east, north] = cell.bounds;
-        let (col_lo, row_lo, col_hi, row_hi) = bbox_to_xyz(west, south, east, north, z);
-        for col in col_lo..=col_hi {
-            for row in row_lo..=row_hi {
-                source_map.entry((z, col, row)).or_default().push(i);
-            }
-        }
-        pb1.inc(1);
-    }
-    pb1.finish_and_clear();
-    let native_count = source_map.len();
-    info!(native_tiles = native_count, "pass 1 done");
-
-    // ── Pass 2 ───────────────────────────────────────────────────────────────
-    // Bottom-up coverage fill. Sweep fine → coarse so that z+1 children are
-    // fully annotated before their z parent inspects them.
-    //
-    // For every tile: start with existing native cells, then
-    //   1. Downward — collect all z+1 children's cells, sort by parent draw
-    //      order (mergesort), add those that extend coverage with early exit.
-    //   2. Upward — walk toward zoom_floor, adding cells from each ancestor
-    //      until the tile is fully covered or zoom_floor is reached.
-    //
-    // Natural insertion order (native → sorted child cells → ancestor cells in
-    // z-distance order) is already the correct draw order; no final re-sort.
-    info!( zoom_floor, zoom_ceil_native, zoom_ceil, "pass 2: fill propagation");
-    let pb2 = ProgressBar::new(u64::from(zoom_ceil_native.saturating_sub(zoom_floor)))
-        .with_style(spinner_style())
-        .with_message("pass 2");
-    for z in (zoom_floor..=zoom_ceil_native).rev() {
-        pb2.set_message(format!("pass 2  z={z}"));
-        let (col_lo, row_lo, col_hi, row_hi) = bbox_to_xyz(bw, bs, be, bn, z);
-        for col in col_lo..=col_hi {
-            for row in row_lo..=row_hi {
-                let key = (z, col, row);
-                let tile_bbox = xyz_to_bbox(z, col, row, col, row);
-
-                // Remove the entry so we can read children without a borrow
-                // conflict, then re-insert the (possibly augmented) result.
-                let mut tile_cells = source_map.remove(&key).unwrap_or_default();
-
-                let mut covered = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
-                for &i in &tile_cells {
-                    covered = cov_expand(covered, cov_clip(cells[i].bounds, tile_bbox));
-                }
-
-                if !cov_full(covered, tile_bbox) {
-                    // — 1. Downward: collect all z+1 children, sort for z, add —
-                    let mut child_cells: Vec<usize> = Vec::new();
-                    for (dc, dr) in [(0u32, 0u32), (1, 0), (0, 1), (1, 1)] {
-                        if let Some(ch) = source_map.get(&(z + 1, 2 * col + dc, 2 * row + dr)) {
-                            child_cells.extend_from_slice(ch);
-                        }
-                    }
-                    child_cells.sort_unstable_by_key(|&i| draw_key(i, z));
-                    for i in child_cells {
-                        let contrib = cov_clip(cells[i].bounds, tile_bbox);
-                        if cov_adds(contrib, covered) {
-                            tile_cells.push(i);
-                            covered = cov_expand(covered, contrib);
-                            if cov_full(covered, tile_bbox) { break; }
-                        }
-                    }
-
-                    // — 2. Upward: walk ancestors until covered or zoom_floor —
-                    if !cov_full(covered, tile_bbox) {
-                        let (mut az, mut ac, mut ar) = (z, col, row);
-                        'up: while az > zoom_floor {
-                            az -= 1; ac >>= 1; ar >>= 1;
-                            if let Some(anc) = source_map.get(&(az, ac, ar)) {
-                                for &i in anc {
-                                    let contrib = cov_clip(cells[i].bounds, tile_bbox);
-                                    if cov_adds(contrib, covered) {
-                                        tile_cells.push(i);
-                                        covered = cov_expand(covered, contrib);
-                                        if cov_full(covered, tile_bbox) { break 'up; }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if !tile_cells.is_empty() {
-                    source_map.insert(key, tile_cells);
-                }
-            }
-        }
-        pb2.inc(1);
-    }
-    pb2.finish_and_clear();
-    info!(
-        annotated_tiles = source_map.len(),
-        filled = source_map.len() - native_count,
-        "pass 2 done",
-    );
-
-    // Drop tiles above the zoom cap; they served as fill sources during pass 2.
-    if zoom_ceil < zoom_ceil_native {
-        source_map.retain(|&(z, _, _), _| z <= zoom_ceil);
-        info!(retained = source_map.len(), zoom_ceil, "zoom cap applied");
-    }
-
-    // ── Pass 3: parallel encode ───────────────────────────────────────────────
-    // Each tile's cell list is already in draw order from pass 2; just encode.
-    info!(annotated_tiles = source_map.len(), "pass 3: encoding tiles");
-    let pb3 = ProgressBar::new(source_map.len() as u64).with_style(bar_style());
-    let tiles: Vec<EncodedTile> = source_map
-        .par_iter()
-        .progress_with(pb3.clone())
-        .map(|(&(z, col, row), idxs)| -> Result<Option<EncodedTile>> {
-            profiling::scope!("tile");
-            let tile_wgs84 = xyz_to_bbox(z, col, row, col, row);
-            let tile_merc  = tile_mercator_bbox(tile_wgs84);
-            let mut layers: HashMap<&'static str, Vec<MvtFeature>> = HashMap::new();
-            for &i in idxs {
-                collect_cell_features(&cells[i], tile_wgs84, tile_merc, z, zoom_offset, &mut layers)?;
-            }
-            let bytes = encode_tile(layers)?;
-            if bytes.is_empty() { return Ok(None); }
-            Ok(Some((tile_id(z, col, row), z, col, row, bytes)))
+    // Total tile coordinates across all zoom levels (used as progress denominator).
+    let total_tiles: u64 = (zoom_floor..=zoom_ceil)
+        .map(|z| {
+            let (c0, r0, c1, r1) = bbox_to_xyz(bw, bs, be, bn, z);
+            (c1 - c0 + 1) as u64 * (r1 - r0 + 1) as u64
         })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect();
-    pb3.finish_and_clear();
-    info!(tiles = tiles.len(), "pass 3 done");
+        .sum();
 
-    for (id, z, col, row, bytes) in tiles {
-        merge_tile(&mut tile_bytes, id, z, col, row, bytes)?;
+    info!(
+        cells = cells.len(),
+        zoom_floor,
+        zoom_ceil_native,
+        zoom_ceil,
+        total_tiles,
+        "encoding tiles",
+    );
+    let pb = ProgressBar::new(total_tiles).with_style(bar_style());
+
+    for z in zoom_floor..=zoom_ceil {
+        let (col_lo, row_lo, col_hi, row_hi) = bbox_to_xyz(bw, bs, be, bn, z);
+        let width  = col_hi - col_lo + 1; // u32
+        let height = row_hi - row_lo + 1;
+        let count  = width as u64 * height as u64;
+        let zi     = z as i32;
+
+        let tiles: Vec<EncodedTile> = (0u64..count)
+            .into_par_iter()
+            .progress_with(pb.clone())
+            .map(|idx| -> Result<Option<EncodedTile>> {
+                profiling::scope!("tile");
+                let col = col_lo + (idx % width as u64) as u32;
+                let row = row_lo + (idx / width as u64) as u32;
+                let tile_wgs84 = xyz_to_bbox(z, col, row, col, row);
+                let tile_merc  = tile_mercator_bbox(tile_wgs84);
+
+                // Candidates: cells whose bounding box overlaps this tile.
+                let mut candidates: Vec<usize> = (0..cells.len())
+                    .filter(|&i| {
+                        let [cw, cs, ce, cn] = cells[i].bounds;
+                        cw < tile_wgs84[2] && ce > tile_wgs84[0]
+                            && cs < tile_wgs84[3] && cn > tile_wgs84[1]
+                    })
+                    .collect();
+
+                if candidates.is_empty() {
+                    return Ok(None);
+                }
+
+                // Sort candidates so the coarsest cell that is still
+                // fine-enough for zoom z comes first (key = 0), then ascending
+                // through finer cells, then coarser-than-z cells last.
+                candidates.sort_unstable_by_key(|&i| {
+                    let nz = cell_zoom[i] as i32;
+                    (nz < zi, if nz >= zi { nz } else { -nz })
+                });
+
+                // Add cells greedily: include a cell only if its contribution
+                // (bbox clipped to tile) adds area not yet in `covered`.
+                // `covered` = bbox union of contributing cells; [MAX,MAX,MIN,MIN]
+                // means empty.  Stop early when the full tile is covered.
+                let mut covered = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+                let mut layers: HashMap<&'static str, Vec<MvtFeature>> = HashMap::new();
+
+                for &i in &candidates {
+                    let [cw, cs, ce, cn] = cells[i].bounds;
+                    let contrib = [
+                        cw.max(tile_wgs84[0]), cs.max(tile_wgs84[1]),
+                        ce.min(tile_wgs84[2]), cn.min(tile_wgs84[3]),
+                    ];
+                    // Skip if this cell's clipped bbox is already fully within
+                    // the covered region.
+                    if covered[0] <= contrib[0] && covered[1] <= contrib[1]
+                        && covered[2] >= contrib[2] && covered[3] >= contrib[3]
+                    {
+                        continue;
+                    }
+                    collect_cell_features(
+                        &cells[i], tile_wgs84, tile_merc, z, zoom_offset, &mut layers,
+                    )?;
+                    covered[0] = covered[0].min(contrib[0]);
+                    covered[1] = covered[1].min(contrib[1]);
+                    covered[2] = covered[2].max(contrib[2]);
+                    covered[3] = covered[3].max(contrib[3]);
+                    // Early exit once the full tile bbox is covered.
+                    if covered[0] <= tile_wgs84[0] && covered[1] <= tile_wgs84[1]
+                        && covered[2] >= tile_wgs84[2] && covered[3] >= tile_wgs84[3]
+                    {
+                        break;
+                    }
+                }
+
+                let bytes = encode_tile(layers)?;
+                if bytes.is_empty() { return Ok(None); }
+                Ok(Some((tile_id(z, col, row), z, col, row, bytes)))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+
+        for (id, tz, tc, tr, bytes) in tiles {
+            merge_tile(&mut tile_bytes, id, tz, tc, tr, bytes)?;
+        }
     }
+    pb.finish_and_clear();
+    info!(encoded = tile_bytes.len(), "tiles encoded");
 
     let metadata = build_metadata();
     let file =
@@ -251,69 +194,21 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path, max_zoom: Option<u8>
         .create(file)
         .context("creating PMTiles writer")?;
 
-    let pb4 = ProgressBar::new(tile_bytes.len() as u64).with_style(bar_style());
+    let pb_write = ProgressBar::new(tile_bytes.len() as u64).with_style(bar_style());
     for (_, (coord, bytes)) in tile_bytes {
         writer.add_tile(coord, &bytes).context("writing tile")?;
-        pb4.inc(1);
+        pb_write.inc(1);
     }
-    pb4.finish_and_clear();
+    pb_write.finish_and_clear();
     writer.finalize().context("finalizing PMTiles")?;
 
     info!(output = %output.display(), "PMTiles written");
     Ok((zoom_floor, zoom_ceil))
 }
-// ── Coverage helpers (axis-aligned bbox tracking) ────────────────────────────
 
-/// Clip `cell` bbox to `tile` bbox.  Returns an invalid rect (west ≥ east or
-/// south ≥ north) when there is no intersection; `cov_adds` detects this.
-#[inline]
-fn cov_clip(cell: [f64; 4], tile: [f64; 4]) -> [f64; 4] {
-    [
-        cell[0].max(tile[0]), cell[1].max(tile[1]),
-        cell[2].min(tile[2]), cell[3].min(tile[3]),
-    ]
-}
 
-/// True when `contrib` is non-empty AND extends beyond the already-covered bbox.
-#[inline]
-fn cov_adds(contrib: [f64; 4], covered: [f64; 4]) -> bool {
-    if contrib[0] >= contrib[2] || contrib[1] >= contrib[3] { return false; }
-    if covered[0] > covered[2] { return true; } // covered is empty
-    !(contrib[0] >= covered[0] && contrib[1] >= covered[1]
-        && contrib[2] <= covered[2] && contrib[3] <= covered[3])
-}
-
-/// Expand the covered bbox to include `contrib` (which must be non-empty).
-#[inline]
-fn cov_expand(covered: [f64; 4], contrib: [f64; 4]) -> [f64; 4] {
-    if covered[0] > covered[2] { return contrib; }
-    if contrib[0] >= contrib[2] || contrib[1] >= contrib[3] { return covered; }
-    [
-        covered[0].min(contrib[0]), covered[1].min(contrib[1]),
-        covered[2].max(contrib[2]), covered[3].max(contrib[3]),
-    ]
-}
-
-/// True when `covered` fully contains `tile`.
-#[inline]
-fn cov_full(covered: [f64; 4], tile: [f64; 4]) -> bool {
-    covered[0] <= tile[0] && covered[1] <= tile[1]
-        && covered[2] >= tile[2] && covered[3] >= tile[3]
-}
-
-// ── Progress bar styles ──────────────────────────────────────────────────────
-
-/// Counter spinner for fast passes (pass 1, pass 2): shows elapsed + pos/len.
-#[allow(clippy::literal_string_with_formatting_args)] // indicatif template syntax, not format args
-fn spinner_style() -> ProgressStyle {
-    ProgressStyle::with_template(
-        "  {spinner:.green} {msg:20}  {elapsed_precise}  {pos}/{len}",
-    )
-    .unwrap_or_else(|_| ProgressStyle::default_spinner())
-}
-
-/// Wide progress bar for slow passes (pass 3, `PMTiles` write): adds rate + ETA.
-#[allow(clippy::literal_string_with_formatting_args)] // indicatif template syntax, not format args
+/// Progress bar style for tile encoding and PMTiles write.
+#[allow(clippy::literal_string_with_formatting_args)]
 fn bar_style() -> ProgressStyle {
     ProgressStyle::with_template(
         "  {spinner:.green} {msg:20}  {elapsed_precise}  [{wide_bar:.cyan/blue}]  {human_pos}/{human_len}  ({per_sec}, {eta})",
