@@ -5,6 +5,8 @@
 //! into a `PMTiles` v3 archive alongside `<stem>.style.json` and
 //! `<stem>.metadata.json`.
 
+mod bbox;
+mod lattice;
 mod style;
 mod tiles;
 mod zoom;

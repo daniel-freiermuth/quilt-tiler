@@ -23,6 +23,8 @@ use rayon::prelude::*;
 use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
 
 use s57::{attribute_acronym, object_acronym};
+use crate::bbox::Bbox;
+use crate::lattice::BoundedLattice;
 use crate::zoom::zoom_from_scale;
 
 const EXTENT: f64 = 4096.0;
@@ -57,19 +59,12 @@ pub fn write_pmtiles(
         Some(cap) => cap.min(zoom_ceil_native),
         None => zoom_ceil_native,
     };
-    let [bw, bs, be, bn] = {
-        let b = cells.iter().fold(
-            [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY],
-            |mut acc, c| {
-                let [w, s, e, n] = c.bounds;
-                acc[0] = acc[0].min(w);
-                acc[1] = acc[1].min(s);
-                acc[2] = acc[2].max(e);
-                acc[3] = acc[3].max(n);
-                acc
-            },
-        );
-        if b[0].is_finite() { b } else { [-180.0, -85.0, 180.0, 85.0] }
+    let overall = {
+        let b = cells.iter().fold(Bbox::bottom(), |acc, c| {
+            let [w, s, e, n] = c.bounds;
+            acc.join(&Bbox { west: w, south: s, east: e, north: n })
+        });
+        if b.is_bottom() { Bbox { west: -180.0, south: -85.0, east: 180.0, north: 85.0 } } else { b }
     };
 
     // Pre-compute native zoom per cell to avoid re-calling zoom_from_scale in
@@ -79,7 +74,7 @@ pub fn write_pmtiles(
     // Total tile coordinates across all zoom levels (used as progress denominator).
     let total_tiles: u64 = (zoom_floor..=zoom_ceil)
         .map(|z| {
-            let (c0, r0, c1, r1) = bbox_to_xyz(bw, bs, be, bn, z);
+            let (c0, r0, c1, r1) = bbox_to_xyz(overall.west, overall.south, overall.east, overall.north, z);
             (c1 - c0 + 1) as u64 * (r1 - r0 + 1) as u64
         })
         .sum();
@@ -95,7 +90,7 @@ pub fn write_pmtiles(
     let pb = ProgressBar::new(total_tiles).with_style(bar_style());
 
     for z in zoom_floor..=zoom_ceil {
-        let (col_lo, row_lo, col_hi, row_hi) = bbox_to_xyz(bw, bs, be, bn, z);
+        let (col_lo, row_lo, col_hi, row_hi) = bbox_to_xyz(overall.west, overall.south, overall.east, overall.north, z);
         let width  = col_hi - col_lo + 1; // u32
         let height = row_hi - row_lo + 1;
         let count  = width as u64 * height as u64;
@@ -108,16 +103,12 @@ pub fn write_pmtiles(
                 profiling::scope!("tile");
                 let col = col_lo + (idx % width as u64) as u32;
                 let row = row_lo + (idx / width as u64) as u32;
-                let tile_wgs84 = xyz_to_bbox(z, col, row, col, row);
+                let tile_wgs84 = Bbox::from(xyz_to_bbox(z, col, row, col, row));
                 let tile_merc  = tile_mercator_bbox(tile_wgs84);
 
                 // Candidates: cells whose bounding box overlaps this tile.
                 let mut candidates: Vec<usize> = (0..cells.len())
-                    .filter(|&i| {
-                        let [cw, cs, ce, cn] = cells[i].bounds;
-                        cw < tile_wgs84[2] && ce > tile_wgs84[0]
-                            && cs < tile_wgs84[3] && cn > tile_wgs84[1]
-                    })
+                    .filter(|&i| Bbox::from(cells[i].bounds).overlaps(&tile_wgs84))
                     .collect();
 
                 if candidates.is_empty() {
@@ -134,35 +125,20 @@ pub fn write_pmtiles(
 
                 // Add cells greedily: include a cell only if its contribution
                 // (bbox clipped to tile) adds area not yet in `covered`.
-                // `covered` = bbox union of contributing cells; [MAX,MAX,MIN,MIN]
-                // means empty.  Stop early when the full tile is covered.
-                let mut covered = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+                // Stop early when the full tile is covered.
+                let mut covered = Bbox::bottom();
                 let mut layers: HashMap<&'static str, Vec<MvtFeature>> = HashMap::new();
 
                 for &i in &candidates {
-                    let [cw, cs, ce, cn] = cells[i].bounds;
-                    let contrib = [
-                        cw.max(tile_wgs84[0]), cs.max(tile_wgs84[1]),
-                        ce.min(tile_wgs84[2]), cn.min(tile_wgs84[3]),
-                    ];
-                    // Skip if this cell's clipped bbox is already fully within
-                    // the covered region.
-                    if covered[0] <= contrib[0] && covered[1] <= contrib[1]
-                        && covered[2] >= contrib[2] && covered[3] >= contrib[3]
-                    {
+                    let contrib = Bbox::from(cells[i].bounds).meet(&tile_wgs84);
+                    if covered.subsumes(&contrib) {
                         continue;
                     }
                     collect_cell_features(
                         &cells[i], tile_wgs84, tile_merc, z, zoom_offset, &mut layers,
-                    )?;
-                    covered[0] = covered[0].min(contrib[0]);
-                    covered[1] = covered[1].min(contrib[1]);
-                    covered[2] = covered[2].max(contrib[2]);
-                    covered[3] = covered[3].max(contrib[3]);
-                    // Early exit once the full tile bbox is covered.
-                    if covered[0] <= tile_wgs84[0] && covered[1] <= tile_wgs84[1]
-                        && covered[2] >= tile_wgs84[2] && covered[3] >= tile_wgs84[3]
-                    {
+                    );
+                    covered = covered.join(&contrib);
+                    if covered.subsumes(&tile_wgs84) {
                         break;
                     }
                 }
@@ -189,7 +165,7 @@ pub fn write_pmtiles(
     let mut writer = PmTilesWriter::new(TileType::Mvt)
         .min_zoom(zoom_floor)
         .max_zoom(zoom_ceil)
-        .bounds(bw, bs, be, bn)
+        .bounds(overall.west, overall.south, overall.east, overall.north)
         .metadata(&metadata)
         .create(file)
         .context("creating PMTiles writer")?;
@@ -223,12 +199,12 @@ fn bar_style() -> ProgressStyle {
 #[profiling::function]
 fn collect_cell_features(
     cell: &s57::S57Cell,
-    tile_wgs84: [f64; 4],
-    tile_merc: [f64; 4],
+    tile_wgs84: Bbox,
+    tile_merc: Bbox,
     tile_zoom: u8,
     zoom_offset: f64,
     layers: &mut HashMap<&'static str, Vec<MvtFeature>>,
-) -> Result<()> {
+) {
     for feat in &cell.features {
         if !feat_intersects(feat, tile_wgs84) {
             continue;
@@ -268,16 +244,13 @@ fn collect_cell_features(
         let d_lat = r_m * 2.0 / 111_320.0;
         let d_lon = r_m * 2.0 / (111_320.0 * lat.to_radians().cos());
 
-        if lon + d_lon < tile_wgs84[0] || lon - d_lon > tile_wgs84[2]
-            || lat + d_lat < tile_wgs84[1] || lat - d_lat > tile_wgs84[3]
-        {
+        let arc_bbox = Bbox { west: lon - d_lon, south: lat - d_lat, east: lon + d_lon, north: lat + d_lat };
+        if !arc_bbox.overlaps(&tile_wgs84) {
             continue;
         }
 
         light_sectors_to_mvt(lon, lat, &feat.attributes, tile_wgs84, tile_merc, layers);
     }
-
-    Ok(())
 }
 
 /// Insert `bytes` for tile `(zoom, col, row)` into `tile_bytes`.
@@ -305,67 +278,41 @@ fn merge_tile(
 
 /// Convert a WGS84 tile bbox `[west, south, east, north]` to Web Mercator
 /// metres `[west_m, south_m, east_m, north_m]`.
-fn tile_mercator_bbox(wgs84: [f64; 4]) -> [f64; 4] {
-    let (w_m, s_m) = wgs84_to_webmercator(wgs84[0], wgs84[1]);
-    let (e_m, n_m) = wgs84_to_webmercator(wgs84[2], wgs84[3]);
-    [w_m, s_m, e_m, n_m]
+fn tile_mercator_bbox(wgs84: Bbox) -> Bbox {
+    let (w_m, s_m) = wgs84_to_webmercator(wgs84.west, wgs84.south);
+    let (e_m, n_m) = wgs84_to_webmercator(wgs84.east, wgs84.north);
+    Bbox { west: w_m, south: s_m, east: e_m, north: n_m }
 }
 
 /// Project `(lon, lat)` WGS84 to tile pixel coordinates `(x, y)` in
 /// `[0, EXTENT]` space.  Geometry is clipped to the tile bbox before reaching
 /// this function, so all projected coordinates stay within the valid range.
 #[allow(clippy::cast_possible_truncation)] // deliberate floor-truncation
-fn to_px(lon: f64, lat: f64, merc: [f64; 4]) -> fast_mvt::MvtCoord {
+fn to_px(lon: f64, lat: f64, merc: Bbox) -> fast_mvt::MvtCoord {
     let (x_m, y_m) = wgs84_to_webmercator(lon, lat);
-    let px = ((x_m - merc[0]) / (merc[2] - merc[0]) * EXTENT) as i32;
-    let py = ((merc[3] - y_m) / (merc[3] - merc[1]) * EXTENT) as i32; // y=0 at north
+    let px = ((x_m - merc.west) / (merc.east - merc.west) * EXTENT) as i32;
+    let py = ((merc.north - y_m) / (merc.north - merc.south) * EXTENT) as i32; // y=0 at north
     (px, py).into()
 }
 
 // ── Feature intersection test ────────────────────────────────────────────────
 
-fn feat_intersects(feat: &s57::Feature, tile: [f64; 4]) -> bool {
-    let Some((fw, fs, fe, fn_)) = feat_bbox(feat) else {
-        return false;
-    };
-    // Overlap when neither axis is disjoint.
-    fw <= tile[2] && fe >= tile[0] && fs <= tile[3] && fn_ >= tile[1]
+fn feat_intersects(feat: &s57::Feature, tile: Bbox) -> bool {
+    feat_bbox(feat).is_some_and(|b| b.overlaps(&tile))
 }
 
-fn feat_bbox(feat: &s57::Feature) -> Option<(f64, f64, f64, f64)> {
+fn feat_bbox(feat: &s57::Feature) -> Option<Bbox> {
     match &feat.geometry {
         s57::Geometry::None => None,
-        s57::Geometry::Point { lon, lat } => Some((*lon, *lat, *lon, *lat)),
-        s57::Geometry::MultiPoint(pts) => {
-            bbox_of(pts.iter().map(|p| (p[0], p[1])))
-        }
+        s57::Geometry::Point { lon, lat } => Some(Bbox::point(*lon, *lat)),
+        s57::Geometry::MultiPoint(pts) => Bbox::of(pts.iter().map(|p| (p[0], p[1]))),
         s57::Geometry::Line(strokes) => {
-            bbox_of(strokes.iter().flat_map(|s| s.iter()).map(|p| (p[0], p[1])))
+            Bbox::of(strokes.iter().flat_map(|s| s.iter()).map(|p| (p[0], p[1])))
         }
         s57::Geometry::Area(ag) => {
-            bbox_of(ag.rings.iter().flat_map(|r| r.iter()).map(|p| (p[0], p[1])))
+            Bbox::of(ag.rings.iter().flat_map(|r| r.iter()).map(|p| (p[0], p[1])))
         }
     }
-}
-
-fn bbox_of(mut pts: impl Iterator<Item = (f64, f64)>) -> Option<(f64, f64, f64, f64)> {
-    let first = pts.next()?;
-    let (mut w, mut s, mut e, mut n) = (first.0, first.1, first.0, first.1);
-    for (lon, lat) in pts {
-        if lon < w {
-            w = lon;
-        }
-        if lat < s {
-            s = lat;
-        }
-        if lon > e {
-            e = lon;
-        }
-        if lat > n {
-            n = lat;
-        }
-    }
-    Some((w, s, e, n))
 }
 
 // ── Geometry clipping ─────────────────────────────────────────────────────────
@@ -376,8 +323,8 @@ fn bbox_of(mut pts: impl Iterator<Item = (f64, f64)>) -> Option<(f64, f64, f64, 
 /// bbox multiple times is split into separate sub-strokes; sub-strokes with
 /// fewer than 2 vertices are discarded.
 #[profiling::function]
-fn clip_stroke(stroke: &[[f64; 2]], bbox: [f64; 4]) -> Vec<Vec<[f64; 2]>> {
-    let [west, south, east, north] = bbox;
+fn clip_stroke(stroke: &[[f64; 2]], bbox: Bbox) -> Vec<Vec<[f64; 2]>> {
+    let Bbox { west, south, east, north } = bbox;
     let mut result: Vec<Vec<[f64; 2]>> = Vec::new();
     let mut current: Vec<[f64; 2]> = Vec::new();
 
@@ -469,8 +416,8 @@ fn clip_segment_lb(
 /// using Sutherland-Hodgman.  Returns the clipped ring; empty when the ring
 /// is entirely outside.  The ring need not be explicitly closed.
 #[profiling::function]
-fn clip_ring(ring: &[[f64; 2]], bbox: [f64; 4]) -> Vec<[f64; 2]> {
-    let [west, south, east, north] = bbox;
+fn clip_ring(ring: &[[f64; 2]], bbox: Bbox) -> Vec<[f64; 2]> {
+    let Bbox { west, south, east, north } = bbox;
     let r = clip_ring_half_plane(ring, |p| p[0] >= west, |a, b| {
         let t = (west - a[0]) / (b[0] - a[0]);
         [west, t.mul_add(b[1] - a[1], a[1])]
@@ -528,7 +475,7 @@ fn clip_ring_half_plane(
 /// boundaries, polygon rings are clipped via Sutherland-Hodgman.  `MultiPoint`
 /// soundings are additionally filtered to their exact containing tile.
 #[profiling::function]
-fn to_mvt_features(feat: &s57::Feature, tile_wgs84: [f64; 4], merc: [f64; 4], tile_zoom: u8, zoom_offset: f64) -> Vec<MvtFeature> {
+fn to_mvt_features(feat: &s57::Feature, tile_wgs84: Bbox, merc: Bbox, tile_zoom: u8, zoom_offset: f64) -> Vec<MvtFeature> {
     // SCAMIN: skip features whose minimum display scale is finer than this tile's zoom.
     // Code 133 = SCAMIN in the S-57 attribute table.
     const SCAMIN_CODE: u16 = 133;
@@ -555,8 +502,8 @@ fn to_mvt_features(feat: &s57::Feature, tile_wgs84: [f64; 4], merc: [f64; 4], ti
             .iter()
             .filter(|[lon, lat, _]| {
                 // Each sounding belongs to exactly one tile.
-                *lon >= tile_wgs84[0] && *lon <= tile_wgs84[2]
-                    && *lat >= tile_wgs84[1] && *lat <= tile_wgs84[3]
+                *lon >= tile_wgs84.west && *lon <= tile_wgs84.east
+                    && *lat >= tile_wgs84.south && *lat <= tile_wgs84.north
             })
             .map(|[lon, lat, depth]| {
                 let c = to_px(*lon, *lat, merc);
@@ -680,8 +627,8 @@ fn light_sectors_to_mvt(
     lon: f64,
     lat: f64,
     attrs: &[s57::Attribute],
-    tile_wgs84: [f64; 4],
-    tile_merc: [f64; 4],
+    tile_wgs84: Bbox,
+    tile_merc: Bbox,
     layers: &mut HashMap<&'static str, Vec<MvtFeature>>,
 ) {
     let mut catlit: Option<MvtValue> = None;
@@ -828,21 +775,21 @@ mod tests {
 
     #[test]
     fn stroke_fully_inside_is_unchanged() {
-        let bbox = [0.0_f64, 0.0, 10.0, 10.0];
+        let bbox = Bbox::from([0.0_f64, 0.0, 10.0, 10.0]);
         let stroke = vec![[2.0, 2.0], [5.0, 5.0], [8.0, 8.0]];
         assert_eq!(clip_stroke(&stroke, bbox), vec![stroke]);
     }
 
     #[test]
     fn stroke_fully_outside_is_empty() {
-        let bbox = [0.0_f64, 0.0, 10.0, 10.0];
+        let bbox = Bbox::from([0.0_f64, 0.0, 10.0, 10.0]);
         let stroke = vec![[11.0, 0.0], [15.0, 0.0]];
         assert!(clip_stroke(&stroke, bbox).is_empty());
     }
 
     #[test]
     fn stroke_clips_to_east_edge() {
-        let bbox = [0.0_f64, 0.0, 10.0, 10.0];
+        let bbox = Bbox::from([0.0_f64, 0.0, 10.0, 10.0]);
         let stroke = vec![[2.0, 5.0], [15.0, 5.0]];
         let result = clip_stroke(&stroke, bbox);
         assert_eq!(result.len(), 1);
@@ -854,7 +801,7 @@ mod tests {
 
     #[test]
     fn stroke_exits_and_re_enters_splits_into_two() {
-        let bbox = [0.0_f64, 0.0, 10.0, 10.0];
+        let bbox = Bbox::from([0.0_f64, 0.0, 10.0, 10.0]);
         // [2,5]→[8,5] inside; [8,5]→[12,5] exits east; [12,5]→[8,2] re-enters
         let stroke = vec![[2.0, 5.0], [8.0, 5.0], [12.0, 5.0], [8.0, 2.0]];
         let result = clip_stroke(&stroke, bbox);
@@ -866,21 +813,21 @@ mod tests {
     #[allow(clippy::float_cmp)] // ring vertices pass through unmodified — exact equality is correct
     #[test]
     fn ring_fully_inside_is_unchanged() {
-        let bbox = [0.0_f64, 0.0, 10.0, 10.0];
+        let bbox = Bbox::from([0.0_f64, 0.0, 10.0, 10.0]);
         let ring = vec![[1.0, 1.0], [9.0, 1.0], [9.0, 9.0], [1.0, 9.0]];
         assert_eq!(clip_ring(&ring, bbox), ring);
     }
 
     #[test]
     fn ring_fully_outside_is_empty() {
-        let bbox = [0.0_f64, 0.0, 10.0, 10.0];
+        let bbox = Bbox::from([0.0_f64, 0.0, 10.0, 10.0]);
         let ring = vec![[11.0, 11.0], [19.0, 11.0], [19.0, 19.0], [11.0, 19.0]];
         assert!(clip_ring(&ring, bbox).is_empty());
     }
 
     #[test]
     fn ring_clipped_to_east_edge() {
-        let bbox = [0.0_f64, 0.0, 10.0, 10.0];
+        let bbox = Bbox::from([0.0_f64, 0.0, 10.0, 10.0]);
         let ring = vec![[5.0, 1.0], [15.0, 1.0], [15.0, 9.0], [5.0, 9.0]];
         let result = clip_ring(&ring, bbox);
         assert!(!result.is_empty());
@@ -894,7 +841,7 @@ mod tests {
     fn ring_enclosing_bbox_clips_to_bbox_corners() {
         // A large polygon that completely contains the tile bbox should clip to
         // exactly the four corners of the bbox.
-        let bbox = [2.0_f64, 2.0, 8.0, 8.0];
+        let bbox = Bbox::from([2.0_f64, 2.0, 8.0, 8.0]);
         let ring = vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
         let result = clip_ring(&ring, bbox);
         assert_eq!(result.len(), 4, "should produce exactly 4 corners");
