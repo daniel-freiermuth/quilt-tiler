@@ -28,8 +28,8 @@ use crate::zoom::zoom_from_scale;
 use s57::{attribute_acronym, object_acronym};
 
 const EXTENT: f64 = 4096.0;
-/// A single encoded tile ready for `BTreeMap` insertion: `(tile_id, zoom, col, row, mvt_bytes)`.
-type EncodedTile = (u64, u8, u32, u32, Vec<u8>);
+/// A single encoded tile ready for `BTreeMap` insertion.
+type EncodedTile = (u64, TileCoord, Vec<u8>);
 
 // ── Public entry point ───────────────────────────────────────────────────────
 
@@ -113,7 +113,7 @@ pub fn write_pmtiles(
         let count = u64::from(width) * u64::from(height);
         let zi = i32::from(z);
 
-        let tiles: Vec<EncodedTile> = (0u64..count)
+        (0u64..count)
             .into_par_iter()
             .progress_with(pb.clone())
             .map(|idx| -> Result<Option<EncodedTile>> {
@@ -134,17 +134,15 @@ pub fn write_pmtiles(
                     return Ok(None);
                 }
 
-                // Sort candidates so the coarsest cell that is still
-                // fine-enough for zoom z comes first (key = 0), then ascending
-                // through finer cells, then coarser-than-z cells last.
+                // Sort candidates: coarsest-appropriate scale first, finer after,
+                // coarser-than-zoom last.
                 candidates.sort_unstable_by_key(|&i| {
                     let nz = i32::from(cell_zoom[i]);
                     (nz < zi, if nz >= zi { nz } else { -nz })
                 });
 
-                // Add cells greedily: include a cell only if its contribution
-                // (bbox clipped to tile) adds area not yet in `covered`.
-                // Stop early when the full tile is covered.
+                // Greedy coverage: include a cell only if its bbox contribution
+                // is not already subsumed by what we have covered so far.
                 let mut covered = Bbox::bottom();
                 let mut layers: HashMap<&'static str, Vec<MvtFeature>> = HashMap::new();
 
@@ -171,16 +169,15 @@ pub fn write_pmtiles(
                 if bytes.is_empty() {
                     return Ok(None);
                 }
-                Ok(Some((tile_id(z, col, row), z, col, row, bytes)))
+                let coord = TileCoord::new(z, col, row).context("invalid tile coord")?;
+                Ok(Some((tile_id(z, col, row), coord, bytes)))
             })
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .flatten()
-            .collect();
-
-        for (id, tz, tc, tr, bytes) in tiles {
-            merge_tile(&mut tile_bytes, id, tz, tc, tr, bytes)?;
-        }
+            .for_each(|(id, coord, bytes)| {
+                tile_bytes.insert(id, (coord, bytes));
+            });
     }
     pb.finish_and_clear();
     info!(encoded = tile_bytes.len(), "tiles encoded");
@@ -290,27 +287,6 @@ fn collect_cell_features(
 
         light_sectors_to_mvt(lon, lat, &feat.attributes, tile_wgs84, tile_merc, layers);
     }
-}
-
-/// Insert `bytes` for tile `(zoom, col, row)` into `tile_bytes`.
-fn merge_tile(
-    tile_bytes: &mut BTreeMap<u64, (TileCoord, Vec<u8>)>,
-    id: u64,
-    zoom: u8,
-    col: u32,
-    row: u32,
-    bytes: Vec<u8>,
-) -> Result<()> {
-    match tile_bytes.entry(id) {
-        std::collections::btree_map::Entry::Occupied(mut e) => {
-            e.get_mut().1.extend(bytes);
-        }
-        std::collections::btree_map::Entry::Vacant(e) => {
-            let coord = TileCoord::new(zoom, col, row).context("invalid tile coord")?;
-            e.insert((coord, bytes));
-        }
-    }
-    Ok(())
 }
 
 // ── Coordinate transform ─────────────────────────────────────────────────────
