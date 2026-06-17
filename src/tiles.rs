@@ -24,6 +24,7 @@ use tracing::info;
 
 use crate::bbox::Bbox;
 use crate::lattice::BoundedLattice;
+use crate::rect_union::RectUnion;
 use crate::zoom::zoom_from_scale;
 use s57::{attribute_acronym, object_acronym};
 
@@ -143,11 +144,14 @@ pub fn write_pmtiles(
 
                 // Greedy coverage: include a cell only if its bbox contribution
                 // is not already subsumed by what we have covered so far.
-                let mut covered = Bbox::bottom();
+                // RectUnion correctly handles separate coverage areas (e.g. NE
+                // + SW corners do not falsely signal full coverage).
+                let tile_ru = RectUnion::from(tile_wgs84);
+                let mut covered = RectUnion::bottom();
                 let mut layers: HashMap<&'static str, Vec<MvtFeature>> = HashMap::new();
 
                 for &i in &candidates {
-                    let contrib = Bbox::from(cells[i].bounds).meet(&tile_wgs84);
+                    let contrib = RectUnion::from(Bbox::from(cells[i].bounds).meet(&tile_wgs84));
                     if covered.subsumes(&contrib) {
                         continue;
                     }
@@ -160,7 +164,7 @@ pub fn write_pmtiles(
                         &mut layers,
                     );
                     covered = covered.join(&contrib);
-                    if covered.subsumes(&tile_wgs84) {
+                    if covered.subsumes(&tile_ru) {
                         break;
                     }
                 }

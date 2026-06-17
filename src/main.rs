@@ -7,6 +7,7 @@
 
 mod bbox;
 mod lattice;
+mod rect_union;
 mod style;
 mod tiles;
 mod zoom;
