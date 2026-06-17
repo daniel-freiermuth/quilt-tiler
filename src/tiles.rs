@@ -135,7 +135,7 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path, max_zoom: Option<u8>
         .with_style(spinner_style())
         .with_message("pass 2");
     let mut new_entries: Vec<(TileKey, TileAnnotation)> = Vec::new();
-    for z in (zoom_floor..zoom_ceil_native).rev() {
+    for z in (zoom_floor..=zoom_ceil_native).rev() {
         pb2.set_message(format!("pass 2  z={z}"));
         let (col_lo, row_lo, col_hi, row_hi) = bbox_to_xyz(bw, bs, be, bn, z);
         for col in col_lo..=col_hi {
