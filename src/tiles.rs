@@ -1,10 +1,10 @@
 //! Direct tile writing: OESU cells → MVT tiles → `PMTiles` archive.
+//!
 //! Three-pass pipeline:
-//!   1. Build a `source_map` of which cells are responsible for each tile.
-//!   2. Bottom-up sweep (fine → coarse): propagate fill annotations without
-//!      re-examining individual cells — each tile checks only its 4 children.
-//!   3. Parallel encode: for each annotated tile, collect features from all
-//!      responsible cells into a shared layer map, then encode one MVT tile.
+//!   1. Map each cell to its native tiles; store cell indices in draw order.
+//!   2. Bottom-up coverage fill: for every tile, augment from finer children
+//!      (downward) then coarser ancestors (upward) until fully covered.
+//!   3. Parallel encode: iterate each tile's cell list in draw order.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -17,7 +17,7 @@ use fast_mvt::{
 };
 use martin_tile_utils::{bbox_to_xyz, wgs84_to_webmercator, xyz_to_bbox};
 use pmtiles::{PmTilesWriter, TileCoord, TileType};
-use tracing::{debug, info};
+use tracing::info;
 use rayon::prelude::*;
 use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
 
@@ -29,10 +29,9 @@ const EXTENT: f64 = 4096.0;
 type EncodedTile = (u64, u8, u32, u32, Vec<u8>);
 /// Key identifying a tile in the source map: `(zoom, col, row)`.
 type TileKey = (u8, u32, u32);
-/// Per-tile fill annotation: `(source_zoom, cell_indices, is_partial)`.
-/// `is_partial` is `true` for pass-1 native tiles where the union of contributing
-/// cell bboxes does not cover the full tile; `false` for all fill-propagated tiles.
-type TileAnnotation = (u8, Vec<usize>, bool);
+/// Ordered list of cell indices for a tile, in draw order (coarsest-appropriate
+/// first, then finer cells, then coarser fallbacks last).
+type TileAnnotation = Vec<usize>;
 
 // ── Public entry point ───────────────────────────────────────────────────────
 
@@ -57,13 +56,11 @@ type TileAnnotation = (u8, Vec<usize>, bool);
 /// 3. Parallel encode.  For each annotated tile, collect features from all
 ///    responsible cells into a shared per-object-type layer map, then encode
 ///    a single MVT tile with one layer per S-57 object acronym.
-// The three passes share source_map, native_count, and bounds; splitting them
-// into sub-functions would just scatter those locals. Accept the length.
+// The three passes share source_map, native_count, and bounds.
 #[allow(clippy::too_many_lines)]
 pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path, max_zoom: Option<u8>, zoom_offset: f64) -> Result<(u8, u8)> {
     let mut tile_bytes: BTreeMap<u64, (TileCoord, Vec<u8>)> = BTreeMap::new();
 
-    // Scale-to-zoom with user offset applied and result clamped to [0, 22].
     let zoom = |scale: u32| zoom_from_scale(scale, zoom_offset);
 
     let zoom_floor       = cells.iter().map(|c| zoom(c.native_scale)).min().unwrap_or(0).saturating_sub(2);
@@ -75,105 +72,129 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path, max_zoom: Option<u8>
         Some(cap) => cap.min(zoom_ceil_native),
         None => zoom_ceil_native,
     };
-    let bounds = cells.iter().fold(
-        [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY],
-        |mut acc, c| {
-            let [w, s, e, n] = c.bounds;
-            acc[0] = acc[0].min(w);
-            acc[1] = acc[1].min(s);
-            acc[2] = acc[2].max(e);
-            acc[3] = acc[3].max(n);
-            acc
-        },
-    );
-    let [bw, bs, be, bn] = if bounds[0].is_finite() { bounds } else { [-180.0, -85.0, 180.0, 85.0] };
+    let [bw, bs, be, bn] = {
+        let b = cells.iter().fold(
+            [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY],
+            |mut acc, c| {
+                let [w, s, e, n] = c.bounds;
+                acc[0] = acc[0].min(w);
+                acc[1] = acc[1].min(s);
+                acc[2] = acc[2].max(e);
+                acc[3] = acc[3].max(n);
+                acc
+            },
+        );
+        if b[0].is_finite() { b } else { [-180.0, -85.0, 180.0, 85.0] }
+    };
 
-    // ── Pass 1: native responsibility map ────────────────────────────────────
+    // Pre-compute native zoom per cell; used in the sort key and pass 2.
+    let cell_zoom: Vec<u8> = cells.iter().map(|c| zoom(c.native_scale)).collect();
+
+    // Draw-order sort key for zoom `z`: z-exact cells first (key 0), then
+    // ascending through finer cells (1, 2, …), then coarser cells last
+    // (sorted by distance from z, finest-coarse first).
+    let draw_key = |cell_index: usize, tile_zoom: u8| -> (bool, i32) {
+        let nz = i32::from(cell_zoom[cell_index]);
+        let zi = i32::from(tile_zoom);
+        (nz < zi, if nz >= zi { nz } else { -nz })
+    };
+
+    // ── Pass 1 ───────────────────────────────────────────────────────────────
+    // Map each cell to the native tiles it covers; store cell indices in draw
+    // order for that tile's zoom level.
     info!(cells = cells.len(), zoom_floor, zoom_ceil_native, zoom_ceil, "pass 1: building native tile map");
     let pb1 = ProgressBar::new(cells.len() as u64).with_style(spinner_style());
-    // Phase 1a: collect cell indices and per-cell coverage rectangles (clipped to
-    // tile bounds) into a raw map.
-    let mut raw_map: HashMap<TileKey, (Vec<usize>, Vec<[f64; 4]>)> = HashMap::new();
+    let mut source_map: HashMap<TileKey, TileAnnotation> = HashMap::new();
     for (i, cell) in cells.iter().enumerate() {
-        let z = zoom(cell.native_scale);
+        let z = cell_zoom[i];
         let [west, south, east, north] = cell.bounds;
         let (col_lo, row_lo, col_hi, row_hi) = bbox_to_xyz(west, south, east, north, z);
         for col in col_lo..=col_hi {
             for row in row_lo..=row_hi {
-                let tile_bbox = xyz_to_bbox(z, col, row, col, row);
-                let cov = [
-                    west.max(tile_bbox[0]), south.max(tile_bbox[1]),
-                    east.min(tile_bbox[2]), north.min(tile_bbox[3]),
-                ];
-                let e = raw_map.entry((z, col, row)).or_default();
-                e.0.push(i);
-                e.1.push(cov);
+                source_map.entry((z, col, row)).or_default().push(i);
             }
         }
         pb1.inc(1);
     }
     pb1.finish_and_clear();
-    // Phase 1b: compute partiality — a tile is partial when the union of its cells'
-    // clipped bboxes does not cover the full tile.  Two adjacent cells that share
-    // an exact boundary produce a union equal to the tile area and are not partial.
-    let mut source_map: HashMap<TileKey, TileAnnotation> = HashMap::with_capacity(raw_map.len());
-    for ((z, col, row), (cell_idxs, cov_rects)) in raw_map {
-        let tile_bbox = xyz_to_bbox(z, col, row, col, row);
-        let tile_area = (tile_bbox[2] - tile_bbox[0]) * (tile_bbox[3] - tile_bbox[1]);
-        let covered   = rect_union_area(&cov_rects, tile_bbox);
-        let is_partial = tile_area > 0.0 && covered < tile_area * (1.0 - 1e-6);
-        source_map.insert((z, col, row), (z, cell_idxs, is_partial));
-    }
     let native_count = source_map.len();
     info!(native_tiles = native_count, "pass 1 done");
 
-    // ── Pass 2: bottom-up fill propagation ───────────────────────────────────
-    // Sequential sweep; process one zoom level at a time so children at z+1
-    // are always fully annotated before we inspect them from z.
-    info!(zoom_floor, zoom_ceil_native, zoom_ceil, "pass 2: fill propagation");
+    // ── Pass 2 ───────────────────────────────────────────────────────────────
+    // Bottom-up coverage fill. Sweep fine → coarse so that z+1 children are
+    // fully annotated before their z parent inspects them.
+    //
+    // For every tile: start with existing native cells, then
+    //   1. Downward — collect all z+1 children's cells, sort by parent draw
+    //      order (mergesort), add those that extend coverage with early exit.
+    //   2. Upward — walk toward zoom_floor, adding cells from each ancestor
+    //      until the tile is fully covered or zoom_floor is reached.
+    //
+    // Natural insertion order (native → sorted child cells → ancestor cells in
+    // z-distance order) is already the correct draw order; no final re-sort.
+    info!( zoom_floor, zoom_ceil_native, zoom_ceil, "pass 2: fill propagation");
     let pb2 = ProgressBar::new(u64::from(zoom_ceil_native.saturating_sub(zoom_floor)))
         .with_style(spinner_style())
         .with_message("pass 2");
-    let mut new_entries: Vec<(TileKey, TileAnnotation)> = Vec::new();
     for z in (zoom_floor..=zoom_ceil_native).rev() {
         pb2.set_message(format!("pass 2  z={z}"));
         let (col_lo, row_lo, col_hi, row_hi) = bbox_to_xyz(bw, bs, be, bn, z);
         for col in col_lo..=col_hi {
             for row in row_lo..=row_hi {
                 let key = (z, col, row);
-                if source_map.contains_key(&key) {
-                    continue;
+                let tile_bbox = xyz_to_bbox(z, col, row, col, row);
+
+                // Remove the entry so we can read children without a borrow
+                // conflict, then re-insert the (possibly augmented) result.
+                let mut tile_cells = source_map.remove(&key).unwrap_or_default();
+
+                let mut covered = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+                for &i in &tile_cells {
+                    covered = cov_expand(covered, cov_clip(cells[i].bounds, tile_bbox));
                 }
-                let children: [Option<&TileAnnotation>; 4] = [
-                    source_map.get(&(z + 1, 2 * col,     2 * row    )),
-                    source_map.get(&(z + 1, 2 * col + 1, 2 * row    )),
-                    source_map.get(&(z + 1, 2 * col,     2 * row + 1)),
-                    source_map.get(&(z + 1, 2 * col + 1, 2 * row + 1)),
-                ];
-                let present: Vec<&TileAnnotation> = children.iter().filter_map(|x| *x).collect();
-                let ann = if !present.is_empty() && present.iter().all(|a| a.0 > z) {
-                    // Partial children: union whatever is available.
-                    // This fills overview tiles (z below the coarsest native zoom)
-                    // and handles sparse intra-range coverage gaps.
-                    let source_z = present.iter().map(|a| a.0).min().unwrap();
-                    let mut idxs: Vec<usize> = present.iter()
-                        .flat_map(|a| a.1.iter().copied())
-                        .collect();
-                    idxs.sort_unstable();
-                    idxs.dedup();
-                    Some((source_z, idxs, false))
-                } else {
-                    // No children at all or some down-filled children
-                    find_native_ancestor(z, col, row, &source_map, zoom_floor)
-                };
-                if let Some(a) = ann {
-                    new_entries.push((key, a));
+
+                if !cov_full(covered, tile_bbox) {
+                    // — 1. Downward: collect all z+1 children, sort for z, add —
+                    let mut child_cells: Vec<usize> = Vec::new();
+                    for (dc, dr) in [(0u32, 0u32), (1, 0), (0, 1), (1, 1)] {
+                        if let Some(ch) = source_map.get(&(z + 1, 2 * col + dc, 2 * row + dr)) {
+                            child_cells.extend_from_slice(ch);
+                        }
+                    }
+                    child_cells.sort_unstable_by_key(|&i| draw_key(i, z));
+                    for i in child_cells {
+                        let contrib = cov_clip(cells[i].bounds, tile_bbox);
+                        if cov_adds(contrib, covered) {
+                            tile_cells.push(i);
+                            covered = cov_expand(covered, contrib);
+                            if cov_full(covered, tile_bbox) { break; }
+                        }
+                    }
+
+                    // — 2. Upward: walk ancestors until covered or zoom_floor —
+                    if !cov_full(covered, tile_bbox) {
+                        let (mut az, mut ac, mut ar) = (z, col, row);
+                        'up: while az > zoom_floor {
+                            az -= 1; ac >>= 1; ar >>= 1;
+                            if let Some(anc) = source_map.get(&(az, ac, ar)) {
+                                for &i in anc {
+                                    let contrib = cov_clip(cells[i].bounds, tile_bbox);
+                                    if cov_adds(contrib, covered) {
+                                        tile_cells.push(i);
+                                        covered = cov_expand(covered, contrib);
+                                        if cov_full(covered, tile_bbox) { break 'up; }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !tile_cells.is_empty() {
+                    source_map.insert(key, tile_cells);
                 }
             }
         }
-        let added = new_entries.len();
-        source_map.extend(std::mem::take(&mut new_entries));
-        debug!(z, added, total = source_map.len(), "pass 2: zoom done");
         pb2.inc(1);
     }
     pb2.finish_and_clear();
@@ -183,86 +204,26 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path, max_zoom: Option<u8>
         "pass 2 done",
     );
 
-    // Drop tiles above the zoom cap before encoding; they have already served
-    // as fill-down sources for every tile at ≤ zoom_ceil in pass 2.
+    // Drop tiles above the zoom cap; they served as fill sources during pass 2.
     if zoom_ceil < zoom_ceil_native {
         source_map.retain(|&(z, _, _), _| z <= zoom_ceil);
         info!(retained = source_map.len(), zoom_ceil, "zoom cap applied");
     }
 
     // ── Pass 3: parallel encode ───────────────────────────────────────────────
+    // Each tile's cell list is already in draw order from pass 2; just encode.
     info!(annotated_tiles = source_map.len(), "pass 3: encoding tiles");
     let pb3 = ProgressBar::new(source_map.len() as u64).with_style(bar_style());
     let tiles: Vec<EncodedTile> = source_map
         .par_iter()
         .progress_with(pb3.clone())
-        .map(|(&(z, col, row), (_, idxs, partial))| -> Result<Option<EncodedTile>> {
+        .map(|(&(z, col, row), idxs)| -> Result<Option<EncodedTile>> {
             profiling::scope!("tile");
             let tile_wgs84 = xyz_to_bbox(z, col, row, col, row);
             let tile_merc  = tile_mercator_bbox(tile_wgs84);
             let mut layers: HashMap<&'static str, Vec<MvtFeature>> = HashMap::new();
             for &i in idxs {
                 collect_cell_features(&cells[i], tile_wgs84, tile_merc, z, zoom_offset, &mut layers)?;
-            }
-            // For partial native tiles: augment with adjacent data.
-            //
-            // Two sources, tried in order:
-            //
-            // 1. z+1 children with source_z > z  →  finer cells that clip into
-            //    this tile but were not in the pass-1 annotation (BL7II5/AL7ID6 case).
-            //
-            // 2. If no finer data found: walk up the ancestor chain looking for the
-            //    nearest coarser tile whose cells differ from the ones we already have.
-            //    This covers tiles where the native cell only clips a small fringe and
-            //    the rest of the area is owned by a coarser-scale chart (58.41N/11.26E case).
-            //
-            // Guarded by `is_partial` so fully-covered tiles pay neither cost.
-            if *partial {
-                let mut seen: Vec<usize> = idxs.clone();
-
-                // — finer pass —
-                let child_keys = [
-                    (z + 1, 2 * col,     2 * row    ),
-                    (z + 1, 2 * col + 1, 2 * row    ),
-                    (z + 1, 2 * col,     2 * row + 1),
-                    (z + 1, 2 * col + 1, 2 * row + 1),
-                ];
-                let mut added_finer = false;
-                for ck in &child_keys {
-                    if let Some((child_src_z, child_idxs, _)) = source_map.get(ck) {
-                        if *child_src_z > z {
-                            for &i in child_idxs {
-                                if !seen.contains(&i) {
-                                    seen.push(i);
-                                    collect_cell_features(&cells[i], tile_wgs84, tile_merc, z, zoom_offset, &mut layers)?;
-                                    added_finer = true;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // — coarser pass (only when finer pass found nothing) —
-                if !added_finer {
-                    let (mut az, mut ac, mut ar) = (z, col, row);
-                    while az > zoom_floor {
-                        az -= 1;
-                        ac >>= 1;
-                        ar >>= 1;
-                        if let Some((_, anc_idxs, _)) = source_map.get(&(az, ac, ar)) {
-                            let mut added_anc = false;
-                            for &i in anc_idxs {
-                                if !seen.contains(&i) {
-                                    seen.push(i);
-                                    collect_cell_features(&cells[i], tile_wgs84, tile_merc, z, zoom_offset, &mut layers)?;
-                                    added_anc = true;
-                                }
-                            }
-                            if added_anc { break; }
-                            // ancestor's cells are a strict subset of seen — try coarser
-                        }
-                    }
-                }
             }
             let bytes = encode_tile(layers)?;
             if bytes.is_empty() { return Ok(None); }
@@ -301,72 +262,43 @@ pub fn write_pmtiles(cells: &[s57::S57Cell], output: &Path, max_zoom: Option<u8>
     info!(output = %output.display(), "PMTiles written");
     Ok((zoom_floor, zoom_ceil))
 }
+// ── Coverage helpers (axis-aligned bbox tracking) ────────────────────────────
 
-// ── Fill helpers ─────────────────────────────────────────────────────────────
-
-/// Walk toward `zoom_floor`, returning a clone of the first `source_map` entry
-/// found at an ancestor tile of `(z, col, row)`.
-///
-/// During pass 2 any entry at a coarser zoom was placed there by pass 1 (native
-/// claim), because the bottom-up sweep hasn't reached those levels yet when this
-/// is called.  The first hit is therefore always a native claim.
-fn find_native_ancestor(
-    z: u8,
-    col: u32,
-    row: u32,
-    source_map: &HashMap<(u8, u32, u32), (u8, Vec<usize>, bool)>,
-    zoom_floor: u8,
-) -> Option<(u8, Vec<usize>, bool)> {
-    for z_prime in (zoom_floor..z).rev() {
-        let shift = z - z_prime;
-        if let Some(ann) = source_map.get(&(z_prime, col >> shift, row >> shift)) {
-            // Tiles filled from an ancestor are never considered partial: the
-            // ancestor was the best available data and no finer augmentation applies.
-            return Some((ann.0, ann.1.clone(), false));
-        }
-    }
-    None
+/// Clip `cell` bbox to `tile` bbox.  Returns an invalid rect (west ≥ east or
+/// south ≥ north) when there is no intersection; `cov_adds` detects this.
+#[inline]
+fn cov_clip(cell: [f64; 4], tile: [f64; 4]) -> [f64; 4] {
+    [
+        cell[0].max(tile[0]), cell[1].max(tile[1]),
+        cell[2].min(tile[2]), cell[3].min(tile[3]),
+    ]
 }
 
-/// Area of the union of `rects` clipped to `tile [W, S, E, N]`.
-///
-/// Uses coordinate-compressed sweep-line: O(N²) for N rectangles, which is
-/// acceptable because N is typically 1–4 native cells per tile.
-fn rect_union_area(rects: &[[f64; 4]], tile: [f64; 4]) -> f64 {
-    let mut xs: Vec<f64> = Vec::with_capacity(rects.len() * 2 + 2);
-    xs.push(tile[0]);
-    xs.push(tile[2]);
-    for r in rects {
-        let x0 = r[0].max(tile[0]).min(tile[2]);
-        let x1 = r[2].max(tile[0]).min(tile[2]);
-        if x0 > tile[0] { xs.push(x0); }
-        if x1 < tile[2] { xs.push(x1); }
-    }
-    xs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-    xs.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
+/// True when `contrib` is non-empty AND extends beyond the already-covered bbox.
+#[inline]
+fn cov_adds(contrib: [f64; 4], covered: [f64; 4]) -> bool {
+    if contrib[0] >= contrib[2] || contrib[1] >= contrib[3] { return false; }
+    if covered[0] > covered[2] { return true; } // covered is empty
+    !(contrib[0] >= covered[0] && contrib[1] >= covered[1]
+        && contrib[2] <= covered[2] && contrib[3] <= covered[3])
+}
 
-    let mut area = 0.0_f64;
-    for win in xs.windows(2) {
-        let (x0, x1) = (win[0], win[1]);
-        let xmid = (x0 + x1) * 0.5;
-        // Collect y-intervals from rectangles whose x-range spans xmid.
-        let mut segs: Vec<[f64; 2]> = rects
-            .iter()
-            .filter(|r| r[0] <= xmid && r[2] >= xmid)
-            .map(|r| [r[1].max(tile[1]), r[3].min(tile[3])])
-            .filter(|[y0, y1]| y1 > y0)
-            .collect();
-        segs.sort_unstable_by(|a, b| a[0].partial_cmp(&b[0]).unwrap());
-        // Sweep to compute union length of y-intervals.
-        let mut y_cover = 0.0_f64;
-        let mut hi = tile[1];
-        for [y0, y1] in segs {
-            let lo = y0.max(hi);
-            if lo < y1 { y_cover += y1 - lo; hi = hi.max(y1); }
-        }
-        area += (x1 - x0) * y_cover;
-    }
-    area
+/// Expand the covered bbox to include `contrib` (which must be non-empty).
+#[inline]
+fn cov_expand(covered: [f64; 4], contrib: [f64; 4]) -> [f64; 4] {
+    if covered[0] > covered[2] { return contrib; }
+    if contrib[0] >= contrib[2] || contrib[1] >= contrib[3] { return covered; }
+    [
+        covered[0].min(contrib[0]), covered[1].min(contrib[1]),
+        covered[2].max(contrib[2]), covered[3].max(contrib[3]),
+    ]
+}
+
+/// True when `covered` fully contains `tile`.
+#[inline]
+fn cov_full(covered: [f64; 4], tile: [f64; 4]) -> bool {
+    covered[0] <= tile[0] && covered[1] <= tile[1]
+        && covered[2] >= tile[2] && covered[3] >= tile[3]
 }
 
 // ── Progress bar styles ──────────────────────────────────────────────────────
