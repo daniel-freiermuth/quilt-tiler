@@ -38,4 +38,4 @@ multiple_crate_versions = "allow"
 
 [features]
 # cargo run --features tracy  →  link Tracy client and emit profiling data
-tracy = ["dep:tracy-client", "profiling/profile-with-tracy"]
+profiling = ["dep:tracy-client", "profiling/profile-with-tracy"]

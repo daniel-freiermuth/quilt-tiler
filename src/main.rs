@@ -132,7 +132,7 @@ struct Args {
 fn main() -> Result<()> {
     // Tracy must start before rayon spins up its workers so every thread
     // is registered with the profiler from the moment it first runs.
-    #[cfg(feature = "tracy")]
+    #[cfg(feature = "profiling")]
     let _tracy = tracy_client::Client::start();
 
     tracing_subscriber::fmt()
