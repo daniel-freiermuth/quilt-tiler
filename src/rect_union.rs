@@ -71,7 +71,9 @@ impl BoundedLattice for RectUnion {
 
     /// Avoids allocating the full `meet`; short-circuits on first overlap.
     fn overlaps(&self, other: &Self) -> bool {
-        self.rects.iter().any(|a| other.rects.iter().any(|b| a.overlaps(b)))
+        self.rects
+            .iter()
+            .any(|a| other.rects.iter().any(|b| a.overlaps(b)))
     }
 }
 
@@ -87,7 +89,9 @@ impl RectUnion {
         }
 
         // Clip all rects to target; keep non-empty ones.
-        let clipped: Vec<Bbox> = self.rects.iter()
+        let clipped: Vec<Bbox> = self
+            .rects
+            .iter()
             .map(|r| r.meet(target))
             .filter(|r| !r.is_bottom())
             .collect();
@@ -114,7 +118,8 @@ impl RectUnion {
             if x0 >= x1 {
                 continue;
             }
-            let y_ranges: Vec<(f64, f64)> = clipped.iter()
+            let y_ranges: Vec<(f64, f64)> = clipped
+                .iter()
                 .filter(|r| r.west <= x0 && r.east >= x1)
                 .map(|r| (r.south, r.north))
                 .collect();
@@ -124,6 +129,13 @@ impl RectUnion {
         }
 
         true
+    }
+}
+
+/// Bounding box of the entire union (smallest [`Bbox`] containing all rects).
+impl From<RectUnion> for Bbox {
+    fn from(ru: RectUnion) -> Self {
+        ru.rects.iter().fold(Self::bottom(), |acc, r| acc.join(r))
     }
 }
 
@@ -156,7 +168,12 @@ mod tests {
     use super::*;
 
     fn b(w: f64, s: f64, e: f64, n: f64) -> RectUnion {
-        RectUnion::from(Bbox { west: w, south: s, east: e, north: n })
+        RectUnion::from(Bbox {
+            west: w,
+            south: s,
+            east: e,
+            north: n,
+        })
     }
 
     #[test]
@@ -176,26 +193,26 @@ mod tests {
         // The original Bbox bug: hull of NE+SW fills the tile, but the area
         // does not.
         let tile = b(0.0, 0.0, 10.0, 10.0);
-        let ne   = b(5.0, 5.0, 10.0, 10.0);
-        let sw   = b(0.0, 0.0,  5.0,  5.0);
+        let ne = b(5.0, 5.0, 10.0, 10.0);
+        let sw = b(0.0, 0.0, 5.0, 5.0);
         let covered = ne.join(&sw);
         assert!(!covered.subsumes(&tile));
     }
 
     #[test]
     fn north_south_halves_cover_tile() {
-        let tile  = b(0.0, 0.0, 10.0, 10.0);
+        let tile = b(0.0, 0.0, 10.0, 10.0);
         let north = b(0.0, 5.0, 10.0, 10.0);
-        let south = b(0.0, 0.0, 10.0,  5.0);
+        let south = b(0.0, 0.0, 10.0, 5.0);
         assert!(north.join(&south).subsumes(&tile));
     }
 
     #[test]
     fn four_quadrants_cover_tile() {
         let tile = b(0.0, 0.0, 10.0, 10.0);
-        let covered = b(0.0, 0.0,  5.0,  5.0)
-            .join(&b(5.0, 0.0, 10.0,  5.0))
-            .join(&b(0.0, 5.0,  5.0, 10.0))
+        let covered = b(0.0, 0.0, 5.0, 5.0)
+            .join(&b(5.0, 0.0, 10.0, 5.0))
+            .join(&b(0.0, 5.0, 5.0, 10.0))
             .join(&b(5.0, 5.0, 10.0, 10.0));
         assert!(covered.subsumes(&tile));
     }
@@ -203,17 +220,17 @@ mod tests {
     #[test]
     fn three_quadrants_do_not_cover_tile() {
         let tile = b(0.0, 0.0, 10.0, 10.0);
-        let covered = b(0.0, 0.0,  5.0,  5.0)
-            .join(&b(5.0, 0.0, 10.0,  5.0))
-            .join(&b(0.0, 5.0,  5.0, 10.0));
+        let covered = b(0.0, 0.0, 5.0, 5.0)
+            .join(&b(5.0, 0.0, 10.0, 5.0))
+            .join(&b(0.0, 5.0, 5.0, 10.0));
         // NW+SW+SE; NE missing.
         assert!(!covered.subsumes(&tile));
     }
 
     #[test]
     fn partial_strip_does_not_cover() {
-        let tile    = b(0.0, 0.0, 10.0, 10.0);
-        let partial = b(0.0, 0.0,  5.0, 10.0); // west half only
+        let tile = b(0.0, 0.0, 10.0, 10.0);
+        let partial = b(0.0, 0.0, 5.0, 10.0); // west half only
         assert!(!partial.subsumes(&tile));
     }
 
@@ -221,7 +238,7 @@ mod tests {
     fn overlapping_rects_cover_tile() {
         // Two rects that overlap in the middle and together cover the tile.
         let tile = b(0.0, 0.0, 10.0, 10.0);
-        let left  = b(0.0, 0.0, 7.0, 10.0);
+        let left = b(0.0, 0.0, 7.0, 10.0);
         let right = b(3.0, 0.0, 10.0, 10.0);
         assert!(left.join(&right).subsumes(&tile));
     }

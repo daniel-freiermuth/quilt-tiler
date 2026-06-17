@@ -19,3 +19,13 @@ pub fn zoom_from_scale(native_scale: u32, offset: f64) -> u8 {
     // Safety: value is clamped to [0.0, 22.0] before cast.
     (log2 + offset).floor().clamp(0.0, 22.0) as u8
 }
+
+/// Compute the nominal scale denominator for a tile at `zoom` with `offset`
+/// applied.  Inverse of [`zoom_from_scale`].
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn scale_from_zoom(zoom: u8, offset: f64) -> u32 {
+    // Safety: value is clamped to a positive finite range before cast.
+    (ZOOM_K / (f64::from(zoom) - offset).exp2())
+        .round()
+        .clamp(1.0, f64::from(u32::MAX)) as u32
+}

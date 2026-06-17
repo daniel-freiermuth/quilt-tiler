@@ -8,7 +8,10 @@
 mod bbox;
 mod lattice;
 mod rect_union;
+mod s57_source;
 mod style;
+mod tile_geom;
+mod tile_source;
 mod tiles;
 mod zoom;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -212,8 +215,12 @@ fn main() -> Result<()> {
         },
     );
 
-    let (min_zoom, out_max_zoom) =
-        tiles::write_pmtiles(&cells, &args.output, args.max_zoom, args.zoom_offset)?;
+    let (min_zoom, out_max_zoom) = tiles::write_pmtiles::<s57::S57Cell>(
+        &cells,
+        &args.output,
+        args.max_zoom,
+        args.zoom_offset,
+    )?;
 
     // Derive output siblings from the PMTiles path unless overridden.
     let source_id = args
