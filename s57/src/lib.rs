@@ -21,9 +21,9 @@ pub struct Attribute {
 /// OpenGL primitive type stored in the OSENC `TriPrim` chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TriPrimType {
-    Triangles     = 4, // GL_TRIANGLES
+    Triangles = 4,     // GL_TRIANGLES
     TriangleStrip = 5, // GL_TRIANGLE_STRIP
-    TriangleFan   = 6, // GL_TRIANGLE_FAN
+    TriangleFan = 6,   // GL_TRIANGLE_FAN
 }
 
 impl TriPrimType {
@@ -671,11 +671,13 @@ pub static ATTRIBUTES: &[(u16, &str)] = &[
 
 #[must_use]
 pub fn object_acronym(code: u16) -> Option<&'static str> {
-    OBJECT_CLASSES.iter().find(|(c, _)| *c == code).map(|(_, a)| *a)
+    OBJECT_CLASSES
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, a)| *a)
 }
 
 #[must_use]
 pub fn attribute_acronym(code: u16) -> Option<&'static str> {
     ATTRIBUTES.iter().find(|(c, _)| *c == code).map(|(_, a)| *a)
 }
-

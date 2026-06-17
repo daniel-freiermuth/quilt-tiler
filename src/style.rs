@@ -25,8 +25,14 @@ const STYLE_JSON: &str = include_str!("style.json");
 ///
 /// # Panics
 /// Panics if the embedded `style.json` is malformed (compile-time guarantee).
-pub fn build_style(safety_depth: f64, shoal_depth: f64, tile_url: &str, min_zoom: u8, max_zoom: u8) -> String {
-    use serde_json::{json, Value};
+pub fn build_style(
+    safety_depth: f64,
+    shoal_depth: f64,
+    tile_url: &str,
+    min_zoom: u8,
+    max_zoom: u8,
+) -> String {
+    use serde_json::{Value, json};
 
     let mut style: Value =
         serde_json::from_str(STYLE_JSON).expect("embedded style.json is valid JSON");

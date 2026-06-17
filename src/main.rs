@@ -26,7 +26,8 @@ fn chrono_now() -> String {
 fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
     let mut year = 1970u64;
     loop {
-        let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+        let leap =
+            year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
         let in_year = if leap { 366 } else { 365 };
         if days < in_year {
             break;
@@ -35,7 +36,20 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
         year += 1;
     }
     let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-    let month_days = [31u64, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let month_days = [
+        31u64,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut month = 1u64;
     for &md in &month_days {
         if days < md {
@@ -51,8 +65,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
+use rayon::prelude::*;
 use tracing::{info, warn};
 
 use zoom::zoom_from_scale;
@@ -119,8 +133,7 @@ fn main() -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -130,8 +143,12 @@ fn main() -> Result<()> {
     ThreadPoolBuilder::new()
         .spawn_handler(|thread| {
             let mut b = std::thread::Builder::new();
-            if let Some(name) = thread.name() { b = b.name(name.to_owned()); }
-            if let Some(sz)   = thread.stack_size() { b = b.stack_size(sz); }
+            if let Some(name) = thread.name() {
+                b = b.name(name.to_owned());
+            }
+            if let Some(sz) = thread.stack_size() {
+                b = b.stack_size(sz);
+            }
             b.spawn(move || {
                 profiling::register_thread!();
                 thread.run();
@@ -179,7 +196,12 @@ fn main() -> Result<()> {
 
     // Aggregate geographic bounds from parsed cells for metadata.
     let bounds = cells.iter().fold(
-        [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY],
+        [
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ],
         |mut acc, c| {
             acc[0] = acc[0].min(c.bounds[0]);
             acc[1] = acc[1].min(c.bounds[1]);
@@ -189,7 +211,8 @@ fn main() -> Result<()> {
         },
     );
 
-    let (min_zoom, out_max_zoom) = tiles::write_pmtiles(&cells, &args.output, args.max_zoom, args.zoom_offset)?;
+    let (min_zoom, out_max_zoom) =
+        tiles::write_pmtiles(&cells, &args.output, args.max_zoom, args.zoom_offset)?;
 
     // Derive output siblings from the PMTiles path unless overridden.
     let source_id = args
@@ -199,9 +222,9 @@ fn main() -> Result<()> {
         .unwrap_or("chart")
         .to_owned();
     let chart_name = args.name.unwrap_or_else(|| source_id.clone());
-    let tile_url = args.tile_url.unwrap_or_else(|| {
-        format!("http://localhost:3000/{source_id}/{{z}}/{{x}}/{{y}}")
-    });
+    let tile_url = args
+        .tile_url
+        .unwrap_or_else(|| format!("http://localhost:3000/{source_id}/{{z}}/{{x}}/{{y}}"));
 
     // Write style.json
     let style_path = args
@@ -212,8 +235,13 @@ fn main() -> Result<()> {
         .and_then(|n| n.to_str())
         .unwrap_or("style.json")
         .to_owned();
-    let style_json =
-        style::build_style(args.safety_depth, args.shoal_depth, &tile_url, min_zoom, out_max_zoom);
+    let style_json = style::build_style(
+        args.safety_depth,
+        args.shoal_depth,
+        &tile_url,
+        min_zoom,
+        out_max_zoom,
+    );
     std::fs::write(&style_path, &style_json)
         .with_context(|| format!("writing style to {}", style_path.display()))?;
     info!(path = %style_path.display(), "style written");

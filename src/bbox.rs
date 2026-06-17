@@ -8,9 +8,9 @@ use crate::lattice::BoundedLattice;
 /// Meet = intersection, join = bounding hull.
 #[derive(Copy, Clone, Debug)]
 pub struct Bbox {
-    pub west:  f64,
+    pub west: f64,
     pub south: f64,
-    pub east:  f64,
+    pub east: f64,
     pub north: f64,
 }
 
@@ -18,7 +18,12 @@ impl Bbox {
     /// A degenerate point-extent bbox.
     #[inline]
     pub const fn point(lon: f64, lat: f64) -> Self {
-        Self { west: lon, south: lat, east: lon, north: lat }
+        Self {
+            west: lon,
+            south: lat,
+            east: lon,
+            north: lat,
+        }
     }
 
     /// Smallest bbox enclosing all `pts`; `None` when the iterator is empty.
@@ -26,9 +31,9 @@ impl Bbox {
         let (lon, lat) = pts.next()?;
         let mut b = Self::point(lon, lat);
         for (lon, lat) in pts {
-            b.west  = b.west.min(lon);
+            b.west = b.west.min(lon);
             b.south = b.south.min(lat);
-            b.east  = b.east.max(lon);
+            b.east = b.east.max(lon);
             b.north = b.north.max(lat);
         }
         Some(b)
@@ -39,9 +44,9 @@ impl BoundedLattice for Bbox {
     #[inline]
     fn bottom() -> Self {
         Self {
-            west:  f64::INFINITY,
+            west: f64::INFINITY,
             south: f64::INFINITY,
-            east:  f64::NEG_INFINITY,
+            east: f64::NEG_INFINITY,
             north: f64::NEG_INFINITY,
         }
     }
@@ -49,9 +54,9 @@ impl BoundedLattice for Bbox {
     #[inline]
     fn join(&self, other: &Self) -> Self {
         Self {
-            west:  self.west.min(other.west),
+            west: self.west.min(other.west),
             south: self.south.min(other.south),
-            east:  self.east.max(other.east),
+            east: self.east.max(other.east),
             north: self.north.max(other.north),
         }
     }
@@ -59,9 +64,9 @@ impl BoundedLattice for Bbox {
     #[inline]
     fn meet(&self, other: &Self) -> Self {
         Self {
-            west:  self.west.max(other.west),
+            west: self.west.max(other.west),
             south: self.south.max(other.south),
-            east:  self.east.min(other.east),
+            east: self.east.min(other.east),
             north: self.north.min(other.north),
         }
     }
@@ -73,9 +78,9 @@ impl BoundedLattice for Bbox {
 
     #[inline]
     fn subsumes(&self, other: &Self) -> bool {
-        self.west  <= other.west
+        self.west <= other.west
             && self.south <= other.south
-            && self.east  >= other.east
+            && self.east >= other.east
             && self.north >= other.north
     }
 
@@ -83,9 +88,10 @@ impl BoundedLattice for Bbox {
     #[inline]
     #[allow(clippy::suspicious_operation_groupings)] // cross-axis comparisons are intentional
     fn overlaps(&self, other: &Self) -> bool {
-        !self.is_bottom() && !other.is_bottom()
-            && self.west  <= other.east
-            && self.east  >= other.west
+        !self.is_bottom()
+            && !other.is_bottom()
+            && self.west <= other.east
+            && self.east >= other.west
             && self.south <= other.north
             && self.north >= other.south
     }
@@ -95,6 +101,11 @@ impl BoundedLattice for Bbox {
 impl From<[f64; 4]> for Bbox {
     #[inline]
     fn from([west, south, east, north]: [f64; 4]) -> Self {
-        Self { west, south, east, north }
+        Self {
+            west,
+            south,
+            east,
+            north,
+        }
     }
 }

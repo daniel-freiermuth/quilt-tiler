@@ -13,19 +13,19 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use fast_mvt::{
-    MvtFeature, MvtGeometry, MvtLayer, MvtLineString, MvtMultiLineString, MvtPoint, MvtPolygon,
-    MvtTile, MvtValue, DEFAULT_EXTENT,
+    DEFAULT_EXTENT, MvtFeature, MvtGeometry, MvtLayer, MvtLineString, MvtMultiLineString, MvtPoint,
+    MvtPolygon, MvtTile, MvtValue,
 };
+use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
 use martin_tile_utils::{bbox_to_xyz, wgs84_to_webmercator, xyz_to_bbox};
 use pmtiles::{PmTilesWriter, TileCoord, TileType};
-use tracing::info;
 use rayon::prelude::*;
-use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
+use tracing::info;
 
-use s57::{attribute_acronym, object_acronym};
 use crate::bbox::Bbox;
 use crate::lattice::BoundedLattice;
 use crate::zoom::zoom_from_scale;
+use s57::{attribute_acronym, object_acronym};
 
 const EXTENT: f64 = 4096.0;
 /// A single encoded tile ready for `BTreeMap` insertion: `(tile_id, zoom, col, row, mvt_bytes)`.
@@ -33,6 +33,7 @@ type EncodedTile = (u64, u8, u32, u32, Vec<u8>);
 
 // ── Public entry point ───────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_lines)]
 /// Encode all parsed `cells` as MVT tiles and write a `PMTiles` v3 archive to
 /// `output`. Returns `(min_zoom, max_zoom)`.
 pub fn write_pmtiles(
@@ -51,7 +52,11 @@ pub fn write_pmtiles(
         .min()
         .unwrap_or(0)
         .saturating_sub(2);
-    let zoom_ceil_native = cells.iter().map(|c| zoom(c.native_scale)).max().unwrap_or(0);
+    let zoom_ceil_native = cells
+        .iter()
+        .map(|c| zoom(c.native_scale))
+        .max()
+        .unwrap_or(0);
     let zoom_ceil = match max_zoom {
         Some(cap) if cap < zoom_floor => {
             anyhow::bail!("--max-zoom {cap} is below the data's minimum zoom {zoom_floor}");
@@ -62,9 +67,23 @@ pub fn write_pmtiles(
     let overall = {
         let b = cells.iter().fold(Bbox::bottom(), |acc, c| {
             let [w, s, e, n] = c.bounds;
-            acc.join(&Bbox { west: w, south: s, east: e, north: n })
+            acc.join(&Bbox {
+                west: w,
+                south: s,
+                east: e,
+                north: n,
+            })
         });
-        if b.is_bottom() { Bbox { west: -180.0, south: -85.0, east: 180.0, north: 85.0 } } else { b }
+        if b.is_bottom() {
+            Bbox {
+                west: -180.0,
+                south: -85.0,
+                east: 180.0,
+                north: 85.0,
+            }
+        } else {
+            b
+        }
     };
 
     // Pre-compute native zoom per cell to avoid re-calling zoom_from_scale in
@@ -74,37 +93,37 @@ pub fn write_pmtiles(
     // Total tile coordinates across all zoom levels (used as progress denominator).
     let total_tiles: u64 = (zoom_floor..=zoom_ceil)
         .map(|z| {
-            let (c0, r0, c1, r1) = bbox_to_xyz(overall.west, overall.south, overall.east, overall.north, z);
-            (c1 - c0 + 1) as u64 * (r1 - r0 + 1) as u64
+            let (c0, r0, c1, r1) =
+                bbox_to_xyz(overall.west, overall.south, overall.east, overall.north, z);
+            u64::from(c1 - c0 + 1) * u64::from(r1 - r0 + 1)
         })
         .sum();
 
     info!(
         cells = cells.len(),
-        zoom_floor,
-        zoom_ceil_native,
-        zoom_ceil,
-        total_tiles,
-        "encoding tiles",
+        zoom_floor, zoom_ceil_native, zoom_ceil, total_tiles, "encoding tiles",
     );
     let pb = ProgressBar::new(total_tiles).with_style(bar_style());
 
     for z in zoom_floor..=zoom_ceil {
-        let (col_lo, row_lo, col_hi, row_hi) = bbox_to_xyz(overall.west, overall.south, overall.east, overall.north, z);
-        let width  = col_hi - col_lo + 1; // u32
+        let (col_lo, row_lo, col_hi, row_hi) =
+            bbox_to_xyz(overall.west, overall.south, overall.east, overall.north, z);
+        let width = col_hi - col_lo + 1; // u32
         let height = row_hi - row_lo + 1;
-        let count  = width as u64 * height as u64;
-        let zi     = z as i32;
+        let count = u64::from(width) * u64::from(height);
+        let zi = i32::from(z);
 
         let tiles: Vec<EncodedTile> = (0u64..count)
             .into_par_iter()
             .progress_with(pb.clone())
             .map(|idx| -> Result<Option<EncodedTile>> {
                 profiling::scope!("tile");
-                let col = col_lo + (idx % width as u64) as u32;
-                let row = row_lo + (idx / width as u64) as u32;
+                #[allow(clippy::cast_possible_truncation)] // idx % width < width ≤ u32::MAX
+                let col = col_lo + (idx % u64::from(width)) as u32;
+                #[allow(clippy::cast_possible_truncation)] // idx / width < height ≤ u32::MAX
+                let row = row_lo + (idx / u64::from(width)) as u32;
                 let tile_wgs84 = Bbox::from(xyz_to_bbox(z, col, row, col, row));
-                let tile_merc  = tile_mercator_bbox(tile_wgs84);
+                let tile_merc = tile_mercator_bbox(tile_wgs84);
 
                 // Candidates: cells whose bounding box overlaps this tile.
                 let mut candidates: Vec<usize> = (0..cells.len())
@@ -119,7 +138,7 @@ pub fn write_pmtiles(
                 // fine-enough for zoom z comes first (key = 0), then ascending
                 // through finer cells, then coarser-than-z cells last.
                 candidates.sort_unstable_by_key(|&i| {
-                    let nz = cell_zoom[i] as i32;
+                    let nz = i32::from(cell_zoom[i]);
                     (nz < zi, if nz >= zi { nz } else { -nz })
                 });
 
@@ -135,7 +154,12 @@ pub fn write_pmtiles(
                         continue;
                     }
                     collect_cell_features(
-                        &cells[i], tile_wgs84, tile_merc, z, zoom_offset, &mut layers,
+                        &cells[i],
+                        tile_wgs84,
+                        tile_merc,
+                        z,
+                        zoom_offset,
+                        &mut layers,
                     );
                     covered = covered.join(&contrib);
                     if covered.subsumes(&tile_wgs84) {
@@ -144,7 +168,9 @@ pub fn write_pmtiles(
                 }
 
                 let bytes = encode_tile(layers)?;
-                if bytes.is_empty() { return Ok(None); }
+                if bytes.is_empty() {
+                    return Ok(None);
+                }
                 Ok(Some((tile_id(z, col, row), z, col, row, bytes)))
             })
             .collect::<Result<Vec<_>>>()?
@@ -160,8 +186,7 @@ pub fn write_pmtiles(
     info!(encoded = tile_bytes.len(), "tiles encoded");
 
     let metadata = build_metadata();
-    let file =
-        File::create(output).with_context(|| format!("creating {}", output.display()))?;
+    let file = File::create(output).with_context(|| format!("creating {}", output.display()))?;
     let mut writer = PmTilesWriter::new(TileType::Mvt)
         .min_zoom(zoom_floor)
         .max_zoom(zoom_ceil)
@@ -182,8 +207,7 @@ pub fn write_pmtiles(
     Ok((zoom_floor, zoom_ceil))
 }
 
-
-/// Progress bar style for tile encoding and PMTiles write.
+/// Progress bar style for tile encoding and `PMTiles` write.
 #[allow(clippy::literal_string_with_formatting_args)]
 fn bar_style() -> ProgressStyle {
     ProgressStyle::with_template(
@@ -224,7 +248,9 @@ fn collect_cell_features(
         if object_acronym(feat.type_code) != Some("LIGHTS") {
             continue;
         }
-        let s57::Geometry::Point { lon, lat } = &feat.geometry else { continue };
+        let s57::Geometry::Point { lon, lat } = &feat.geometry else {
+            continue;
+        };
         let (lon, lat) = (*lon, *lat);
 
         // Honour SCAMIN: same check as to_mvt_features (attribute code 133).
@@ -236,15 +262,28 @@ fn collect_cell_features(
         }
 
         // Arc bounding box: centre ± 2×r_m (radials are 2× the arc radius).
-        let valnmr = feat.attributes.iter()
+        let valnmr = feat
+            .attributes
+            .iter()
             .find(|a| a.code == 178)
-            .and_then(|a| if let s57::AttrValue::Double(v) = a.value { Some(v) } else { None })
+            .and_then(|a| {
+                if let s57::AttrValue::Double(v) = a.value {
+                    Some(v)
+                } else {
+                    None
+                }
+            })
             .unwrap_or(3.0);
-        let r_m   = (200.0_f64 + valnmr * 50.0).min(600.0);
+        let r_m = valnmr.mul_add(50.0, 200.0_f64).min(600.0);
         let d_lat = r_m * 2.0 / 111_320.0;
         let d_lon = r_m * 2.0 / (111_320.0 * lat.to_radians().cos());
 
-        let arc_bbox = Bbox { west: lon - d_lon, south: lat - d_lat, east: lon + d_lon, north: lat + d_lat };
+        let arc_bbox = Bbox {
+            west: lon - d_lon,
+            south: lat - d_lat,
+            east: lon + d_lon,
+            north: lat + d_lat,
+        };
         if !arc_bbox.overlaps(&tile_wgs84) {
             continue;
         }
@@ -281,7 +320,12 @@ fn merge_tile(
 fn tile_mercator_bbox(wgs84: Bbox) -> Bbox {
     let (w_m, s_m) = wgs84_to_webmercator(wgs84.west, wgs84.south);
     let (e_m, n_m) = wgs84_to_webmercator(wgs84.east, wgs84.north);
-    Bbox { west: w_m, south: s_m, east: e_m, north: n_m }
+    Bbox {
+        west: w_m,
+        south: s_m,
+        east: e_m,
+        north: n_m,
+    }
 }
 
 /// Project `(lon, lat)` WGS84 to tile pixel coordinates `(x, y)` in
@@ -324,7 +368,12 @@ fn feat_bbox(feat: &s57::Feature) -> Option<Bbox> {
 /// fewer than 2 vertices are discarded.
 #[profiling::function]
 fn clip_stroke(stroke: &[[f64; 2]], bbox: Bbox) -> Vec<Vec<[f64; 2]>> {
-    let Bbox { west, south, east, north } = bbox;
+    let Bbox {
+        west,
+        south,
+        east,
+        north,
+    } = bbox;
     let mut result: Vec<Vec<[f64; 2]>> = Vec::new();
     let mut current: Vec<[f64; 2]> = Vec::new();
 
@@ -417,23 +466,44 @@ fn clip_segment_lb(
 /// is entirely outside.  The ring need not be explicitly closed.
 #[profiling::function]
 fn clip_ring(ring: &[[f64; 2]], bbox: Bbox) -> Vec<[f64; 2]> {
-    let Bbox { west, south, east, north } = bbox;
-    let r = clip_ring_half_plane(ring, |p| p[0] >= west, |a, b| {
-        let t = (west - a[0]) / (b[0] - a[0]);
-        [west, t.mul_add(b[1] - a[1], a[1])]
-    });
-    let r = clip_ring_half_plane(&r, |p| p[0] <= east, |a, b| {
-        let t = (east - a[0]) / (b[0] - a[0]);
-        [east, t.mul_add(b[1] - a[1], a[1])]
-    });
-    let r = clip_ring_half_plane(&r, |p| p[1] >= south, |a, b| {
-        let t = (south - a[1]) / (b[1] - a[1]);
-        [t.mul_add(b[0] - a[0], a[0]), south]
-    });
-    clip_ring_half_plane(&r, |p| p[1] <= north, |a, b| {
-        let t = (north - a[1]) / (b[1] - a[1]);
-        [t.mul_add(b[0] - a[0], a[0]), north]
-    })
+    let Bbox {
+        west,
+        south,
+        east,
+        north,
+    } = bbox;
+    let r = clip_ring_half_plane(
+        ring,
+        |p| p[0] >= west,
+        |a, b| {
+            let t = (west - a[0]) / (b[0] - a[0]);
+            [west, t.mul_add(b[1] - a[1], a[1])]
+        },
+    );
+    let r = clip_ring_half_plane(
+        &r,
+        |p| p[0] <= east,
+        |a, b| {
+            let t = (east - a[0]) / (b[0] - a[0]);
+            [east, t.mul_add(b[1] - a[1], a[1])]
+        },
+    );
+    let r = clip_ring_half_plane(
+        &r,
+        |p| p[1] >= south,
+        |a, b| {
+            let t = (south - a[1]) / (b[1] - a[1]);
+            [t.mul_add(b[0] - a[0], a[0]), south]
+        },
+    );
+    clip_ring_half_plane(
+        &r,
+        |p| p[1] <= north,
+        |a, b| {
+            let t = (north - a[1]) / (b[1] - a[1]);
+            [t.mul_add(b[0] - a[0], a[0]), north]
+        },
+    )
 }
 
 /// Sutherland-Hodgman single half-plane clipping pass.
@@ -475,7 +545,13 @@ fn clip_ring_half_plane(
 /// boundaries, polygon rings are clipped via Sutherland-Hodgman.  `MultiPoint`
 /// soundings are additionally filtered to their exact containing tile.
 #[profiling::function]
-fn to_mvt_features(feat: &s57::Feature, tile_wgs84: Bbox, merc: Bbox, tile_zoom: u8, zoom_offset: f64) -> Vec<MvtFeature> {
+fn to_mvt_features(
+    feat: &s57::Feature,
+    tile_wgs84: Bbox,
+    merc: Bbox,
+    tile_zoom: u8,
+    zoom_offset: f64,
+) -> Vec<MvtFeature> {
     // SCAMIN: skip features whose minimum display scale is finer than this tile's zoom.
     // Code 133 = SCAMIN in the S-57 attribute table.
     const SCAMIN_CODE: u16 = 133;
@@ -502,8 +578,10 @@ fn to_mvt_features(feat: &s57::Feature, tile_wgs84: Bbox, merc: Bbox, tile_zoom:
             .iter()
             .filter(|[lon, lat, _]| {
                 // Each sounding belongs to exactly one tile.
-                *lon >= tile_wgs84.west && *lon <= tile_wgs84.east
-                    && *lat >= tile_wgs84.south && *lat <= tile_wgs84.north
+                *lon >= tile_wgs84.west
+                    && *lon <= tile_wgs84.east
+                    && *lat >= tile_wgs84.south
+                    && *lat <= tile_wgs84.north
             })
             .map(|[lon, lat, depth]| {
                 let c = to_px(*lon, *lat, merc);
@@ -528,8 +606,10 @@ fn to_mvt_features(feat: &s57::Feature, tile_wgs84: Bbox, merc: Bbox, tile_zoom:
                 return vec![];
             }
             let geom = if clipped.len() == 1 {
-                let ls: MvtLineString =
-                    clipped[0].iter().map(|[lon, lat]| to_px(*lon, *lat, merc)).collect();
+                let ls: MvtLineString = clipped[0]
+                    .iter()
+                    .map(|[lon, lat]| to_px(*lon, *lat, merc))
+                    .collect();
                 MvtGeometry::LineString(ls)
             } else {
                 let lines: Vec<MvtLineString> = clipped
@@ -552,8 +632,10 @@ fn to_mvt_features(feat: &s57::Feature, tile_wgs84: Bbox, merc: Bbox, tile_zoom:
             if exterior_pts.len() < 3 {
                 return vec![];
             }
-            let exterior: MvtLineString =
-                exterior_pts.iter().map(|[lon, lat]| to_px(*lon, *lat, merc)).collect();
+            let exterior: MvtLineString = exterior_pts
+                .iter()
+                .map(|[lon, lat]| to_px(*lon, *lat, merc))
+                .collect();
             // Clip holes; discard any that vanish entirely.
             let holes: Vec<MvtLineString> = ag.rings[1..]
                 .iter()
@@ -562,11 +644,15 @@ fn to_mvt_features(feat: &s57::Feature, tile_wgs84: Bbox, merc: Bbox, tile_zoom:
                     if clipped.len() < 3 {
                         return None;
                     }
-                    Some(clipped.iter().map(|[lon, lat]| to_px(*lon, *lat, merc)).collect())
+                    Some(
+                        clipped
+                            .iter()
+                            .map(|[lon, lat]| to_px(*lon, *lat, merc))
+                            .collect(),
+                    )
                 })
                 .collect();
-            let mut f =
-                MvtFeature::new(MvtGeometry::Polygon(MvtPolygon::new(exterior, holes)));
+            let mut f = MvtFeature::new(MvtGeometry::Polygon(MvtPolygon::new(exterior, holes)));
             f.properties = props;
             vec![f]
         }
@@ -594,14 +680,14 @@ fn build_props(attrs: &[s57::Attribute]) -> Vec<(String, MvtValue)> {
 /// White lights use off-white so they remain legible against light backgrounds.
 fn light_colour_hex(colour: &str) -> &'static str {
     match colour.split(',').next().unwrap_or("").trim() {
-        "3"  => "#ee2222",  // Red
-        "4"  => "#22aa22",  // Green
-        "5"  => "#2255ee",  // Blue
-        "6"  => "#ccaa00",  // Yellow
-        "9"  => "#cc8800",  // Amber
-        "11" => "#ee7700",  // Orange
-        "12" => "#cc22cc",  // Magenta
-        _    => "#f8fafc",  // White (code 1 or unknown)
+        "3" => "#ee2222",  // Red
+        "4" => "#22aa22",  // Green
+        "5" => "#2255ee",  // Blue
+        "6" => "#ccaa00",  // Yellow
+        "9" => "#cc8800",  // Amber
+        "11" => "#ee7700", // Orange
+        "12" => "#cc22cc", // Magenta
+        _ => "#f8fafc",    // White (code 1 or unknown)
     }
 }
 
@@ -639,35 +725,60 @@ fn light_sectors_to_mvt(
 
     for attr in attrs {
         match attr.code {
-            37  => { catlit = Some(match &attr.value {
-                         s57::AttrValue::Int(i)    => MvtValue::UInt(u64::from(*i)),
-                         s57::AttrValue::Str(s)    => MvtValue::String(s.clone()),
-                         s57::AttrValue::Double(f) => MvtValue::Double(*f),
-                     }); }
-            75  => { if let s57::AttrValue::Str(s) = &attr.value { colour = s.as_str(); } }
-            136 => { if let s57::AttrValue::Double(v) = attr.value { sectr1 = Some(v); } }
-            137 => { if let s57::AttrValue::Double(v) = attr.value { sectr2 = Some(v); } }
-            178 => { if let s57::AttrValue::Double(v) = attr.value { valnmr = v; } }
-            _   => {}
+            37 => {
+                catlit = Some(match &attr.value {
+                    s57::AttrValue::Int(i) => MvtValue::UInt(u64::from(*i)),
+                    s57::AttrValue::Str(s) => MvtValue::String(s.clone()),
+                    s57::AttrValue::Double(f) => MvtValue::Double(*f),
+                });
+            }
+            75 => {
+                if let s57::AttrValue::Str(s) = &attr.value {
+                    colour = s.as_str();
+                }
+            }
+            136 => {
+                if let s57::AttrValue::Double(v) = attr.value {
+                    sectr1 = Some(v);
+                }
+            }
+            137 => {
+                if let s57::AttrValue::Double(v) = attr.value {
+                    sectr2 = Some(v);
+                }
+            }
+            178 => {
+                if let s57::AttrValue::Double(v) = attr.value {
+                    valnmr = v;
+                }
+            }
+            _ => {}
         }
     }
 
-    let color   = light_colour_hex(colour);
-    let r_m     = (200.0_f64 + valnmr * 50.0).min(600.0_f64);
+    let hex = light_colour_hex(colour);
+    let r_m = valnmr.mul_add(50.0, 200.0_f64).min(600.0_f64);
 
+    #[allow(clippy::float_cmp)] // exact equality: same bearing = no sector
     let has_sectors = matches!((sectr1, sectr2), (Some(s1), Some(s2)) if s1 != s2);
     let (from_brg, to_brg_raw) = if has_sectors {
         (sectr1.unwrap(), sectr2.unwrap())
     } else {
         (0.0, 360.0)
     };
-    let to_brg = if to_brg_raw <= from_brg { to_brg_raw + 360.0 } else { to_brg_raw };
+    let to_brg = if to_brg_raw <= from_brg {
+        to_brg_raw + 360.0
+    } else {
+        to_brg_raw
+    };
 
     // Arc: one point every 3° for a smooth curve.
-    let span  = to_brg - from_brg;
+    let span = to_brg - from_brg;
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)] // span ≥ 0, ≤ 360
     let steps = ((span / 3.0).ceil() as usize).max(4);
     let arc: Vec<[f64; 2]> = (0..=steps)
         .map(|i| {
+            #[allow(clippy::cast_precision_loss)] // steps ≤ ~120; no precision concern
             let brg = from_brg + span * (i as f64 / steps as f64);
             bearing_offset(lon, lat, brg, r_m)
         })
@@ -675,13 +786,18 @@ fn light_sectors_to_mvt(
 
     let mut push_line = |pts: Vec<[f64; 2]>, kind: &'static str| {
         for stroke in clip_stroke(&pts, tile_wgs84) {
-            if stroke.len() < 2 { continue; }
-            let ls: MvtLineString = stroke.iter()
+            if stroke.len() < 2 {
+                continue;
+            }
+            let ls: MvtLineString = stroke
+                .iter()
                 .map(|[x, y]| to_px(*x, *y, tile_merc))
                 .collect();
             let mut f = MvtFeature::new(MvtGeometry::LineString(ls));
-            f.properties.push(("kind".into(),  MvtValue::String(kind.into())));
-            f.properties.push(("color".into(), MvtValue::String(color.into())));
+            f.properties
+                .push(("kind".into(), MvtValue::String(kind.into())));
+            f.properties
+                .push(("color".into(), MvtValue::String(hex.into())));
             if let Some(ref cv) = catlit {
                 f.properties.push(("CATLIT".into(), cv.clone()));
             }
@@ -694,11 +810,13 @@ fn light_sectors_to_mvt(
     // Radial boundary lines at 2× arc radius, only for sector lights.
     if has_sectors {
         for brg in [sectr1.unwrap(), sectr2.unwrap()] {
-            push_line(vec![[lon, lat], bearing_offset(lon, lat, brg, r_m * 2.0)], "radial");
+            push_line(
+                vec![[lon, lat], bearing_offset(lon, lat, brg, r_m * 2.0)],
+                "radial",
+            );
         }
     }
 }
-
 
 // ── MVT tile encoding ────────────────────────────────────────────────────────
 

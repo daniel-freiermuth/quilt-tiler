@@ -11,9 +11,13 @@ pub fn from_sm(east: f64, north: f64, ref_lat: f64, ref_lon: f64) -> [f64; 2] {
 
     let lat_r = ref_lat.to_radians();
     // Inverse Mercator: undo the log(tan()) forward projection
-    let lat = 2.0f64.mul_add(((north / WGS84_A) + (PI / 4.0 + lat_r / 2.0).tan().ln())
-            .exp()
-            .atan(), -(PI / 2.0))
+    let lat = 2.0f64
+        .mul_add(
+            ((north / WGS84_A) + (PI / 4.0 + lat_r / 2.0).tan().ln())
+                .exp()
+                .atan(),
+            -(PI / 2.0),
+        )
         .to_degrees();
 
     [lon, lat]

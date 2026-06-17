@@ -17,7 +17,7 @@ mod georef;
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use s57::{AreaGeometry, AttrValue, Attribute, Feature, Geometry, TriPrim, TriPrimType};
 
 // ── Record type constants ────────────────────────────────────────────────────
@@ -56,7 +56,6 @@ const CELL_EXTENT_RECORD: u16 = 100;
 const CELL_TXTDSC_INFO_FILE_RECORD: u16 = 101;
 
 const SERVER_STATUS_RECORD: u16 = 200;
-
 
 /// An edge entry from the Vector Edge Node Table (VET, record 96 or 85).
 struct EdgeEntry {
@@ -131,9 +130,12 @@ struct RawTriPrim {
 #[derive(Debug)]
 enum RawGeometry {
     None,
-    Point { lon: f64, lat: f64 },
-    MultiPoint(Vec<[f32; 3]>),  // (east, north, depth) in SM
-    Line(Vec<[i32; 4]>),        // [start_node, edge_id, end_node, dir]
+    Point {
+        lon: f64,
+        lat: f64,
+    },
+    MultiPoint(Vec<[f32; 3]>), // (east, north, depth) in SM
+    Line(Vec<[i32; 4]>),       // [start_node, edge_id, end_node, dir]
     Area {
         contour_count: u32,
         vertex_counts: Vec<u32>,
@@ -239,7 +241,7 @@ pub fn parse_file(data: &[u8]) -> Result<s57::S57Cell> {
             Err(e) => return Err(e.into()),
         }
         let rec_type = u16::from_le_bytes([hdr[0], hdr[1]]);
-        let rec_len  = u32::from_le_bytes([hdr[2], hdr[3], hdr[4], hdr[5]]);
+        let rec_len = u32::from_le_bytes([hdr[2], hdr[3], hdr[4], hdr[5]]);
         if rec_len < 6 {
             tracing::warn!(rec_type, rec_len, "record with length < 6, stopping parse");
             break;
@@ -324,9 +326,7 @@ pub fn parse_file(data: &[u8]) -> Result<s57::S57Cell> {
             CELL_TXTDSC_INFO_FILE_RECORD => {
                 // Payload: u32 name_len, u32 content_len, <name_len bytes filename>, <content>
                 if payload_len >= 8 {
-                    if let (Ok(name_len), Ok(_content_len)) =
-                        (read_u32(&mut p), read_u32(&mut p))
-                    {
+                    if let (Ok(name_len), Ok(_content_len)) = (read_u32(&mut p), read_u32(&mut p)) {
                         let name_len = name_len as usize;
                         let fname = read_cstring(&mut p, name_len).unwrap_or_default();
                         // Content starts after the name field (possibly past its null terminator)
@@ -353,7 +353,7 @@ pub fn parse_file(data: &[u8]) -> Result<s57::S57Cell> {
                 }
                 if payload_len >= 5 {
                     let type_code = read_u16(&mut p)?;
-                    let id        = read_u16(&mut p)?;
+                    let id = read_u16(&mut p)?;
                     let primitive = read_u8(&mut p)?;
                     current = Some(RawFeature {
                         type_code,
@@ -370,7 +370,7 @@ pub fn parse_file(data: &[u8]) -> Result<s57::S57Cell> {
                     tracing::warn!(payload_len, "FEATURE_ATTRIBUTE_RECORD too short");
                     continue;
                 }
-                let attr_code  = read_u16(&mut p)?;
+                let attr_code = read_u16(&mut p)?;
                 let value_type = read_u8(&mut p)?;
                 let value = match value_type {
                     0 => {
@@ -404,7 +404,10 @@ pub fn parse_file(data: &[u8]) -> Result<s57::S57Cell> {
                     }
                 };
                 if let Some(f) = &mut current {
-                    f.attributes.push(Attribute { code: attr_code, value });
+                    f.attributes.push(Attribute {
+                        code: attr_code,
+                        value,
+                    });
                 }
             }
 
@@ -435,9 +438,9 @@ pub fn parse_file(data: &[u8]) -> Result<s57::S57Cell> {
                             break;
                         }
                         let start_node = read_i32(&mut p)?;
-                        let edge_id    = read_i32(&mut p)?;
-                        let end_node   = read_i32(&mut p)?;
-                        let dir        = read_i32(&mut p)?;
+                        let edge_id = read_i32(&mut p)?;
+                        let end_node = read_i32(&mut p)?;
+                        let dir = read_i32(&mut p)?;
                         edge_refs.push([start_node, edge_id, end_node, dir]);
                     }
                     if let Some(f) = &mut current {
@@ -470,7 +473,9 @@ pub fn parse_file(data: &[u8]) -> Result<s57::S57Cell> {
                 }
                 // Read the scale_factor from the EXT header (at offset 44 in payload)
                 let mut hdr_p = Cursor::new(payload_bytes.as_slice());
-                for _ in 0..5 { let _ = read_f64(&mut hdr_p); } // skip 4×f64 extent
+                for _ in 0..5 {
+                    let _ = read_f64(&mut hdr_p);
+                } // skip 4×f64 extent
                 let _ = read_u32(&mut hdr_p); // contour_count
                 let _ = read_u32(&mut hdr_p); // triprim_count
                 let _ = read_u32(&mut hdr_p); // edge_count
@@ -481,7 +486,8 @@ pub fn parse_file(data: &[u8]) -> Result<s57::S57Cell> {
                         continue;
                     }
                 };
-                match parse_area_payload(&mut p, payload_len, true, scale_factor, ref_lat, ref_lon) {
+                match parse_area_payload(&mut p, payload_len, true, scale_factor, ref_lat, ref_lon)
+                {
                     Ok(raw) => {
                         if let Some(f) = &mut current {
                             f.raw_geometry = raw;
@@ -504,7 +510,7 @@ pub fn parse_file(data: &[u8]) -> Result<s57::S57Cell> {
                         if p.position() as usize + 12 > payload_len {
                             break;
                         }
-                        let east  = read_f32(&mut p)?;
+                        let east = read_f32(&mut p)?;
                         let north = read_f32(&mut p)?;
                         let depth = read_f32(&mut p)?;
                         pts.push([east, north, depth]);
@@ -529,14 +535,14 @@ pub fn parse_file(data: &[u8]) -> Result<s57::S57Cell> {
                     if p.position() as usize + 8 > payload_len {
                         break;
                     }
-                    let edge_index  = read_u32(&mut p)?;
+                    let edge_index = read_u32(&mut p)?;
                     let point_count = read_u32(&mut p)? as usize;
                     let mut points = Vec::with_capacity(point_count);
                     for _ in 0..point_count {
                         if p.position() as usize + 8 > payload_len {
                             break;
                         }
-                        let east  = f64::from(read_f32(&mut p)?);
+                        let east = f64::from(read_f32(&mut p)?);
                         let north = f64::from(read_f32(&mut p)?);
                         points.push([east, north]);
                     }
@@ -556,9 +562,15 @@ pub fn parse_file(data: &[u8]) -> Result<s57::S57Cell> {
                         break;
                     }
                     let node_index = read_u32(&mut p)?;
-                    let east  = f64::from(read_f32(&mut p)?);
+                    let east = f64::from(read_f32(&mut p)?);
                     let north = f64::from(read_f32(&mut p)?);
-                    vct.insert(node_index, NodeEntry { lon: east, lat: north });
+                    vct.insert(
+                        node_index,
+                        NodeEntry {
+                            lon: east,
+                            lat: north,
+                        },
+                    );
                 }
             }
 
@@ -576,14 +588,14 @@ pub fn parse_file(data: &[u8]) -> Result<s57::S57Cell> {
                     if p.position() as usize + 8 > payload_len {
                         break;
                     }
-                    let edge_index  = read_u32(&mut p)?;
+                    let edge_index = read_u32(&mut p)?;
                     let point_count = read_u32(&mut p)? as usize;
                     let mut points = Vec::with_capacity(point_count);
                     for _ in 0..point_count {
                         if p.position() as usize + 4 > payload_len {
                             break;
                         }
-                        let east  = f64::from(read_i16(&mut p)?) / scale_factor;
+                        let east = f64::from(read_i16(&mut p)?) / scale_factor;
                         let north = f64::from(read_i16(&mut p)?) / scale_factor;
                         points.push([east, north]);
                     }
@@ -605,9 +617,15 @@ pub fn parse_file(data: &[u8]) -> Result<s57::S57Cell> {
                         break;
                     }
                     let node_index = read_u32(&mut p)?;
-                    let east  = f64::from(read_i16(&mut p)?) / scale_factor;
+                    let east = f64::from(read_i16(&mut p)?) / scale_factor;
                     let north = f64::from(read_i16(&mut p)?) / scale_factor;
-                    vct.insert(node_index, NodeEntry { lon: east, lat: north });
+                    vct.insert(
+                        node_index,
+                        NodeEntry {
+                            lon: east,
+                            lat: north,
+                        },
+                    );
                 }
             }
 
@@ -618,11 +636,7 @@ pub fn parse_file(data: &[u8]) -> Result<s57::S57Cell> {
             }
 
             unknown => {
-                tracing::warn!(
-                    rec_type = unknown,
-                    rec_len,
-                    "unknown record type, skipping"
-                );
+                tracing::warn!(rec_type = unknown, rec_len, "unknown record type, skipping");
             }
         }
     }
@@ -635,7 +649,10 @@ pub fn parse_file(data: &[u8]) -> Result<s57::S57Cell> {
     // ── Resolve SM coords → WGS84 ────────────────────────────────────────────
     let mut resolved_vct: HashMap<u32, [f64; 2]> = HashMap::with_capacity(vct.len());
     for (idx, node) in &vct {
-        resolved_vct.insert(*idx, crate::georef::from_sm(node.lon, node.lat, ref_lat, ref_lon));
+        resolved_vct.insert(
+            *idx,
+            crate::georef::from_sm(node.lon, node.lat, ref_lat, ref_lon),
+        );
     }
 
     let mut resolved_vet: HashMap<u32, Vec<[f64; 2]>> = HashMap::with_capacity(vet.len());
@@ -674,17 +691,7 @@ pub fn parse_file(data: &[u8]) -> Result<s57::S57Cell> {
     // degrees — NOT in SM metres.  Earlier code mistakenly ran from_sm() on
     // these, mapping all points to near-centroid.  Correct interpretation:
     // reorder to GeoJSON [lon, lat] and widen to f64.
-    fn decode_covr(raw: Vec<RawCovr>) -> Vec<Vec<[f64; 2]>> {
-        raw.into_iter()
-            .map(|covr| {
-                covr.points
-                    .into_iter()
-                    .map(|[lat, lon]| [f64::from(lon), f64::from(lat)])
-                    .collect()
-            })
-            .collect()
-    }
-    let coverage    = decode_covr(raw_covr);
+    let coverage = decode_covr(raw_covr);
     let no_coverage = decode_covr(raw_nocovr);
 
     Ok(OesuCell {
@@ -706,7 +713,20 @@ pub fn parse_file(data: &[u8]) -> Result<s57::S57Cell> {
         coverage,
         no_coverage,
         text_descriptions,
-    }.into())
+    }
+    .into())
+}
+
+/// Reorder raw COVR points from `(lat, lon)` `f32` to `GeoJSON` `[lon, lat]` `f64`.
+fn decode_covr(raw: Vec<RawCovr>) -> Vec<Vec<[f64; 2]>> {
+    raw.into_iter()
+        .map(|covr| {
+            covr.points
+                .into_iter()
+                .map(|[lat, lon]| [f64::from(lon), f64::from(lat)])
+                .collect()
+        })
+        .collect()
 }
 
 // ── Prologue helpers ─────────────────────────────────────────────────────────
@@ -716,11 +736,14 @@ pub fn parse_file(data: &[u8]) -> Result<s57::S57Cell> {
 #[allow(clippy::items_after_statements)] // PAYLOAD const follows early-exit guards; clearer here
 fn strip_server_status(data: &[u8]) -> Result<(&[u8], u16, u16)> {
     if data.len() < 6 {
-        bail!("file too short to be a valid SENC stream ({} bytes)", data.len());
+        bail!(
+            "file too short to be a valid SENC stream ({} bytes)",
+            data.len()
+        );
     }
 
     let rec_type = u16::from_le_bytes([data[0], data[1]]);
-    let rec_len  = u32::from_le_bytes([data[2], data[3], data[4], data[5]]) as usize;
+    let rec_len = u32::from_le_bytes([data[2], data[3], data[4], data[5]]) as usize;
 
     if rec_type != SERVER_STATUS_RECORD {
         // Not a SENC file: check for BSB raster chart signature.
@@ -741,19 +764,22 @@ fn strip_server_status(data: &[u8]) -> Result<(&[u8], u16, u16)> {
     //   u16 expireDaysRemaining, u16 graceDaysAllowed, u16 graceDaysRemaining
     const PAYLOAD: usize = 12;
     if rec_len < 6 + PAYLOAD {
-        bail!("SERVER_STATUS_RECORD too short ({rec_len} bytes, need at least {})", 6 + PAYLOAD);
+        bail!(
+            "SERVER_STATUS_RECORD too short ({rec_len} bytes, need at least {})",
+            6 + PAYLOAD
+        );
     }
     if data.len() < rec_len {
         bail!("file truncated inside SERVER_STATUS_RECORD");
     }
 
     let pl = &data[6..6 + PAYLOAD];
-    let server_status  = u16::from_le_bytes([pl[0],  pl[1]]);
-    let decrypt_status = u16::from_le_bytes([pl[2],  pl[3]]);
-    let expire_status  = u16::from_le_bytes([pl[4],  pl[5]]);
-    let expire_days    = u16::from_le_bytes([pl[6],  pl[7]]);
-    let grace_allowed  = u16::from_le_bytes([pl[8],  pl[9]]);
-    let grace_days     = u16::from_le_bytes([pl[10], pl[11]]);
+    let server_status = u16::from_le_bytes([pl[0], pl[1]]);
+    let decrypt_status = u16::from_le_bytes([pl[2], pl[3]]);
+    let expire_status = u16::from_le_bytes([pl[4], pl[5]]);
+    let expire_days = u16::from_le_bytes([pl[6], pl[7]]);
+    let grace_allowed = u16::from_le_bytes([pl[8], pl[9]]);
+    let grace_days = u16::from_le_bytes([pl[10], pl[11]]);
 
     tracing::debug!(
         server_status,
@@ -791,7 +817,7 @@ fn read_senc_version(data: &[u8]) -> Result<u16> {
     }
 
     let rec_type = u16::from_le_bytes([data[0], data[1]]);
-    let rec_len  = u32::from_le_bytes([data[2], data[3], data[4], data[5]]);
+    let rec_len = u32::from_le_bytes([data[2], data[3], data[4], data[5]]);
 
     if rec_type != HEADER_SENC_VERSION {
         if data.starts_with(b"!BSB") || data.starts_with(b"BSB/") {
@@ -838,7 +864,7 @@ fn parse_covr_payload(p: &mut Cursor<&[u8]>, payload_len: usize) -> Option<RawCo
     let count = read_u32(p).ok()? as usize;
     let mut points = Vec::with_capacity(count);
     for _ in 0..count {
-        let east  = read_f32(p).ok()?;
+        let east = read_f32(p).ok()?;
         let north = read_f32(p).ok()?;
         points.push([east, north]);
     }
@@ -853,7 +879,11 @@ fn parse_covr_payload(p: &mut Cursor<&[u8]>, payload_len: usize) -> Option<RawCo
 ///   - `TriPrim` vertices use `nvert × 2 × i16` (divided by `scale_factor`)
 ///
 /// For non-EXT records `scale_factor` and `ref_lat`/`ref_lon` are ignored.
-#[allow(clippy::too_many_lines, clippy::cast_possible_truncation, clippy::similar_names)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::similar_names
+)]
 fn parse_area_payload(
     p: &mut Cursor<&[u8]>,
     payload_len: usize,
@@ -863,7 +893,10 @@ fn parse_area_payload(
     ref_lon: f64,
 ) -> Result<RawGeometry> {
     let min_len = if ext { 52 } else { 44 };
-    anyhow::ensure!(payload_len >= min_len, "area payload too short ({payload_len} bytes)");
+    anyhow::ensure!(
+        payload_len >= min_len,
+        "area payload too short ({payload_len} bytes)"
+    );
 
     // 4×f64 extent (informational, not used for geometry)
     let _s = read_f64(p)?;
@@ -873,7 +906,7 @@ fn parse_area_payload(
 
     let contour_count = read_u32(p)?;
     let triprim_count = read_u32(p)? as usize;
-    let edge_count    = read_u32(p)? as usize;
+    let edge_count = read_u32(p)? as usize;
 
     if ext {
         // Consume the scale_factor field; caller already read it to pass in.
@@ -899,7 +932,7 @@ fn parse_area_payload(
             "truncated TriPrim header at entry {k}/{triprim_count}"
         );
         let prim_type = read_u8(p)?;
-        let nvert     = read_u32(p)? as usize;
+        let nvert = read_u32(p)? as usize;
 
         let (bbox, vertices) = if ext {
             // bbox: 4×i16 SM coords [min_east, max_east, min_north, max_north]
@@ -907,8 +940,8 @@ fn parse_area_payload(
                 p.position() as usize + 4 * 2 + nvert * 2 * 2 <= payload_len,
                 "truncated EXT TriPrim body at entry {k}/{triprim_count} (nvert={nvert})"
             );
-            let min_east  = f64::from(read_i16(p)?) / scale_factor;
-            let max_east  = f64::from(read_i16(p)?) / scale_factor;
+            let min_east = f64::from(read_i16(p)?) / scale_factor;
+            let max_east = f64::from(read_i16(p)?) / scale_factor;
             let min_north = f64::from(read_i16(p)?) / scale_factor;
             let max_north = f64::from(read_i16(p)?) / scale_factor;
             let [min_lon, min_lat] = crate::georef::from_sm(min_east, min_north, ref_lat, ref_lon);
@@ -917,7 +950,7 @@ fn parse_area_payload(
 
             let mut verts = Vec::with_capacity(nvert);
             for _ in 0..nvert {
-                let east  = f32::from(read_i16(p)?) / scale_factor as f32;
+                let east = f32::from(read_i16(p)?) / scale_factor as f32;
                 let north = f32::from(read_i16(p)?) / scale_factor as f32;
                 verts.push([east, north]);
             }
@@ -936,20 +969,24 @@ fn parse_area_payload(
 
             let mut verts = Vec::with_capacity(nvert);
             for _ in 0..nvert {
-                let east  = read_f32(p)?;
+                let east = read_f32(p)?;
                 let north = read_f32(p)?;
                 verts.push([east, north]);
             }
             (bbox, verts)
         };
 
-        tri_prims.push(RawTriPrim { prim_type, bbox, vertices });
+        tri_prims.push(RawTriPrim {
+            prim_type,
+            bbox,
+            vertices,
+        });
     }
 
     // Edge reference table: edge_count × 4 × i32.
     // The o-charts server always emits 4-int entries (stride 4); the OSENC spec
     // says 3-int entries for version ≤ 200, but all known files are version 201+.
-    let cursor    = p.position() as usize;
+    let cursor = p.position() as usize;
     let remaining = payload_len.saturating_sub(cursor);
     anyhow::ensure!(
         remaining == edge_count * 16,
@@ -960,13 +997,18 @@ fn parse_area_payload(
     let mut edge_refs = Vec::with_capacity(edge_count);
     for _ in 0..edge_count {
         let start_node = read_i32(p)?;
-        let edge_id    = read_i32(p)?;
-        let end_node   = read_i32(p)?;
-        let dir        = read_i32(p)?;
+        let edge_id = read_i32(p)?;
+        let end_node = read_i32(p)?;
+        let dir = read_i32(p)?;
         edge_refs.push([start_node, edge_id, end_node, dir]);
     }
 
-    Ok(RawGeometry::Area { contour_count, vertex_counts, tri_prims, edge_refs })
+    Ok(RawGeometry::Area {
+        contour_count,
+        vertex_counts,
+        tri_prims,
+        edge_refs,
+    })
 }
 
 // ── Geometry resolution ──────────────────────────────────────────────────────
@@ -1005,17 +1047,22 @@ fn resolve_geometry(
             }
         }
 
-        RawGeometry::Area { contour_count, vertex_counts, tri_prims, edge_refs } => {
+        RawGeometry::Area {
+            contour_count,
+            vertex_counts,
+            tri_prims,
+            edge_refs,
+        } => {
             if edge_refs.is_empty() {
                 tracing::warn!(expected = contour_count, "no contours in area geometry");
                 return Geometry::None;
             }
 
             let expected_rings = contour_count as usize;
-            let total_edges    = edge_refs.len();
+            let total_edges = edge_refs.len();
             let mut rings: Vec<Vec<[f64; 2]>> = Vec::with_capacity(expected_rings);
-            let mut ring_start  = 0usize;
-            let mut prev_end    = edge_refs[0][0];
+            let mut ring_start = 0usize;
+            let mut prev_end = edge_refs[0][0];
 
             for i in 0..total_edges {
                 let [start_node, _edge, end_node, _dir] = edge_refs[i];
@@ -1031,7 +1078,7 @@ fn resolve_geometry(
                 }
                 prev_end = end_node;
 
-                let is_last    = i + 1 == total_edges;
+                let is_last = i + 1 == total_edges;
                 let ring_closed = end_node == edge_refs[ring_start][0];
 
                 if is_last && !ring_closed {
@@ -1056,7 +1103,7 @@ fn resolve_geometry(
                     }
                     if !is_last {
                         ring_start = i + 1;
-                        prev_end   = edge_refs[ring_start][0];
+                        prev_end = edge_refs[ring_start][0];
                     }
                 }
             }
@@ -1088,12 +1135,7 @@ fn resolve_geometry(
                             .vertices
                             .iter()
                             .map(|&[e, n]| {
-                                crate::georef::from_sm(
-                                    f64::from(e),
-                                    f64::from(n),
-                                    ref_lat,
-                                    ref_lon,
-                                )
+                                crate::georef::from_sm(f64::from(e), f64::from(n), ref_lat, ref_lon)
                             })
                             .collect(),
                     })
@@ -1103,7 +1145,11 @@ fn resolve_geometry(
             if rings.is_empty() {
                 Geometry::None
             } else {
-                Geometry::Area(AreaGeometry { rings, vertex_counts, tri_prims: resolved_tri_prims })
+                Geometry::Area(AreaGeometry {
+                    rings,
+                    vertex_counts,
+                    tri_prims: resolved_tri_prims,
+                })
             }
         }
     }
