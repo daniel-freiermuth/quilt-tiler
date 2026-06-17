@@ -373,9 +373,9 @@ checksum = "34aa73646ffb006b8f5147f3dc182bd4bcb190227ce861fc4a4844bf8e3cb2c0"
 
 [[package]]
 name = "fast-mvt"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3317314793f5938545f211999cebb74d659f640b48555946247baeb9e407328"
+checksum = "075da97a9d841b90a396a2c5b26808fce818ca21989bc8398d2d2122c8eae197"
 dependencies = [
  "buffa",
  "dup-indexer",
@@ -578,9 +578,9 @@ dependencies = [
 
 [[package]]
 name = "martin-tile-utils"
-version = "0.7.3"
+version = "0.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f50da69ea23c3f4e11b7e21bfbe236ba12ed825ce0c9cdcb11a2c99b25ee4533"
+checksum = "7b9ddefee243adb0e3ac8b37553d4536790dd2861ed008467a59d937985e7f85"
 dependencies = [
  "brotli",
  "flate2",
