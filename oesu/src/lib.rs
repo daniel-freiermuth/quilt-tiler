@@ -90,6 +90,7 @@ struct OesuCell {
     coverage: Vec<Vec<[f64; 2]>>,
     no_coverage: Vec<Vec<[f64; 2]>>,
     text_descriptions: HashMap<String, String>,
+    source: String,
 }
 
 impl From<OesuCell> for s57::S57Cell {
@@ -100,6 +101,7 @@ impl From<OesuCell> for s57::S57Cell {
             bounds: c.bounds,
             features: c.features,
             coverage: c.coverage,
+            source: c.source,
         }
     }
 }
@@ -206,7 +208,7 @@ fn read_cstring(c: &mut Cursor<&[u8]>, max: usize) -> Result<String> {
     clippy::similar_names,           // sw/nw/ne/se and resolved_vct/resolved_vet are domain vocab
     clippy::missing_errors_doc,      // private binary parser; error cases in record comments
 )]
-pub fn parse_file(data: &[u8]) -> Result<s57::S57Cell> {
+pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
     // ── Prologue: validate SERVER_STATUS + version ───────────────────────────
     let (data, expire_days_remaining, grace_days_remaining) = strip_server_status(data)?;
     let senc_version = read_senc_version(data)?;
@@ -713,6 +715,7 @@ pub fn parse_file(data: &[u8]) -> Result<s57::S57Cell> {
         coverage,
         no_coverage,
         text_descriptions,
+        source,
     }
     .into())
 }

@@ -98,6 +98,7 @@ pub struct S57Cell {
     /// multiple disjoint coverage areas (outer `Vec`); each ring is a
     /// closed polygon (inner `Vec`).  Empty when no COVR record was present.
     pub coverage: Vec<Vec<[f64; 2]>>,
+    pub source: String,
 }
 
 // ── Object-class and attribute code tables ───────────────────────────────────

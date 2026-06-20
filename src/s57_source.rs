@@ -32,6 +32,10 @@ impl TileSource for s57::S57Cell {
         self.native_scale
     }
 
+    fn source(&self) -> String {
+        self.source.clone()
+    }
+
     #[profiling::function]
     fn render(&self, tile: &TileGeom) -> Self::Content {
         let mut layers: HashMap<&'static str, Vec<MvtFeature>> = HashMap::new();

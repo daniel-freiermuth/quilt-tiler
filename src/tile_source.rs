@@ -29,7 +29,9 @@ pub trait TileSource: Sync {
     /// Must convert to and from [`Bbox`]: `write_pmtiles` needs `From<Bbox>` to
     /// construct the tile-shaped coverage sentinel, and `Into<Bbox>` to
     /// aggregate item extents into the overall bounding box for tile iteration.
-    type Coverage: BoundedLattice + From<Bbox> + Into<Bbox>;
+    type Coverage: BoundedLattice + From<Bbox> + Into<Bbox> + Debug;
+
+    fn source(&self) -> String;
 
     /// Geographic coverage of this item.
     fn coverage(&self) -> Self::Coverage;
