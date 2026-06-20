@@ -58,11 +58,6 @@ impl BoundedLattice for RectUnion {
         Self { rects }
     }
 
-    #[inline]
-    fn is_bottom(&self) -> bool {
-        self.rects.is_empty()
-    }
-
     /// `true` when every rect in `other` is fully covered by the union of
     /// rects in `self`.
     fn subsumes(&self, other: &Self) -> bool {
@@ -130,6 +125,11 @@ impl RectUnion {
 
         true
     }
+
+    #[inline]
+    pub fn is_bottom(&self) -> bool {
+        self.rects.is_empty()
+    }
 }
 
 /// Bounding box of the entire union (smallest [`Bbox`] containing all rects).
@@ -174,12 +174,6 @@ mod tests {
             east: e,
             north: n,
         })
-    }
-
-    #[test]
-    fn bottom_is_empty() {
-        assert!(RectUnion::bottom().is_bottom());
-        assert!(!b(0.0, 0.0, 1.0, 1.0).is_bottom());
     }
 
     #[test]

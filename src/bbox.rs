@@ -38,6 +38,11 @@ impl Bbox {
         }
         Some(b)
     }
+
+    #[inline]
+    pub fn is_bottom(&self) -> bool {
+        self.west > self.east || self.south > self.north
+    }
 }
 
 impl BoundedLattice for Bbox {
@@ -69,11 +74,6 @@ impl BoundedLattice for Bbox {
             east: self.east.min(other.east),
             north: self.north.min(other.north),
         }
-    }
-
-    #[inline]
-    fn is_bottom(&self) -> bool {
-        self.west > self.east || self.south > self.north
     }
 
     #[inline]
