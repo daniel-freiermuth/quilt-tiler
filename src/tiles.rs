@@ -54,21 +54,9 @@ pub fn write_pmtiles<S: TileSource>(
         None => zoom_ceil_native,
     };
 
-    let overall = {
-        let b = items.iter().fold(Bbox::bottom(), |acc, item| {
-            acc.join(&item.coverage().into())
-        });
-        if b.is_bottom() {
-            Bbox {
-                west: -180.0,
-                south: -85.0,
-                east: 180.0,
-                north: 85.0,
-            }
-        } else {
-            b
-        }
-    };
+    let overall = items.iter().fold(Bbox::bottom(), |acc, item| {
+        acc.join(&item.coverage().into())
+    });
 
     let total_tiles: u64 = (zoom_floor..=zoom_ceil)
         .map(|z| {
