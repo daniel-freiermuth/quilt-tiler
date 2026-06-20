@@ -7,12 +7,12 @@ use fast_mvt::{
     DEFAULT_EXTENT, MvtFeature, MvtGeometry, MvtLayer, MvtLineString, MvtMultiLineString, MvtPoint,
     MvtPolygon, MvtTile, MvtValue,
 };
+use geo::{MultiPolygon, Polygon};
 use martin_tile_utils::wgs84_to_webmercator;
 use pmtiles::TileType;
 
 use crate::bbox::Bbox;
 use crate::lattice::BoundedLattice;
-use crate::rect_union::RectUnion;
 use crate::tile_geom::TileGeom;
 use crate::tile_source::TileSource;
 
@@ -22,10 +22,15 @@ const EXTENT: f64 = 4096.0;
 
 impl TileSource for s57::S57Cell {
     type Content = HashMap<&'static str, Vec<MvtFeature>>;
-    type Coverage = RectUnion;
+    type Coverage = MultiPolygon;
 
-    fn coverage(&self) -> RectUnion {
-        RectUnion::from(Bbox::from(self.bounds))
+    fn coverage(&self) -> Self::Coverage {
+        MultiPolygon::new(
+            self.coverage
+                .iter()
+                .map(|ring| Polygon::new(ring.clone().into(), vec![]))
+                .collect(),
+        )
     }
 
     fn native_scale(&self) -> u32 {

@@ -1,5 +1,7 @@
 //! Axis-aligned bounding box — the [`BoundedLattice`] instance for bbox algebra.
 
+use geo::{BoundingRect, MultiPolygon, Polygon};
+
 use crate::lattice::BoundedLattice;
 
 /// An axis-aligned bounding box in WGS84 or projected coordinates.
@@ -107,5 +109,39 @@ impl From<[f64; 4]> for Bbox {
             east,
             north,
         }
+    }
+}
+
+impl From<MultiPolygon> for Bbox {
+    fn from(value: MultiPolygon) -> Self {
+        match value.bounding_rect() {
+            None => Bbox::bottom(),
+            Some(b_rect) => {
+                let sw_coord = b_rect.min();
+                let ne_coord = b_rect.max();
+                Self {
+                    north: ne_coord.y,
+                    south: sw_coord.y,
+                    west: sw_coord.x,
+                    east: ne_coord.x,
+                }
+            }
+        }
+    }
+}
+
+impl From<Bbox> for Polygon {
+    fn from(value: Bbox) -> Self {
+        Polygon::new(
+            vec![
+                [value.east, value.north],
+                [value.west, value.north],
+                [value.west, value.south],
+                [value.east, value.south],
+                [value.east, value.north],
+            ]
+            .into(),
+            vec![],
+        )
     }
 }

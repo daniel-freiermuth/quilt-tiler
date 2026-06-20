@@ -4,6 +4,8 @@
 //! Current implementation: [`crate::bbox::Bbox`].
 //! Intended next implementation: exact polygon boolean regions.
 
+use geo::{BooleanOps, Contains, Intersects, MultiPolygon};
+
 /// A bounded lattice.
 ///
 /// The partial order is: `a ≥ b` iff `a.subsumes(b)` ("a covers b entirely").
@@ -22,4 +24,26 @@ pub trait BoundedLattice: Sized {
     fn subsumes(&self, other: &Self) -> bool;
 
     fn overlaps(&self, other: &Self) -> bool;
+}
+
+impl BoundedLattice for MultiPolygon {
+    fn bottom() -> Self {
+        MultiPolygon::empty()
+    }
+
+    fn join(&self, other: &Self) -> Self {
+        self.union(other)
+    }
+
+    fn meet(&self, other: &Self) -> Self {
+        self.intersection(other)
+    }
+
+    fn subsumes(&self, other: &Self) -> bool {
+        self.contains(other)
+    }
+
+    fn overlaps(&self, other: &Self) -> bool {
+        self.intersects(other)
+    }
 }
