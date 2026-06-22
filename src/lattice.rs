@@ -4,7 +4,7 @@
 //! Current implementation: [`crate::bbox::Bbox`].
 //! Intended next implementation: exact polygon boolean regions.
 
-use geo::{BooleanOps, Contains, Intersects, MultiPolygon};
+use geo::{Area, BooleanOps, Contains, Intersects, MultiPolygon};
 
 /// A bounded lattice.
 ///
@@ -24,6 +24,10 @@ pub trait BoundedLattice: Sized {
     fn subsumes(&self, other: &Self) -> bool;
 
     fn overlaps(&self, other: &Self) -> bool;
+
+    fn area(&self) -> f64;
+
+    fn minus(&self, other: &Self) -> Self;
 }
 
 impl BoundedLattice for MultiPolygon {
@@ -45,5 +49,13 @@ impl BoundedLattice for MultiPolygon {
 
     fn overlaps(&self, other: &Self) -> bool {
         self.intersects(other)
+    }
+
+    fn area(&self) -> f64 {
+        self.signed_area()
+    }
+
+    fn minus(&self, other: &Self) -> Self {
+        self.difference(other)
     }
 }

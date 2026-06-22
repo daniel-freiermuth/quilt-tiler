@@ -93,11 +93,6 @@ pub fn write_pmtiles<S: TileSource>(
 
                 let tile_wgs84 = Bbox::from(xyz_to_bbox(z, col, row, col, row));
                 let tile_merc = tile_mercator_bbox(tile_wgs84);
-                let tile = TileGeom {
-                    wgs84: tile_wgs84,
-                    merc: tile_merc,
-                    scale: tile_scale,
-                };
 
                 // Candidates: items whose coverage bbox overlaps this tile.
                 let mut candidates: Vec<usize> = {
@@ -124,21 +119,28 @@ pub fn write_pmtiles<S: TileSource>(
                 }
 
                 // Greedy coverage: include an item only if its contribution
-                // adds area not yet covered.  RectUnion correctly handles
-                // separate coverage areas (e.g. NE + SW ≠ full tile).
+                // adds area not yet covered.  `Coverage`'s real polygon
+                // algebra correctly handles disjoint coverage areas (e.g.
+                // NE + SW ≠ full tile), unlike a bounding-box hull.
                 let tile_cov = S::Coverage::from(tile_wgs84);
-                let mut covered = S::Coverage::bottom();
+                let mut uncovered = tile_cov.clone();
                 let mut contents: Vec<S::Content> = Vec::new();
+
                 {
                     profiling::scope!("Collecting features");
                     for &i in &candidates {
-                        let contrib = items[i].coverage().meet(&tile_cov);
-                        if covered.subsumes(&contrib) {
+                        let contrib = items[i].coverage().meet(&uncovered);
+                        if contrib.area() == 0.0 {
                             continue;
                         }
-                        contents.push(items[i].render(&tile));
-                        covered = covered.join(&contrib);
-                        if covered.subsumes(&tile_cov) {
+                        let item_tile = TileGeom {
+                            geom: contrib.clone().into(),
+                            merc: tile_merc,
+                            scale: tile_scale,
+                        };
+                        contents.push(items[i].render(&item_tile));
+                        uncovered = uncovered.minus(&contrib);
+                        if uncovered.area() == 0.0 {
                             break;
                         }
                     }

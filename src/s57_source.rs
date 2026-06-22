@@ -4,17 +4,17 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use fast_mvt::{
-    DEFAULT_EXTENT, MvtFeature, MvtGeometry, MvtLayer, MvtLineString, MvtPoint, MvtTile, MvtValue,
+    DEFAULT_EXTENT, MvtFeature, MvtGeometry, MvtLayer, MvtLineString, MvtTile, MvtValue,
 };
 use geo::{
-    BooleanOps, Coord, CoordsIter, HasDimensions, LineString, MapCoords, MultiLineString,
+    BooleanOps, Coord, HasDimensions, Intersects, LineString, MapCoords, MultiLineString,
     MultiPolygon, Point, Polygon, coord,
 };
+
 use martin_tile_utils::wgs84_to_webmercator;
 use pmtiles::TileType;
 
 use crate::bbox::Bbox;
-use crate::lattice::BoundedLattice;
 use crate::tile_geom::TileGeom;
 use crate::tile_source::TileSource;
 
@@ -48,12 +48,12 @@ impl TileSource for s57::S57Cell {
         let mut layers: HashMap<&'static str, Vec<MvtFeature>> = HashMap::new();
 
         for feat in &self.features {
-            if !feat_intersects(feat, tile.wgs84) {
-                continue;
-            }
             let Some(layer_name) = s57::object_acronym(feat.type_code) else {
                 continue;
             };
+            if !feat_intersects(feat, &tile.geom) {
+                continue;
+            }
             let feats = to_mvt_features(feat, tile);
             if !feats.is_empty() {
                 layers.entry(layer_name).or_default().extend(feats);
@@ -99,7 +99,7 @@ impl TileSource for s57::S57Cell {
                 east: center.x() + d_lon,
                 north: center.y() + d_lat,
             };
-            if !arc_bbox.overlaps(&tile.wgs84) {
+            if !tile.geom.intersects(&Polygon::from(arc_bbox)) {
                 continue;
             }
             light_sectors_to_mvt(*center, &feat.attributes, tile, &mut layers);
@@ -160,47 +160,43 @@ fn to_px(wgs84_coord: Coord, merc: Bbox) -> fast_mvt::MvtCoord {
 
 // ── Feature filtering ────────────────────────────────────────────────────────
 
-fn feat_intersects(feat: &s57::Feature, tile: Bbox) -> bool {
-    feat_bbox(feat).is_some_and(|b| b.overlaps(&tile))
-}
-
-fn feat_bbox(feat: &s57::Feature) -> Option<Bbox> {
+fn feat_intersects(feat: &s57::Feature, tile_geom: &MultiPolygon) -> bool {
     match &feat.geometry {
-        s57::Geometry::None => None,
-        s57::Geometry::Point(point) => Some(Bbox::point(point.x(), point.y())),
-        s57::Geometry::Soundings(pts) => Bbox::of(pts.iter().map(|p| (p.0.x(), p.0.y()))),
-        s57::Geometry::Line(strokes) => Bbox::of(strokes.coords().map(|p| (p.x, p.y))),
-        s57::Geometry::Area(ag) => Bbox::of(ag.exterior_coords_iter().map(|p| (p.x, p.y))),
+        s57::Geometry::None => false,
+        s57::Geometry::Point(p) => tile_geom.intersects(p),
+        s57::Geometry::Soundings(pts) => pts.iter().any(|(p, _)| tile_geom.intersects(p)),
+        s57::Geometry::Line(ls) => tile_geom.intersects(ls),
+        s57::Geometry::Area(poly) => tile_geom.intersects(poly),
     }
 }
 
 // ── Geometry clipping ────────────────────────────────────────────────────────
 
-/// Clip a polyline stroke to `bbox`.
+/// Clip a polyline stroke to `clip` — an arbitrary [`MultiPolygon`] region,
+/// not necessarily a single rectangle.
 ///
-/// A stroke that exits and re-enters the bbox is split into separate
+/// A stroke that exits and re-enters `clip` is split into separate
 /// sub-strokes; sub-strokes with fewer than 2 vertices are discarded.
 #[profiling::function]
-fn clip_stroke(line: &LineString, bbox: Bbox) -> MultiLineString {
-    let clip_region = MultiPolygon::new(vec![Polygon::from(bbox)]);
-    clip_region.clip(&MultiLineString::new(vec![line.clone()]), false)
+fn clip_stroke(line: &LineString, clip: &MultiPolygon) -> MultiLineString {
+    clip.clip(&MultiLineString::new(vec![line.clone()]), false)
 }
 
-/// Clip a polygon ring to `bbox`.
+/// Clip a polygon ring to `clip` — an arbitrary [`MultiPolygon`] region, not
+/// necessarily a single rectangle.
 ///
-/// Returns the clipped ring; empty when the ring is entirely outside.
-/// The ring need not be explicitly closed.
+/// Returns the clipped polygon(s); empty when entirely outside `clip`.  The
+/// ring need not be explicitly closed.
 #[profiling::function]
-fn clip_ring(subject: &Polygon, bbox: Bbox) -> MultiPolygon {
-    let clip_region = Polygon::from(bbox);
-    subject.intersection(&clip_region)
+fn clip_ring(subject: &Polygon, clip: &MultiPolygon) -> MultiPolygon {
+    subject.intersection(clip)
 }
 
 // ── Feature → MVT conversion ─────────────────────────────────────────────────
 
 /// Convert one S-57 feature to zero or more MVT features in tile pixel space.
 ///
-/// All geometry is clipped to `tile.wgs84`.  `MultiPoint` soundings are
+/// All geometry is clipped to `tile.geom`.  `Soundings` points are
 /// additionally filtered to their exact containing tile.
 #[profiling::function]
 fn to_mvt_features(feat: &s57::Feature, tile: &TileGeom) -> Vec<MvtFeature> {
@@ -230,14 +226,11 @@ fn to_mvt_features(feat: &s57::Feature, tile: &TileGeom) -> Vec<MvtFeature> {
             .iter()
             .filter(|(wgs_coord, _)| {
                 // Each sounding belongs to exactly one tile.
-                wgs_coord.x() >= tile.wgs84.west
-                    && wgs_coord.x() <= tile.wgs84.east
-                    && wgs_coord.y() >= tile.wgs84.south
-                    && wgs_coord.y() <= tile.wgs84.north
+                tile.geom.intersects(wgs_coord)
             })
             .map(|(wgs_coord, depth)| {
                 let c = to_px((*wgs_coord).into(), tile.merc);
-                let mut f = MvtFeature::new(MvtGeometry::Point(MvtPoint::new(c.x, c.y)));
+                let mut f = MvtFeature::new(MvtGeometry::Point(c.into()));
                 f.properties.clone_from(&props);
                 f.add_tag_double("VALDCO", *depth);
                 f
@@ -248,7 +241,7 @@ fn to_mvt_features(feat: &s57::Feature, tile: &TileGeom) -> Vec<MvtFeature> {
             if stroke.is_empty() {
                 return vec![];
             }
-            let clipped: MultiLineString = clip_stroke(stroke, tile.wgs84);
+            let clipped: MultiLineString = clip_stroke(stroke, &tile.geom);
             if clipped.is_empty() {
                 return vec![];
             }
@@ -263,7 +256,7 @@ fn to_mvt_features(feat: &s57::Feature, tile: &TileGeom) -> Vec<MvtFeature> {
             if ag.is_empty() {
                 return vec![];
             }
-            let clipped_wgs84 = clip_ring(ag, tile.wgs84);
+            let clipped_wgs84 = clip_ring(ag, &tile.geom);
             if clipped_wgs84.is_empty() {
                 return vec![];
             }
@@ -393,7 +386,7 @@ fn light_sectors_to_mvt(
     );
 
     let mut push_line = |pts: LineString, kind: &'static str| {
-        for stroke in clip_stroke(&pts, tile.wgs84) {
+        for stroke in clip_stroke(&pts, &tile.geom) {
             let ls: MvtLineString = stroke.map_coords(|c| to_px(c, tile.merc));
             let mut f = MvtFeature::new(MvtGeometry::LineString(ls));
             f.properties
@@ -437,30 +430,40 @@ mod tests {
         coords
     }
 
+    /// A single-rectangle clip region.
+    fn rect(west: f64, south: f64, east: f64, north: f64) -> MultiPolygon {
+        MultiPolygon::new(vec![Polygon::from(Bbox {
+            west,
+            south,
+            east,
+            north,
+        })])
+    }
+
     // ── clip_stroke ────────────────────────────────────────────────────────
 
     #[test]
     fn stroke_fully_inside_is_unchanged() {
-        let bbox = Bbox::from([0.0_f64, 0.0, 10.0, 10.0]);
+        let clip = rect(0.0, 0.0, 10.0, 10.0);
         let stroke = LineString::from(vec![[2.0, 2.0], [5.0, 5.0], [8.0, 8.0]]);
         assert_eq!(
-            clip_stroke(&stroke, bbox),
+            clip_stroke(&stroke, &clip),
             MultiLineString::new(vec![stroke.clone()])
         );
     }
 
     #[test]
     fn stroke_fully_outside_is_empty() {
-        let bbox = Bbox::from([0.0_f64, 0.0, 10.0, 10.0]);
+        let clip = rect(0.0, 0.0, 10.0, 10.0);
         let stroke = LineString::from(vec![[11.0, 0.0], [15.0, 0.0]]);
-        assert!(clip_stroke(&stroke, bbox).is_empty());
+        assert!(clip_stroke(&stroke, &clip).is_empty());
     }
 
     #[test]
     fn stroke_clips_to_east_edge() {
-        let bbox = Bbox::from([0.0_f64, 0.0, 10.0, 10.0]);
+        let clip = rect(0.0, 0.0, 10.0, 10.0);
         let stroke = LineString::from(vec![[2.0, 5.0], [15.0, 5.0]]);
-        let result = clip_stroke(&stroke, bbox);
+        let result = clip_stroke(&stroke, &clip);
         assert_eq!(result.0.len(), 1);
         let q0 = result.0[0].0[0];
         let q1 = result.0[0].0[1];
@@ -470,14 +473,50 @@ mod tests {
 
     #[test]
     fn stroke_exits_and_re_enters_splits_into_two() {
-        let bbox = Bbox::from([0.0_f64, 0.0, 10.0, 10.0]);
+        let clip = rect(0.0, 0.0, 10.0, 10.0);
         let stroke = LineString::from(vec![[2.0, 5.0], [8.0, 5.0], [12.0, 5.0], [8.0, 2.0]]);
-        let result = clip_stroke(&stroke, bbox);
+        let result = clip_stroke(&stroke, &clip);
         assert_eq!(
             result.0.len(),
             2,
             "expected two sub-strokes, got {result:?}"
         );
+    }
+
+    #[test]
+    fn stroke_clips_to_two_disjoint_rects() {
+        // Non-rectangular clip region: two separate rects, not their hull.
+        // A stroke crossing the gap between them must split into two pieces
+        // and never touch the uncovered middle strip [4, 6].
+        let clip = MultiPolygon::new(vec![
+            Polygon::from(Bbox {
+                west: 0.0,
+                south: 0.0,
+                east: 4.0,
+                north: 10.0,
+            }),
+            Polygon::from(Bbox {
+                west: 6.0,
+                south: 0.0,
+                east: 10.0,
+                north: 10.0,
+            }),
+        ]);
+        let stroke = LineString::from(vec![[1.0, 5.0], [9.0, 5.0]]);
+        let result = clip_stroke(&stroke, &clip);
+        assert_eq!(
+            result.0.len(),
+            2,
+            "expected two sub-strokes, one per rect, got {result:?}"
+        );
+        for ls in &result.0 {
+            for c in ls.coords() {
+                assert!(
+                    c.x <= 4.0 + 1e-10 || c.x >= 6.0 - 1e-10,
+                    "coordinate {c:?} falls in the uncovered gap"
+                );
+            }
+        }
     }
 
     // ── clip_ring ──────────────────────────────────────────────────────────
@@ -486,10 +525,10 @@ mod tests {
     fn ring_fully_inside_is_unchanged() {
         // Same vertex set as the input, no clipping needed — winding/start
         // point may differ from the boolean-op engine's normalisation.
-        let bbox = Bbox::from([0.0_f64, 0.0, 10.0, 10.0]);
+        let clip = rect(0.0, 0.0, 10.0, 10.0);
         let points = vec![[1.0, 1.0], [9.0, 1.0], [9.0, 9.0], [1.0, 9.0]];
         let ring = Polygon::new(LineString::from(points.clone()), vec![]);
-        let result = clip_ring(&ring, bbox);
+        let result = clip_ring(&ring, &clip);
         assert_eq!(result.0.len(), 1);
         let corners = distinct_corners(&result.0[0]);
         assert_eq!(corners.len(), points.len());
@@ -505,22 +544,22 @@ mod tests {
 
     #[test]
     fn ring_fully_outside_is_empty() {
-        let bbox = Bbox::from([0.0_f64, 0.0, 10.0, 10.0]);
+        let clip = rect(0.0, 0.0, 10.0, 10.0);
         let ring = Polygon::new(
             LineString::from(vec![[11.0, 11.0], [19.0, 11.0], [19.0, 19.0], [11.0, 19.0]]),
             vec![],
         );
-        assert!(clip_ring(&ring, bbox).is_empty());
+        assert!(clip_ring(&ring, &clip).is_empty());
     }
 
     #[test]
     fn ring_clipped_to_east_edge() {
-        let bbox = Bbox::from([0.0_f64, 0.0, 10.0, 10.0]);
+        let clip = rect(0.0, 0.0, 10.0, 10.0);
         let ring = Polygon::new(
             LineString::from(vec![[5.0, 1.0], [15.0, 1.0], [15.0, 9.0], [5.0, 9.0]]),
             vec![],
         );
-        let result = clip_ring(&ring, bbox);
+        let result = clip_ring(&ring, &clip);
         assert!(!result.is_empty());
         assert!(
             result
@@ -533,12 +572,12 @@ mod tests {
 
     #[test]
     fn ring_enclosing_bbox_clips_to_bbox_corners() {
-        let bbox = Bbox::from([2.0_f64, 2.0, 8.0, 8.0]);
+        let clip = rect(2.0, 2.0, 8.0, 8.0);
         let ring = Polygon::new(
             LineString::from(vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]),
             vec![],
         );
-        let result = clip_ring(&ring, bbox);
+        let result = clip_ring(&ring, &clip);
         assert_eq!(result.0.len(), 1, "should produce a single clipped polygon");
         let corners = distinct_corners(&result.0[0]);
         assert_eq!(corners.len(), 4, "should produce exactly 4 corners");
@@ -548,5 +587,43 @@ mod tests {
             }),
             "corners should be within bbox, got {corners:?}"
         );
+    }
+
+    #[test]
+    fn ring_clipped_to_two_disjoint_rects_yields_two_polygons() {
+        // Non-rectangular clip region: a ring spanning both rects (and the
+        // uncovered gap between them) must split into two separate polygons.
+        let clip = MultiPolygon::new(vec![
+            Polygon::from(Bbox {
+                west: 0.0,
+                south: 0.0,
+                east: 4.0,
+                north: 10.0,
+            }),
+            Polygon::from(Bbox {
+                west: 6.0,
+                south: 0.0,
+                east: 10.0,
+                north: 10.0,
+            }),
+        ]);
+        let ring = Polygon::new(
+            LineString::from(vec![[1.0, 1.0], [9.0, 1.0], [9.0, 9.0], [1.0, 9.0]]),
+            vec![],
+        );
+        let result = clip_ring(&ring, &clip);
+        assert_eq!(
+            result.0.len(),
+            2,
+            "expected one polygon per rect, got {result:?}"
+        );
+        for p in &result.0 {
+            for c in p.exterior().coords() {
+                assert!(
+                    c.x <= 4.0 + 1e-10 || c.x >= 6.0 - 1e-10,
+                    "coordinate {c:?} falls in the uncovered gap"
+                );
+            }
+        }
     }
 }

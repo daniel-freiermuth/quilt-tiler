@@ -97,6 +97,29 @@ impl BoundedLattice for Bbox {
             && self.south <= other.north
             && self.north >= other.south
     }
+
+    /// Plain rectangle area in degrees² (or projected units² for [`Self`]
+    /// values in metres).  `0.0` for [`Self::is_bottom`].
+    fn area(&self) -> f64 {
+        if self.is_bottom() {
+            0.0
+        } else {
+            (self.east - self.west) * (self.north - self.south)
+        }
+    }
+
+    /// Conservative rectangle difference: a [`Self`] cannot represent the
+    /// exact (possibly L-shaped) remainder of a partial overlap, so this
+    /// returns ⊥ only when `other` fully covers `self`, and `self`
+    /// unchanged otherwise — erring toward "still uncovered" rather than
+    /// risking a false "fully covered".
+    fn minus(&self, other: &Self) -> Self {
+        if other.subsumes(self) {
+            Self::bottom()
+        } else {
+            *self
+        }
+    }
 }
 
 /// Converts a `[west, south, east, north]` array (e.g. from `xyz_to_bbox`).
@@ -112,8 +135,8 @@ impl From<[f64; 4]> for Bbox {
     }
 }
 
-impl From<MultiPolygon> for Bbox {
-    fn from(value: MultiPolygon) -> Self {
+impl From<&MultiPolygon> for Bbox {
+    fn from(value: &MultiPolygon) -> Self {
         value.bounding_rect().map_or_else(Self::bottom, |b_rect| {
             let sw_coord = b_rect.min();
             let ne_coord = b_rect.max();
@@ -124,6 +147,12 @@ impl From<MultiPolygon> for Bbox {
                 east: ne_coord.x,
             }
         })
+    }
+}
+
+impl From<MultiPolygon> for Bbox {
+    fn from(value: MultiPolygon) -> Self {
+        Self::from(&value)
     }
 }
 

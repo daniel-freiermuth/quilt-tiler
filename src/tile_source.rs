@@ -11,13 +11,15 @@
 //! be called through `dyn TileSource`).  It is designed for monomorphised
 //! static dispatch only.
 
+use std::fmt::Debug;
+
 use anyhow::Result;
+use geo::MultiPolygon;
 use pmtiles::TileType;
 
 use crate::bbox::Bbox;
 use crate::lattice::BoundedLattice;
 use crate::tile_geom::TileGeom;
-use std::fmt::Debug;
 
 /// A source of data that can be quilted into a `PMTiles` archive.
 pub trait TileSource: Sync {
@@ -30,7 +32,11 @@ pub trait TileSource: Sync {
     /// Must convert to and from [`Bbox`]: `write_pmtiles` needs `From<Bbox>` to
     /// construct the tile-shaped coverage sentinel, and `Into<Bbox>` to
     /// aggregate item extents into the overall bounding box for tile iteration.
-    type Coverage: BoundedLattice + From<Bbox> + Into<Bbox> + Debug;
+    /// `Into<MultiPolygon>` feeds an item's exact per-tile contribution
+    /// region into [`TileGeom::geom`] for [`Self::render`] — `write_pmtiles`
+    /// clips each candidate to only the area it actually contributes, not
+    /// the whole tile, so overlapping sources never double-paint.
+    type Coverage: BoundedLattice + From<Bbox> + Into<Bbox> + Into<MultiPolygon> + Debug + Clone;
 
     /// Source identifier for this item (debug/diagnostic use by callers).
     #[allow(dead_code)] // consumed by debug logging in a follow-up commit
@@ -42,7 +48,9 @@ pub trait TileSource: Sync {
     /// Native display scale denominator (e.g. `50_000` for 1:50 000).
     fn native_scale(&self) -> u32;
 
-    /// Render this item into tile-space content.
+    /// Render this item into tile-space content.  `tile.geom` is this item's
+    /// exact contribution region for this tile — not necessarily the whole
+    /// tile — so all geometry should be clipped against it.
     fn render(&self, tile: &TileGeom) -> Self::Content;
 
     /// Encode one tile's accumulated `contents` into raw bytes.
