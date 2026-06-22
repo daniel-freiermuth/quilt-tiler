@@ -114,25 +114,22 @@ impl From<[f64; 4]> for Bbox {
 
 impl From<MultiPolygon> for Bbox {
     fn from(value: MultiPolygon) -> Self {
-        match value.bounding_rect() {
-            None => Bbox::bottom(),
-            Some(b_rect) => {
-                let sw_coord = b_rect.min();
-                let ne_coord = b_rect.max();
-                Self {
-                    north: ne_coord.y,
-                    south: sw_coord.y,
-                    west: sw_coord.x,
-                    east: ne_coord.x,
-                }
+        value.bounding_rect().map_or_else(Self::bottom, |b_rect| {
+            let sw_coord = b_rect.min();
+            let ne_coord = b_rect.max();
+            Self {
+                north: ne_coord.y,
+                south: sw_coord.y,
+                west: sw_coord.x,
+                east: ne_coord.x,
             }
-        }
+        })
     }
 }
 
 impl From<Bbox> for Polygon {
     fn from(value: Bbox) -> Self {
-        Polygon::new(
+        Self::new(
             vec![
                 [value.east, value.north],
                 [value.west, value.north],

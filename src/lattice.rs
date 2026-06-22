@@ -28,7 +28,7 @@ pub trait BoundedLattice: Sized {
 
 impl BoundedLattice for MultiPolygon {
     fn bottom() -> Self {
-        MultiPolygon::empty()
+        Self::empty()
     }
 
     fn join(&self, other: &Self) -> Self {

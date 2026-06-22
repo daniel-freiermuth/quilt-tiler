@@ -32,6 +32,8 @@ pub trait TileSource: Sync {
     /// aggregate item extents into the overall bounding box for tile iteration.
     type Coverage: BoundedLattice + From<Bbox> + Into<Bbox> + Debug;
 
+    /// Source identifier for this item (debug/diagnostic use by callers).
+    #[allow(dead_code)] // consumed by debug logging in a follow-up commit
     fn source(&self) -> String;
 
     /// Geographic coverage of this item.

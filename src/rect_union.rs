@@ -127,7 +127,7 @@ impl RectUnion {
     }
 
     #[inline]
-    pub fn is_bottom(&self) -> bool {
+    pub const fn is_bottom(&self) -> bool {
         self.rects.is_empty()
     }
 }
