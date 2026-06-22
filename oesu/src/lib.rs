@@ -136,7 +136,7 @@ enum RawGeometry {
         lon: f64,
         lat: f64,
     },
-    MultiPoint(Vec<[f32; 3]>), // (east, north, depth) in SM
+    Sounding(Vec<[f32; 3]>), // (east, north, depth) in SM
     Line(Vec<[i32; 4]>),       // [start_node, edge_id, end_node, dir]
     Area {
         contour_count: u32,
@@ -518,7 +518,7 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
                         pts.push([east, north, depth]);
                     }
                     if let Some(f) = &mut current {
-                        f.raw_geometry = RawGeometry::MultiPoint(pts);
+                        f.raw_geometry = RawGeometry::Sounding(pts);
                     }
                 } else {
                     tracing::warn!(payload_len, "GEOM_MULTIPOINT too short");
@@ -1029,7 +1029,7 @@ fn resolve_geometry(
 
         RawGeometry::Point { lon, lat } => Geometry::Point { lon, lat },
 
-        RawGeometry::MultiPoint(pts) => {
+        RawGeometry::Sounding(pts) => {
             let resolved = pts
                 .iter()
                 .map(|[e, n, d]| {
@@ -1038,7 +1038,7 @@ fn resolve_geometry(
                     [lon, lat, f64::from(*d)]
                 })
                 .collect();
-            Geometry::MultiPoint(resolved)
+            Geometry::Soundings(resolved)
         }
 
         RawGeometry::Line(edge_refs) => {

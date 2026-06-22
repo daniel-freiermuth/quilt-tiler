@@ -167,7 +167,7 @@ fn feat_bbox(feat: &s57::Feature) -> Option<Bbox> {
     match &feat.geometry {
         s57::Geometry::None => None,
         s57::Geometry::Point { lon, lat } => Some(Bbox::point(*lon, *lat)),
-        s57::Geometry::MultiPoint(pts) => Bbox::of(pts.iter().map(|p| (p[0], p[1]))),
+        s57::Geometry::Soundings(pts) => Bbox::of(pts.iter().map(|p| (p[0], p[1]))),
         s57::Geometry::Line(strokes) => {
             Bbox::of(strokes.iter().flat_map(|s| s.iter()).map(|p| (p[0], p[1])))
         }
@@ -377,7 +377,7 @@ fn to_mvt_features(feat: &s57::Feature, tile: &TileGeom) -> Vec<MvtFeature> {
             vec![f]
         }
 
-        s57::Geometry::MultiPoint(pts) => pts
+        s57::Geometry::Soundings(pts) => pts
             .iter()
             .filter(|[lon, lat, _]| {
                 // Each sounding belongs to exactly one tile.

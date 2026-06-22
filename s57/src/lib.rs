@@ -65,7 +65,7 @@ pub struct AreaGeometry {
 pub enum Geometry {
     None,
     Point { lon: f64, lat: f64 },
-    MultiPoint(Vec<[f64; 3]>), // [lon, lat, depth]
+    Soundings(Vec<[f64; 3]>), // [lon, lat, depth]
     Line(Vec<Vec<[f64; 2]>>),  // list of strokes, each a list of [lon, lat]
     Area(AreaGeometry),
 }
