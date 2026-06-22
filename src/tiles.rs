@@ -100,22 +100,28 @@ pub fn write_pmtiles<S: TileSource>(
                 };
 
                 // Candidates: items whose coverage bbox overlaps this tile.
-                let mut candidates: Vec<usize> = (0..items.len())
-                    .filter(|&i| {
-                        let bbox: Bbox = items[i].coverage().into();
-                        bbox.overlaps(&tile_wgs84)
-                    })
-                    .collect();
+                let mut candidates: Vec<usize> = {
+                    profiling::scope!("Collecting candidates");
+                    (0..items.len())
+                        .filter(|&i| {
+                            let bbox: Bbox = items[i].coverage().into();
+                            bbox.overlaps(&tile_wgs84)
+                        })
+                        .collect()
+                };
 
                 if candidates.is_empty() {
                     return Ok(None);
                 }
 
-                // Sort: coarsest-appropriate zoom first, finer after, too-coarse last.
-                candidates.sort_unstable_by_key(|&i| {
-                    let nz = i32::from(zooms[i]);
-                    (nz < zi, if nz >= zi { nz } else { -nz })
-                });
+                {
+                    profiling::scope!("Sorting candidates");
+                    // Sort: coarsest-appropriate zoom first, finer after, too-coarse last.
+                    candidates.sort_unstable_by_key(|&i| {
+                        let nz = i32::from(zooms[i]);
+                        (nz < zi, if nz >= zi { nz } else { -nz })
+                    });
+                }
 
                 // Greedy coverage: include an item only if its contribution
                 // adds area not yet covered.  RectUnion correctly handles
@@ -123,16 +129,18 @@ pub fn write_pmtiles<S: TileSource>(
                 let tile_cov = S::Coverage::from(tile_wgs84);
                 let mut covered = S::Coverage::bottom();
                 let mut contents: Vec<S::Content> = Vec::new();
-
-                for &i in &candidates {
-                    let contrib = items[i].coverage().meet(&tile_cov);
-                    if covered.subsumes(&contrib) {
-                        continue;
-                    }
-                    contents.push(items[i].render(&tile));
-                    covered = covered.join(&contrib);
-                    if covered.subsumes(&tile_cov) {
-                        break;
+                {
+                    profiling::scope!("Collecting features");
+                    for &i in &candidates {
+                        let contrib = items[i].coverage().meet(&tile_cov);
+                        if covered.subsumes(&contrib) {
+                            continue;
+                        }
+                        contents.push(items[i].render(&tile));
+                        covered = covered.join(&contrib);
+                        if covered.subsumes(&tile_cov) {
+                            break;
+                        }
                     }
                 }
 
