@@ -108,6 +108,7 @@ impl TileSource for s57::S57Cell {
         layers
     }
 
+    #[profiling::function]
     fn encode(contents: Vec<Self::Content>) -> Result<Vec<u8>> {
         let mut merged: HashMap<&'static str, Vec<MvtFeature>> = HashMap::new();
         for content in contents {

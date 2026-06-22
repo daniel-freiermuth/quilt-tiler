@@ -35,18 +35,22 @@ impl BoundedLattice for MultiPolygon {
         Self::empty()
     }
 
+    #[profiling::function]
     fn join(&self, other: &Self) -> Self {
         self.union(other)
     }
 
+    #[profiling::function]
     fn meet(&self, other: &Self) -> Self {
         self.intersection(other)
     }
 
+    #[profiling::function]
     fn subsumes(&self, other: &Self) -> bool {
         self.contains(other)
     }
 
+    #[profiling::function]
     fn overlaps(&self, other: &Self) -> bool {
         self.intersects(other)
     }
