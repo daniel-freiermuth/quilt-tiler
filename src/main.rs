@@ -7,7 +7,6 @@
 
 mod bbox;
 mod lattice;
-mod rect_union;
 mod s57_source;
 mod style;
 mod tile_geom;
