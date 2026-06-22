@@ -17,6 +17,7 @@ use pmtiles::TileType;
 use crate::bbox::Bbox;
 use crate::lattice::BoundedLattice;
 use crate::tile_geom::TileGeom;
+use std::fmt::Debug;
 
 /// A source of data that can be quilted into a `PMTiles` archive.
 pub trait TileSource: Sync {
