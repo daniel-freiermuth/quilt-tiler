@@ -18,7 +18,8 @@ use std::collections::HashMap;
 use std::io::{Cursor, Read};
 
 use anyhow::{Context, Result, bail};
-use s57::{AreaGeometry, AttrValue, Attribute, Feature, Geometry, TriPrim, TriPrimType};
+use geo_types::{Coord, LineString, Point, Polygon, point};
+use s57::{AttrValue, Attribute, Feature, Geometry};
 
 // ── Record type constants ────────────────────────────────────────────────────
 
@@ -117,27 +118,44 @@ struct RawFeature {
     raw_geometry: RawGeometry,
 }
 
+/// OpenGL primitive type stored in the OSENC `TriPrim` chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriPrimType {
+    Triangles = 4,     // GL_TRIANGLES
+    TriangleStrip = 5, // GL_TRIANGLE_STRIP
+    TriangleFan = 6,   // GL_TRIANGLE_FAN
+}
+
+impl TriPrimType {
+    /// Returns `None` for unrecognised values instead of panicking.
+    const fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            4 => Some(Self::Triangles),
+            5 => Some(Self::TriangleStrip),
+            6 => Some(Self::TriangleFan),
+            _ => None,
+        }
+    }
+}
+
 /// Internal `TriPrim` before SM → WGS84 coordinate conversion.
 #[derive(Debug)]
 struct RawTriPrim {
-    prim_type: u8,
+    _prim_type: u8,
     /// [W, S, E, N] — WGS84 degrees.
     /// For EXT records (84) the bbox is converted from SM to WGS84 at parse time,
     /// since `CELL_EXTENT_RECORD` always precedes feature geometry in the stream.
-    bbox: [f64; 4],
+    _bbox: [f64; 4],
     /// SM (east, north) coordinate pairs, one per vertex.
-    vertices: Vec<[f32; 2]>,
+    _vertices: Vec<[f32; 2]>,
 }
 
 #[derive(Debug)]
 enum RawGeometry {
     None,
-    Point {
-        lon: f64,
-        lat: f64,
-    },
+    Point(Point),
     Sounding(Vec<[f32; 3]>), // (east, north, depth) in SM
-    Line(Vec<[i32; 4]>),       // [start_node, edge_id, end_node, dir]
+    Line(Vec<[i32; 4]>),     // [start_node, edge_id, end_node, dir]
     Area {
         contour_count: u32,
         vertex_counts: Vec<u32>,
@@ -419,7 +437,7 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
                     let lat = read_f64(&mut p)?;
                     let lon = read_f64(&mut p)?;
                     if let Some(f) = &mut current {
-                        f.raw_geometry = RawGeometry::Point { lon, lat };
+                        f.raw_geometry = RawGeometry::Point(point![x: lon, y: lat]);
                     }
                 } else {
                     tracing::warn!(payload_len, "GEOM_POINT too short");
@@ -649,17 +667,17 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
     }
 
     // ── Resolve SM coords → WGS84 ────────────────────────────────────────────
-    let mut resolved_vct: HashMap<u32, [f64; 2]> = HashMap::with_capacity(vct.len());
+    let mut resolved_vct: HashMap<u32, Point> = HashMap::with_capacity(vct.len());
     for (idx, node) in &vct {
         resolved_vct.insert(
             *idx,
-            crate::georef::from_sm(node.lon, node.lat, ref_lat, ref_lon),
+            crate::georef::from_sm(node.lon, node.lat, ref_lat, ref_lon).into(),
         );
     }
 
-    let mut resolved_vet: HashMap<u32, Vec<[f64; 2]>> = HashMap::with_capacity(vet.len());
+    let mut resolved_vet: HashMap<u32, LineString> = HashMap::with_capacity(vet.len());
     for (idx, edge) in &vet {
-        let pts: Vec<[f64; 2]> = edge
+        let pts = edge
             .points
             .iter()
             .map(|&[e, n]| crate::georef::from_sm(e, n, ref_lat, ref_lon))
@@ -935,6 +953,9 @@ fn parse_area_payload(
             "truncated TriPrim header at entry {k}/{triprim_count}"
         );
         let prim_type = read_u8(p)?;
+        if TriPrimType::from_u8(prim_type).is_none() {
+            tracing::warn!(prim_type, entry = k, "unrecognized TriPrim primitive type");
+        }
         let nvert = read_u32(p)? as usize;
 
         let (bbox, vertices) = if ext {
@@ -947,9 +968,9 @@ fn parse_area_payload(
             let max_east = f64::from(read_i16(p)?) / scale_factor;
             let min_north = f64::from(read_i16(p)?) / scale_factor;
             let max_north = f64::from(read_i16(p)?) / scale_factor;
-            let [min_lon, min_lat] = crate::georef::from_sm(min_east, min_north, ref_lat, ref_lon);
-            let [max_lon, max_lat] = crate::georef::from_sm(max_east, max_north, ref_lat, ref_lon);
-            let bbox = [min_lon, min_lat, max_lon, max_lat];
+            let min_coord = crate::georef::from_sm(min_east, min_north, ref_lat, ref_lon);
+            let max_coord = crate::georef::from_sm(max_east, max_north, ref_lat, ref_lon);
+            let bbox = [min_coord.x, min_coord.y, max_coord.x, max_coord.y];
 
             let mut verts = Vec::with_capacity(nvert);
             for _ in 0..nvert {
@@ -980,9 +1001,9 @@ fn parse_area_payload(
         };
 
         tri_prims.push(RawTriPrim {
-            prim_type,
-            bbox,
-            vertices,
+            _prim_type: prim_type,
+            _bbox: bbox,
+            _vertices: vertices,
         });
     }
 
@@ -1021,39 +1042,35 @@ fn resolve_geometry(
     raw: RawGeometry,
     ref_lat: f64,
     ref_lon: f64,
-    vet: &HashMap<u32, Vec<[f64; 2]>>,
-    vct: &HashMap<u32, [f64; 2]>,
+    vet: &HashMap<u32, LineString>,
+    vct: &HashMap<u32, Point>,
 ) -> Geometry {
     match raw {
         RawGeometry::None => Geometry::None,
 
-        RawGeometry::Point { lon, lat } => Geometry::Point { lon, lat },
+        RawGeometry::Point(p) => Geometry::Point(p),
 
         RawGeometry::Sounding(pts) => {
             let resolved = pts
                 .iter()
                 .map(|[e, n, d]| {
-                    let [lon, lat] =
+                    let coord =
                         crate::georef::from_sm(f64::from(*e), f64::from(*n), ref_lat, ref_lon);
-                    [lon, lat, f64::from(*d)]
+                    (coord.into(), f64::from(*d))
                 })
                 .collect();
             Geometry::Soundings(resolved)
         }
 
         RawGeometry::Line(edge_refs) => {
-            let coords = build_ring(&edge_refs, vet, vct, false);
-            if coords.is_empty() {
-                Geometry::None
-            } else {
-                Geometry::Line(vec![coords])
-            }
+            let line = build_ring(&edge_refs, vet, vct, false);
+            Geometry::Line(line)
         }
 
         RawGeometry::Area {
             contour_count,
-            vertex_counts,
-            tri_prims,
+            vertex_counts: _vertex_counts,
+            tri_prims: _tri_prims,
             edge_refs,
         } => {
             if edge_refs.is_empty() {
@@ -1063,7 +1080,7 @@ fn resolve_geometry(
 
             let expected_rings = contour_count as usize;
             let total_edges = edge_refs.len();
-            let mut rings: Vec<Vec<[f64; 2]>> = Vec::with_capacity(expected_rings);
+            let mut rings: Vec<LineString> = Vec::with_capacity(expected_rings);
             let mut ring_start = 0usize;
             let mut prev_end = edge_refs[0][0];
 
@@ -1095,15 +1112,7 @@ fn resolve_geometry(
 
                 if ring_closed || is_last {
                     let ring_coords = build_ring(&edge_refs[ring_start..=i], vet, vct, true);
-                    if ring_coords.len() >= 4 {
-                        rings.push(ring_coords);
-                    } else {
-                        tracing::warn!(
-                            ring = rings.len() + 1,
-                            vertices = ring_coords.len(),
-                            "skipping degenerate ring (< 4 vertices)"
-                        );
-                    }
+                    rings.push(ring_coords);
                     if !is_last {
                         ring_start = i + 1;
                         prev_end = edge_refs[ring_start][0];
@@ -1128,54 +1137,28 @@ fn resolve_geometry(
                 }
             }
 
-            let resolved_tri_prims = tri_prims
-                .into_iter()
-                .filter_map(|tp| {
-                    Some(TriPrim {
-                        prim_type: TriPrimType::from_u8(tp.prim_type)?,
-                        bbox: tp.bbox,
-                        vertices: tp
-                            .vertices
-                            .iter()
-                            .map(|&[e, n]| {
-                                crate::georef::from_sm(f64::from(e), f64::from(n), ref_lat, ref_lon)
-                            })
-                            .collect(),
-                    })
-                })
-                .collect();
-
-            if rings.is_empty() {
-                Geometry::None
-            } else {
-                Geometry::Area(AreaGeometry {
-                    rings,
-                    vertex_counts,
-                    tri_prims: resolved_tri_prims,
-                })
-            }
+            Geometry::Area(Polygon::new(rings[0].clone(), rings[1..].to_vec()))
         }
     }
 }
 
 /// Build a coordinate ring from a sequence of edge reference entries.
 /// Each entry: `[start_node_rcid, edge_rcid, end_node_rcid, dir]`
-/// Negative `edge_rcid` means traverse the VET points in reverse.
 /// `close = true` appends the first point at the end (polygon rings).
 #[allow(clippy::cast_sign_loss)] // RCID values in start/end fields are always non-negative
 fn build_ring(
     edge_refs: &[[i32; 4]],
-    vet: &HashMap<u32, Vec<[f64; 2]>>,
-    vct: &HashMap<u32, [f64; 2]>,
+    vet: &HashMap<u32, LineString>,
+    vct: &HashMap<u32, Point>,
     close: bool,
-) -> Vec<[f64; 2]> {
-    let mut coords: Vec<[f64; 2]> = Vec::new();
+) -> LineString {
+    let mut coords: Vec<Coord> = Vec::new();
 
     for [start_rcid, edge_rcid, _end_rcid, dir] in edge_refs {
-        if let Some(&[lon, lat]) = vct.get(&(*start_rcid as u32))
-            && (coords.is_empty() || coords.last() != Some(&[lon, lat]))
+        if let Some(&point) = vct.get(&(*start_rcid as u32))
+            && (coords.is_empty() || coords.last() != Some(&point.into()))
         {
-            coords.push([lon, lat]);
+            coords.push(point.into());
         }
 
         if *edge_rcid == 0 {
@@ -1186,18 +1169,18 @@ fn build_ring(
 
         if let Some(pts) = vet.get(&(*edge_rcid as u32)) {
             if reverse {
-                coords.extend(pts.iter().rev().copied());
+                coords.extend(pts.coords().rev());
             } else {
-                coords.extend(pts.iter().copied());
+                coords.extend(pts.coords());
             }
         }
     }
 
     if let Some([_, _, end_rcid, _]) = edge_refs.last()
-        && let Some(&[lon, lat]) = vct.get(&(*end_rcid as u32))
-        && coords.last() != Some(&[lon, lat])
+        && let Some(&point) = vct.get(&(*end_rcid as u32))
+        && coords.last() != Some(&point.into())
     {
-        coords.push([lon, lat]);
+        coords.push(point.into());
     }
 
     if close && coords.len() >= 2 {
@@ -1207,5 +1190,5 @@ fn build_ring(
         }
     }
 
-    coords
+    LineString::new(coords)
 }

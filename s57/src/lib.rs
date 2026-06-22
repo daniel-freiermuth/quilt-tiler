@@ -5,6 +5,8 @@
 
 // ── Feature data model ───────────────────────────────────────────────────────
 
+use geo_types::{LineString, Point, Polygon};
+
 #[derive(Debug, Clone)]
 pub enum AttrValue {
     Int(u32),
@@ -18,56 +20,13 @@ pub struct Attribute {
     pub value: AttrValue,
 }
 
-/// OpenGL primitive type stored in the OSENC `TriPrim` chain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TriPrimType {
-    Triangles = 4,     // GL_TRIANGLES
-    TriangleStrip = 5, // GL_TRIANGLE_STRIP
-    TriangleFan = 6,   // GL_TRIANGLE_FAN
-}
-
-impl TriPrimType {
-    /// Returns `None` for unrecognised values instead of panicking.
-    #[must_use]
-    pub const fn from_u8(v: u8) -> Option<Self> {
-        match v {
-            4 => Some(Self::Triangles),
-            5 => Some(Self::TriangleStrip),
-            6 => Some(Self::TriangleFan),
-            _ => None,
-        }
-    }
-}
-
-/// One tessellation primitive from the `TriPrim` chain of an area record.
-#[derive(Debug, Clone)]
-pub struct TriPrim {
-    pub prim_type: TriPrimType,
-    /// Bounding box [W, S, E, N] in WGS84 degrees.
-    pub bbox: [f64; 4],
-    /// Vertices as [lon, lat] pairs, resolved from Spherical Mercator.
-    pub vertices: Vec<[f64; 2]>,
-}
-
-/// Fully resolved area geometry.
-#[derive(Debug, Clone)]
-pub struct AreaGeometry {
-    /// Closed coordinate rings.  First ring is the outer boundary;
-    /// subsequent rings are inner rings (holes) or sub-polygons.
-    pub rings: Vec<Vec<[f64; 2]>>,
-    /// Per-ring OGR vertex counts from the LOD-reduced tessellation step.
-    pub vertex_counts: Vec<u32>,
-    /// Pre-tessellated triangle primitives for GPU-accelerated fill rendering.
-    pub tri_prims: Vec<TriPrim>,
-}
-
 #[derive(Debug, Clone)]
 pub enum Geometry {
     None,
-    Point { lon: f64, lat: f64 },
-    Soundings(Vec<[f64; 3]>), // [lon, lat, depth]
-    Line(Vec<Vec<[f64; 2]>>),  // list of strokes, each a list of [lon, lat]
-    Area(AreaGeometry),
+    Point(Point),
+    Soundings(Vec<(Point, f64)>), // (position, depth)
+    Line(LineString),             // single stroke (sequence of vertices)
+    Area(Polygon),
 }
 
 #[derive(Debug, Clone)]

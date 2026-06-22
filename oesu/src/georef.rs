@@ -1,9 +1,11 @@
+use geo_types::{Coord, coord};
+
 /// Simple Mercator → WGS84 conversion, matching `OpenCPN`'s `fromSM()`.
 /// Coordinates in VET/VCT tables are stored as f32 easting/northing in metres,
 /// projected relative to the cell centroid (`ref_lat`, `ref_lon`).
 ///
-/// Returns `[longitude, latitude]` in decimal degrees — `GeoJSON` order.
-pub fn from_sm(east: f64, north: f64, ref_lat: f64, ref_lon: f64) -> [f64; 2] {
+/// Returns the WGS84 coordinate as `Coord { x: longitude, y: latitude }`.
+pub fn from_sm(east: f64, north: f64, ref_lat: f64, ref_lon: f64) -> Coord {
     const WGS84_A: f64 = 6_378_137.0;
     use std::f64::consts::PI;
 
@@ -20,5 +22,5 @@ pub fn from_sm(east: f64, north: f64, ref_lat: f64, ref_lon: f64) -> [f64; 2] {
         )
         .to_degrees();
 
-    [lon, lat]
+    coord![x:lon, y:lat]
 }
