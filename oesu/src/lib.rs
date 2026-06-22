@@ -14,11 +14,11 @@
 
 mod georef;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read};
 
 use anyhow::{Context, Result, bail};
-use geo_types::{Coord, LineString, Point, Polygon, point};
+use geo::{Area, Coord, Intersects, LineString, MultiPolygon, Point, Polygon, point};
 use s57::{AttrValue, Attribute, Feature, Geometry};
 
 // ── Record type constants ────────────────────────────────────────────────────
@@ -88,8 +88,7 @@ struct OesuCell {
     ref_lon: f64,
     bounds: [f64; 4],
     features: Vec<Feature>,
-    coverage: Vec<Vec<[f64; 2]>>,
-    no_coverage: Vec<Vec<[f64; 2]>>,
+    coverage: MultiPolygon,
     text_descriptions: HashMap<String, String>,
     source: String,
 }
@@ -162,11 +161,6 @@ enum RawGeometry {
         tri_prims: Vec<RawTriPrim>,
         edge_refs: Vec<[i32; 4]>,
     },
-}
-
-/// Coverage polygon with raw SM coords, resolved after the scan loop.
-struct RawCovr {
-    points: Vec<[f32; 2]>, // (east, north) in SM
 }
 
 // ── Reader helpers ───────────────────────────────────────────────────────────
@@ -244,8 +238,8 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
     let mut ref_lon = 0.0f64;
     let mut bounds = [0.0f64; 4];
     let mut raw_features: Vec<RawFeature> = Vec::new();
-    let mut raw_covr: Vec<RawCovr> = Vec::new();
-    let mut raw_nocovr: Vec<RawCovr> = Vec::new();
+    let mut raw_covr: Vec<LineString> = Vec::new();
+    let mut raw_nocovr: Vec<LineString> = Vec::new();
     let mut text_descriptions: HashMap<String, String> = HashMap::new();
     let mut vet: HashMap<u32, EdgeEntry> = HashMap::new();
     let mut vct: HashMap<u32, NodeEntry> = HashMap::new();
@@ -707,12 +701,12 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
         .collect();
 
     // ── Resolve coverage polygons ────────────────────────────────────────────
-    // COVR/NOCOVR records store points as (f32 lat_deg, f32 lon_deg) in WGS84
-    // degrees — NOT in SM metres.  Earlier code mistakenly ran from_sm() on
-    // these, mapping all points to near-centroid.  Correct interpretation:
-    // reorder to GeoJSON [lon, lat] and widen to f64.
-    let coverage = decode_covr(raw_covr);
-    let no_coverage = decode_covr(raw_nocovr);
+    // See `parse_covr_payload`'s doc comment: these points are already
+    // WGS84 degrees, not SM metres — no from_sm() conversion here.
+    let coverage = decode_covr(&raw_covr, &raw_nocovr);
+    if coverage.signed_area() <= 0.0 {
+        tracing::warn!("cell has zero or negative coverage area (no COVR record?)");
+    }
 
     Ok(OesuCell {
         name,
@@ -731,23 +725,63 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
         bounds,
         features,
         coverage,
-        no_coverage,
         text_descriptions,
         source,
     }
     .into())
 }
 
-/// Reorder raw COVR points from `(lat, lon)` `f32` to `GeoJSON` `[lon, lat]` `f64`.
-fn decode_covr(raw: Vec<RawCovr>) -> Vec<Vec<[f64; 2]>> {
-    raw.into_iter()
-        .map(|covr| {
-            covr.points
-                .into_iter()
-                .map(|[lat, lon]| [f64::from(lon), f64::from(lat)])
-                .collect()
+/// Assign each NOCOVR ring as a hole of whichever COVR exterior it falls
+/// inside, building the cell's coverage [`MultiPolygon`].
+///
+/// Overlapping COVR exteriors and NOCOVR rings that match no (or several)
+/// COVR exteriors are data-quality issues, not parse failures: they are
+/// logged and handled best-effort rather than panicking.
+fn decode_covr(covr: &[LineString], no_covr: &[LineString]) -> MultiPolygon {
+    let exteriors: Vec<Polygon> = covr
+        .iter()
+        .map(|ring| Polygon::new(ring.clone(), vec![]))
+        .collect();
+    let interiors: Vec<Polygon> = no_covr
+        .iter()
+        .map(|ring| Polygon::new(ring.clone(), vec![]))
+        .collect();
+
+    for i in 0..exteriors.len() {
+        for j in (i + 1)..exteriors.len() {
+            if exteriors[i].intersects(&exteriors[j]) {
+                tracing::warn!(i, j, "overlapping COVR exteriors");
+            }
+        }
+    }
+
+    let mut taken_interiors: HashSet<usize> = HashSet::new();
+    let polys: Vec<Polygon> = exteriors
+        .iter()
+        .map(|ext| {
+            let holes: Vec<LineString> = interiors
+                .iter()
+                .enumerate()
+                .filter_map(|(index, int)| {
+                    if !int.intersects(ext) {
+                        return None;
+                    }
+                    if !taken_interiors.insert(index) {
+                        tracing::warn!(index, "NOCOVR ring claimed by multiple COVR exteriors");
+                    }
+                    Some(int.exterior().clone())
+                })
+                .collect();
+            Polygon::new(ext.exterior().clone(), holes)
         })
-        .collect()
+        .collect();
+
+    let unclaimed = interiors.len() - taken_interiors.len();
+    if unclaimed > 0 {
+        tracing::warn!(unclaimed, "NOCOVR rings outside any COVR exterior, ignored");
+    }
+
+    MultiPolygon::new(polys)
 }
 
 // ── Prologue helpers ─────────────────────────────────────────────────────────
@@ -877,19 +911,25 @@ fn read_senc_version(data: &[u8]) -> Result<u16> {
 
 // ── Record sub-parsers ───────────────────────────────────────────────────────
 
-/// Parse a COVR or NOCOVR payload: `u32 point_count`, then `count × 2 × f32`.
-fn parse_covr_payload(p: &mut Cursor<&[u8]>, payload_len: usize) -> Option<RawCovr> {
+/// Parse a COVR or NOCOVR payload: `u32 point_count`, then `count × 2 × f32`
+/// `(lat_deg, lon_deg)` pairs in WGS84 degrees — already final units, no
+/// SM→WGS84 resolution needed (unlike VET/VCT), just a `[lon, lat]` reorder
+/// and widen to `f64`.
+fn parse_covr_payload(p: &mut Cursor<&[u8]>, payload_len: usize) -> Option<LineString> {
     if payload_len < 4 {
         return None;
     }
     let count = read_u32(p).ok()? as usize;
-    let mut points = Vec::with_capacity(count);
+    let mut coords = Vec::with_capacity(count);
     for _ in 0..count {
-        let east = read_f32(p).ok()?;
-        let north = read_f32(p).ok()?;
-        points.push([east, north]);
+        let lat = read_f32(p).ok()?;
+        let lon = read_f32(p).ok()?;
+        coords.push(Coord {
+            x: f64::from(lon),
+            y: f64::from(lat),
+        });
     }
-    Some(RawCovr { points })
+    Some(LineString::new(coords))
 }
 
 /// Parse an area geometry payload (records 82 and 84).

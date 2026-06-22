@@ -1,4 +1,4 @@
-use geo_types::{Coord, coord};
+use geo::{Coord, coord};
 
 /// Simple Mercator → WGS84 conversion, matching `OpenCPN`'s `fromSM()`.
 /// Coordinates in VET/VCT tables are stored as f32 easting/northing in metres,

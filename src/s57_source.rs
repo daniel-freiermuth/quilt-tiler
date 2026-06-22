@@ -26,13 +26,9 @@ impl TileSource for s57::S57Cell {
     type Content = HashMap<&'static str, Vec<MvtFeature>>;
     type Coverage = MultiPolygon;
 
+    #[profiling::function]
     fn coverage(&self) -> Self::Coverage {
-        MultiPolygon::new(
-            self.coverage
-                .iter()
-                .map(|ring| Polygon::new(ring.clone().into(), vec![]))
-                .collect(),
-        )
+        self.coverage.clone()
     }
 
     fn native_scale(&self) -> u32 {

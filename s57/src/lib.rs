@@ -5,7 +5,7 @@
 
 // ── Feature data model ───────────────────────────────────────────────────────
 
-use geo_types::{LineString, Point, Polygon};
+use geo_types::{LineString, MultiPolygon, Point, Polygon};
 
 #[derive(Debug, Clone)]
 pub enum AttrValue {
@@ -56,7 +56,7 @@ pub struct S57Cell {
     /// Coverage polygons in WGS84 `[lon, lat]` order.  A cell may have
     /// multiple disjoint coverage areas (outer `Vec`); each ring is a
     /// closed polygon (inner `Vec`).  Empty when no COVR record was present.
-    pub coverage: Vec<Vec<[f64; 2]>>,
+    pub coverage: MultiPolygon,
     pub source: String,
 }
 
