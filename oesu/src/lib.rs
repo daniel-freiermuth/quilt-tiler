@@ -257,7 +257,9 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
         let rec_type = u16::from_le_bytes([hdr[0], hdr[1]]);
         let rec_len = u32::from_le_bytes([hdr[2], hdr[3], hdr[4], hdr[5]]);
         if rec_len < 6 {
-            tracing::warn!(rec_type, rec_len, "record with length < 6, stopping parse");
+            if rec_type != 0 || rec_len != 0 {
+                tracing::warn!(rec_type, rec_len, "record with length < 6, stopping parse");
+            }
             break;
         }
         let payload_len = (rec_len - 6) as usize;
@@ -704,8 +706,13 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
     // See `parse_covr_payload`'s doc comment: these points are already
     // WGS84 degrees, not SM metres — no from_sm() conversion here.
     let coverage = decode_covr(&raw_covr, &raw_nocovr);
-    if coverage.signed_area() <= 0.0 {
-        tracing::warn!("cell has zero or negative coverage area (no COVR record?)");
+    if coverage.unsigned_area() == 0.0 {
+        tracing::warn!(
+            raw_covr = raw_covr.len(),
+            raw_nocovr = raw_nocovr.len(),
+            name,
+            "cell has zero coverage area (no COVR record?)"
+        );
     }
 
     Ok(OesuCell {
@@ -767,7 +774,7 @@ fn decode_covr(covr: &[LineString], no_covr: &[LineString]) -> MultiPolygon {
                         return None;
                     }
                     if !taken_interiors.insert(index) {
-                        tracing::warn!(index, "NOCOVR ring claimed by multiple COVR exteriors");
+                        tracing::debug!(index, "NOCOVR ring claimed by multiple COVR exteriors");
                     }
                     Some(int.exterior().clone())
                 })
@@ -775,7 +782,6 @@ fn decode_covr(covr: &[LineString], no_covr: &[LineString]) -> MultiPolygon {
             Polygon::new(ext.exterior().clone(), holes)
         })
         .collect();
-
     let unclaimed = interiors.len() - taken_interiors.len();
     if unclaimed > 0 {
         tracing::warn!(unclaimed, "NOCOVR rings outside any COVR exterior, ignored");

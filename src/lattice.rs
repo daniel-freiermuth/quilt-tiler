@@ -56,7 +56,7 @@ impl BoundedLattice for MultiPolygon {
     }
 
     fn area(&self) -> f64 {
-        self.signed_area()
+        self.unsigned_area()
     }
 
     fn minus(&self, other: &Self) -> Self {
