@@ -18,7 +18,11 @@ use crate::lattice::BoundedLattice;
 use crate::tile_geom::TileGeom;
 use crate::tile_source::TileSource;
 
-const EXTENT: f64 = 4096.0;
+/// Pixel-space scale `to_px` projects into — must match the MVT layer's
+/// declared extent ([`DEFAULT_EXTENT`]), or geometry and the tile's own
+/// coordinate-space header disagree.  Derived from it, not duplicated.
+#[allow(clippy::cast_precision_loss)] // exact: any u32 fits a f64 mantissa
+const EXTENT: f64 = DEFAULT_EXTENT.get() as f64;
 
 // ── TileSource impl ──────────────────────────────────────────────────────────
 
