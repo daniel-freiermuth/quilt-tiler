@@ -70,7 +70,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use zoom::zoom_from_scale;
 
@@ -178,7 +178,7 @@ fn main() -> Result<()> {
             match oesu::parse_file(path.to_str().unwrap().to_owned(), &data) {
                 Ok(cell) => {
                     let z = zoom_from_scale(cell.native_scale, args.zoom_offset);
-                    info!(
+                    debug!(
                         name = %cell.name,
                         scale = cell.native_scale,
                         zoom = z,
