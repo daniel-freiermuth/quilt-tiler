@@ -122,8 +122,7 @@ pub fn write_pmtiles<S: TileSource>(
                 // adds area not yet covered.  `Coverage`'s real polygon
                 // algebra correctly handles disjoint coverage areas (e.g.
                 // NE + SW ≠ full tile), unlike a bounding-box hull.
-                let tile_cov = S::Coverage::from(tile_wgs84);
-                let mut uncovered = tile_cov.clone();
+                let mut uncovered = S::Coverage::from(tile_wgs84);
                 let mut contents: Vec<S::Content> = Vec::new();
 
                 {
