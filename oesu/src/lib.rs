@@ -102,6 +102,7 @@ impl From<OesuCell> for s57::S57Cell {
             features: c.features,
             coverage: c.coverage,
             source: c.source,
+            text_descriptions: c.text_descriptions,
         }
     }
 }

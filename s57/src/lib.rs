@@ -5,6 +5,8 @@
 
 // ── Feature data model ───────────────────────────────────────────────────────
 
+use std::collections::HashMap;
+
 use geo_types::{LineString, MultiPolygon, Point, Polygon};
 
 #[derive(Debug, Clone)]
@@ -58,6 +60,7 @@ pub struct S57Cell {
     /// closed polygon (inner `Vec`).  Empty when no COVR record was present.
     pub coverage: MultiPolygon,
     pub source: String,
+    pub text_descriptions: HashMap<String, String>,
 }
 
 // ── Object-class and attribute code tables ───────────────────────────────────
