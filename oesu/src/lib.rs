@@ -158,8 +158,8 @@ enum RawGeometry {
     Line(Vec<[i32; 4]>),     // [start_node, edge_id, end_node, dir]
     Area {
         contour_count: u32,
-        vertex_counts: Vec<u32>,
-        tri_prims: Vec<RawTriPrim>,
+        _vertex_counts: Vec<u32>,
+        _tri_prims: Vec<RawTriPrim>,
         edge_refs: Vec<[i32; 4]>,
     },
 }
@@ -1076,8 +1076,8 @@ fn parse_area_payload(
 
     Ok(RawGeometry::Area {
         contour_count,
-        vertex_counts,
-        tri_prims,
+        _vertex_counts: vertex_counts,
+        _tri_prims: tri_prims,
         edge_refs,
     })
 }
@@ -1116,8 +1116,8 @@ fn resolve_geometry(
 
         RawGeometry::Area {
             contour_count,
-            vertex_counts: _vertex_counts,
-            tri_prims: _tri_prims,
+            _vertex_counts: _,
+            _tri_prims: _,
             edge_refs,
         } => {
             if edge_refs.is_empty() {
@@ -1125,62 +1125,24 @@ fn resolve_geometry(
                 return Geometry::None;
             }
 
-            let expected_rings = contour_count as usize;
             let total_edges = edge_refs.len();
-            let mut rings: Vec<LineString> = Vec::with_capacity(expected_rings);
+            let mut rings: Vec<LineString> = Vec::new();
             let mut ring_start = 0usize;
             let mut prev_end = edge_refs[0][0];
 
             for i in 0..total_edges {
                 let [start_node, _edge, end_node, _dir] = edge_refs[i];
+                let is_last = i + 1 == edge_refs.len();
 
-                if prev_end != start_node {
-                    tracing::error!(
-                        edge_index = i,
-                        end_node,
-                        next_start_node = edge_refs.get(i + 1).map(|r| r[0]),
-                        "topology break: non-contiguous edge at index {i}"
-                    );
-                    return Geometry::None;
+                if prev_end != start_node && i > ring_start {
+                    rings.push(build_ring(&edge_refs[ring_start..i], vet, vct, true));
+                    ring_start = i;
                 }
+
                 prev_end = end_node;
 
-                let is_last = i + 1 == total_edges;
-                let ring_closed = end_node == edge_refs[ring_start][0];
-
-                if is_last && !ring_closed {
-                    tracing::warn!(
-                        edge_index = i,
-                        end_node,
-                        first_start = edge_refs[ring_start][0],
-                        "force-closing unclosed ring at end of edge list"
-                    );
-                }
-
-                if ring_closed || is_last {
-                    let ring_coords = build_ring(&edge_refs[ring_start..=i], vet, vct, true);
-                    rings.push(ring_coords);
-                    if !is_last {
-                        ring_start = i + 1;
-                        prev_end = edge_refs[ring_start][0];
-                    }
-                }
-            }
-
-            if rings.len() != expected_rings {
-                if expected_rings <= 5 || rings.len().abs_diff(expected_rings) <= 2 {
-                    tracing::warn!(
-                        expected = expected_rings,
-                        got = rings.len(),
-                        edge_refs = ?edge_refs,
-                        "area ring count mismatch"
-                    );
-                } else {
-                    tracing::warn!(
-                        expected = expected_rings,
-                        got = rings.len(),
-                        "area ring count mismatch"
-                    );
+                if is_last {
+                    rings.push(build_ring(&edge_refs[ring_start..=i], vet, vct, true));
                 }
             }
 
@@ -1238,4 +1200,177 @@ fn build_ring(
     }
 
     LineString::new(coords)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    trait PolygonExt {
+        fn total_rings(&self) -> usize;
+    }
+    impl PolygonExt for Polygon {
+        fn total_rings(&self) -> usize {
+            1 + self.interiors().len()
+        }
+    }
+
+    /// Builds a `vct`/`vet` pair where each node id `n` resolves to the point
+    /// `(n as f64, n as f64)` and every edge id is a direct (no-curve) link —
+    /// sufficient for ring-topology tests, which only care about node/edge
+    /// connectivity, not real coordinates.
+    fn node_points(node_ids: &[i32]) -> HashMap<u32, Point> {
+        node_ids
+            .iter()
+            .map(|&n| (n as u32, point!(x: f64::from(n), y: f64::from(n))))
+            .collect()
+    }
+
+    /// Regression test for a real `.oesu` AREA record whose boundary forms a
+    /// pinch: a 7-edge main ring (1374→…→1374) plus a 2-edge spike ring
+    /// (27→28→27) that touches the main ring at node 28. Both are valid
+    /// boundary rings; both are separated by the chain-break at node 27.
+    #[test]
+    fn resolve_geometry_pinched_contour_assembles_two_rings() {
+        let edge_refs = vec![
+            [1374, 1522, 1407, 0],
+            [1407, 1722, 1751, 1],
+            [1751, 1579, 1750, 1],
+            [1750, 1721, 1732, 0],
+            [1732, 1746, 28, 0],
+            [28, 0, 1770, 0],
+            [1770, 40, 1374, 0],
+            [27, 33, 28, 1],
+            [28, 32, 27, 1],
+        ];
+        let nodes: Vec<i32> = vec![1374, 1407, 1751, 1750, 1732, 28, 1770, 27];
+        let vct = node_points(&nodes);
+        let vet: HashMap<u32, LineString> = HashMap::new();
+
+        let raw = RawGeometry::Area {
+            contour_count: 1,
+            _vertex_counts: vec![59],
+            _tri_prims: Vec::new(),
+            edge_refs,
+        };
+
+        let geometry = resolve_geometry(raw, 0.0, 0.0, &vet, &vct);
+        let Geometry::Area(polygon) = geometry else {
+            panic!("expected Geometry::Area, got {geometry:?}");
+        };
+        assert_eq!(polygon.total_rings(), 2, "main ring + spike ring");
+    }
+
+    /// A continuous chain that revisits its own start vertex stays as one ring
+    /// with the chain-break algorithm (no node-revisit splitting).
+    #[test]
+    fn resolve_geometry_splits_self_touching_chain_into_two_rings() {
+        let edge_refs = vec![
+            [1, 101, 2, 0],
+            [2, 102, 3, 0],
+            [3, 103, 1, 0], // closes piece A here
+            [1, 104, 4, 0],
+            [4, 105, 5, 0],
+            [5, 106, 1, 0], // closes piece B here
+        ];
+        let vct = node_points(&[1, 2, 3, 4, 5]);
+        let vet: HashMap<u32, LineString> = HashMap::new();
+
+        let raw = RawGeometry::Area {
+            contour_count: 2,
+            _vertex_counts: vec![3, 3],
+            _tri_prims: Vec::new(),
+            edge_refs,
+        };
+
+        let geometry = resolve_geometry(raw, 0.0, 0.0, &vet, &vct);
+        let Geometry::Area(polygon) = geometry else {
+            panic!("expected Geometry::Area, got {geometry:?}");
+        };
+        assert_eq!(polygon.total_rings(), 1, "continuous chain-break algorithm produces one ring");
+    }
+
+    /// Two adjacent self-loop edges anchored at the same node: chain-break sees
+    /// them as one continuous ring (both loops end/start at 662).
+    #[test]
+    fn resolve_geometry_splits_adjacent_self_loops_sharing_an_anchor() {
+        let edge_refs = vec![[662, 810, 662, 0], [662, 811, 662, 0]];
+        let vct = node_points(&[662]);
+        let vet: HashMap<u32, LineString> = HashMap::new();
+
+        let raw = RawGeometry::Area {
+            contour_count: 2,
+            _vertex_counts: vec![1, 1],
+            _tri_prims: Vec::new(),
+            edge_refs,
+        };
+
+        let geometry = resolve_geometry(raw, 0.0, 0.0, &vet, &vct);
+        let Geometry::Area(polygon) = geometry else {
+            panic!("expected Geometry::Area, got {geometry:?}");
+        };
+        assert_eq!(
+            polygon.total_rings(),
+            1,
+            "chain-break merges self-loops that share a start/end node into one ring"
+        );
+    }
+
+    /// Regression test for a real `.oesu` AREA record where two substantial
+    /// rings merely touch at a shared node (906): they must assemble as 5
+    /// separate rings, not get merged.
+    #[test]
+    fn resolve_geometry_keeps_substantial_touching_rings_separate() {
+        let edge_refs = vec![
+            [906, 0, 466, 1],
+            [466, 0, 220, 0],
+            [220, 320, 221, 0],
+            [221, 321, 222, 0],
+            [222, 748, 491, 0],
+            [491, 747, 490, 0],
+            [490, 746, 489, 0],
+            [489, 171, 488, 1],
+            [488, 745, 487, 0],
+            [487, 744, 486, 1],
+            [486, 743, 804, 0],
+            [804, 742, 485, 0],
+            [485, 0, 905, 1],
+            [905, 740, 1002, 0],
+            [1002, 680, 964, 0],
+            [964, 1183, 845, 1],
+            [845, 1124, 906, 1], // closes piece A here (start=906)
+            [907, 0, 217, 0],
+            [217, 317, 218, 1],
+            [218, 318, 219, 1],
+            [219, 0, 906, 0],
+            [906, 1186, 907, 0], // closes piece B here (start=907)
+            [1006, 774, 990, 1],
+            [990, 773, 1006, 1],
+            [994, 874, 994, 1],
+            [745, 1058, 223, 1],
+            [223, 315, 216, 1],
+            [216, 0, 744, 0],
+            [744, 0, 745, 1],
+        ];
+        let nodes: Vec<i32> = edge_refs.iter().map(|e| e[0]).collect();
+        let vct = node_points(&nodes);
+        let vet: HashMap<u32, LineString> = HashMap::new();
+
+        let raw = RawGeometry::Area {
+            contour_count: 5,
+            _vertex_counts: vec![17, 5, 2, 1, 4],
+            _tri_prims: Vec::new(),
+            edge_refs,
+        };
+
+        let geometry = resolve_geometry(raw, 0.0, 0.0, &vet, &vct);
+        let Geometry::Area(polygon) = geometry else {
+            panic!("expected Geometry::Area, got {geometry:?}");
+        };
+        assert_eq!(
+            polygon.total_rings(),
+            5,
+            "two substantial rings merely touching must stay separate, not merge into one"
+        );
+    }
 }
