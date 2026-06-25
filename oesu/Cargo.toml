@@ -8,7 +8,7 @@ publish = false
 anyhow = "1"
 s57    = { path = "../s57" }
 tracing = "0.1"
-geo    = "0.33.1"
+geo    = { version = "0.33.1", default-features = false, features = ["earcut", "spade"] }
 
 [lints.rust]
 unsafe_code = "forbid"

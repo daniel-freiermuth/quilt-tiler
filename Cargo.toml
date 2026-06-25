@@ -22,7 +22,7 @@ indicatif       = { version = "0.18.4", features = ["rayon"] }
 serde_json      = "1"
 tracing         = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-geo = "0.33.1"
+geo = { version = "0.33.1", default-features = false, features = ["earcut", "spade"] }
 
 [lints.rust]
 unsafe_code = "forbid"
