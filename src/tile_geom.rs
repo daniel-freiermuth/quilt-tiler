@@ -10,10 +10,10 @@ use geo::MultiPolygon;
 /// [`crate::tile_source::TileSource`] render call needs.
 #[derive(Clone, Debug)]
 pub struct TileGeom {
-    /// Tile extent in WGS84 geographic coordinates; clipping uses this
-    /// directly, so it need not be a rectangle.
+    /// Coverage contribution for this source in WGS84.  Area features are
+    /// clipped to this region so coverage-owning cells don't overlap.
     pub geom: MultiPolygon,
-    /// Bounding box of [`Self::geom`] in Web Mercator metres, used to
+    /// Bounding box of the full tile in Web Mercator metres, used to
     /// project clipped WGS84 coordinates to tile-pixel space.
     pub merc: Bbox,
     /// Nominal scale denominator at this zoom level (`zoom_offset` already
