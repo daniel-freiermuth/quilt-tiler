@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read};
 
 use anyhow::{Context, Result, bail};
-use geo::{Area, Coord, Intersects, LineString, MultiPolygon, Point, Polygon, point};
+use geo::{Area, BooleanOps, Coord, Intersects, LineString, MultiPolygon, Point, Polygon, point};
 use s57::{AttrValue, Attribute, Feature, Geometry};
 
 // ── Record type constants ────────────────────────────────────────────────────
@@ -706,12 +706,12 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
     // ── Resolve coverage polygons ────────────────────────────────────────────
     // See `parse_covr_payload`'s doc comment: these points are already
     // WGS84 degrees, not SM metres — no from_sm() conversion here.
-    let coverage = decode_covr(&raw_covr, &raw_nocovr);
+    let coverage = decode_covr(&source, &raw_covr, &raw_nocovr);
     if coverage.unsigned_area() == 0.0 {
         tracing::warn!(
             raw_covr = raw_covr.len(),
             raw_nocovr = raw_nocovr.len(),
-            name,
+            source,
             "cell has zero coverage area (no COVR record?)"
         );
     }
@@ -739,53 +739,94 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
     .into())
 }
 
-/// Assign each NOCOVR ring as a hole of whichever COVR exterior it falls
-/// inside, building the cell's coverage [`MultiPolygon`].
+/// Subtract every NOCOVR ring from whichever COVR exterior(s) it overlaps,
+/// building the cell's coverage [`MultiPolygon`].
 ///
-/// Overlapping COVR exteriors and NOCOVR rings that match no (or several)
-/// COVR exteriors are data-quality issues, not parse failures: they are
-/// logged and handled best-effort rather than panicking.
-fn decode_covr(covr: &[LineString], no_covr: &[LineString]) -> MultiPolygon {
+/// NOCOVR rings are not guaranteed to nest inside their COVR exterior: ENC
+/// production commonly draws a NOCOVR ring by retracing most of COVR's own
+/// boundary (e.g. a coastline) and closing around the cell's nominal grid
+/// extent, so NOCOVR is frequently *adjacent* to COVR rather than contained
+/// by it. A structural `Polygon::new(ext, vec![hole])` requires strict
+/// containment and silently breaks geo's `BooleanOps` when violated
+/// (intersection degenerates to returning the other operand unchanged); a
+/// boolean [`BooleanOps::difference`] is correct regardless of nesting.
+///
+/// Overlapping COVR exteriors and NOCOVR rings that match no COVR exterior
+/// are data-quality issues, not parse failures: they are logged and
+/// handled best-effort rather than panicking.
+fn decode_covr(source: &str, covr: &[LineString], no_covr: &[LineString]) -> MultiPolygon {
+    // OESU COVR/NOCOVR rings arrive with occasional duplicate consecutive
+    // coords (zero-length edges) and may not be closed. Deduplicate and
+    // close every ring before use, warning when a ring actually needed it
+    // (so genuinely clean input stays quiet).
+    let normalise = |kind: &str, index: usize, ring: &LineString| -> LineString {
+        let mut coords: Vec<Coord> = Vec::new();
+        for c in ring.coords() {
+            if coords.last() != Some(c) {
+                coords.push(*c);
+            }
+        }
+        let removed = ring.0.len() - coords.len();
+        if removed > 0 {
+            tracing::warn!(
+                source,
+                kind,
+                index,
+                removed,
+                "ring had duplicate consecutive coords, deduplicated"
+            );
+        }
+        if coords.first() != coords.last()
+            && let Some(&first) = coords.first()
+        {
+            coords.push(first);
+            tracing::warn!(source, kind, index, "ring was not closed, closed it");
+        }
+        LineString::new(coords)
+    };
+
     let exteriors: Vec<Polygon> = covr
         .iter()
-        .map(|ring| Polygon::new(ring.clone(), vec![]))
+        .enumerate()
+        .map(|(i, ring)| Polygon::new(normalise("COVR", i, ring), vec![]))
         .collect();
     let interiors: Vec<Polygon> = no_covr
         .iter()
-        .map(|ring| Polygon::new(ring.clone(), vec![]))
+        .enumerate()
+        .map(|(i, ring)| Polygon::new(normalise("NOCOVR", i, ring), vec![]))
         .collect();
 
     for i in 0..exteriors.len() {
         for j in (i + 1)..exteriors.len() {
             if exteriors[i].intersects(&exteriors[j]) {
-                tracing::warn!(i, j, "overlapping COVR exteriors");
+                tracing::warn!(source, i, j, "overlapping COVR exteriors");
             }
         }
     }
 
-    let mut taken_interiors: HashSet<usize> = HashSet::new();
-    let polys: Vec<Polygon> = exteriors
-        .iter()
-        .map(|ext| {
-            let holes: Vec<LineString> = interiors
-                .iter()
-                .enumerate()
-                .filter_map(|(index, int)| {
-                    if !int.intersects(ext) {
-                        return None;
-                    }
-                    if !taken_interiors.insert(index) {
-                        tracing::debug!(index, "NOCOVR ring claimed by multiple COVR exteriors");
-                    }
-                    Some(int.exterior().clone())
-                })
-                .collect();
-            Polygon::new(ext.exterior().clone(), holes)
-        })
-        .collect();
-    let unclaimed = interiors.len() - taken_interiors.len();
+    // Subtract every overlapping NOCOVR ring from its COVR exterior with a
+    // proper boolean difference rather than a structural `Polygon` hole —
+    // see the function doc comment for why containment can't be assumed.
+    let mut claimed: HashSet<usize> = HashSet::new();
+    let mut polys: Vec<Polygon> = Vec::new();
+    for ext in &exteriors {
+        let mut remaining = MultiPolygon::new(vec![ext.clone()]);
+        for (index, int) in interiors.iter().enumerate() {
+            if !int.intersects(ext) {
+                continue;
+            }
+            claimed.insert(index);
+            remaining = remaining.difference(int);
+        }
+        polys.extend(remaining);
+    }
+    let unclaimed = interiors.len() - claimed.len();
     if unclaimed > 0 {
-        tracing::warn!(unclaimed, "NOCOVR rings outside any COVR exterior, ignored");
+        tracing::warn!(
+            source,
+            unclaimed,
+            "NOCOVR rings outside any COVR exterior, ignored"
+        );
     }
 
     MultiPolygon::new(polys)
@@ -1287,7 +1328,11 @@ mod tests {
         let Geometry::Area(polygon) = geometry else {
             panic!("expected Geometry::Area, got {geometry:?}");
         };
-        assert_eq!(polygon.total_rings(), 1, "continuous chain-break algorithm produces one ring");
+        assert_eq!(
+            polygon.total_rings(),
+            1,
+            "continuous chain-break algorithm produces one ring"
+        );
     }
 
     /// Two adjacent self-loop edges anchored at the same node: chain-break sees
