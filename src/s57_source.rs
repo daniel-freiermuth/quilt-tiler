@@ -51,8 +51,11 @@ impl TileSource for s57::S57Cell {
             let Some(layer_name) = s57::object_acronym(feat.type_code) else {
                 continue;
             };
-            if !feat_intersects(feat, &tile.geom) {
-                continue;
+            {
+                profiling::scope!("Test feature intersection");
+                if !feat_intersects(feat, &tile.geom) {
+                    continue;
+                }
             }
             let feats = to_mvt_features(feat, tile);
             if !feats.is_empty() {
@@ -60,49 +63,52 @@ impl TileSource for s57::S57Cell {
             }
         }
 
-        // Light sector arcs — separate pass: arcs extend beyond the light position,
-        // so the arc bounding box is used for intersection rather than the point.
-        for feat in &self.features {
-            if s57::object_acronym(feat.type_code) != Some("LIGHTS") {
-                continue;
-            }
-            let s57::Geometry::Point(center) = &feat.geometry else {
-                continue;
-            };
+        {
+            profiling::scope!("Collecting lighthouses");
+            // Light sector arcs — separate pass: arcs extend beyond the light position,
+            // so the arc bounding box is used for intersection rather than the point.
+            for feat in &self.features {
+                if s57::object_acronym(feat.type_code) != Some("LIGHTS") {
+                    continue;
+                }
+                let s57::Geometry::Point(center) = &feat.geometry else {
+                    continue;
+                };
 
-            // SCAMIN in scale space: tile.scale > scamin → tile is too coarse.
-            if let Some(attr) = feat.attributes.iter().find(|a| a.code == 133)
-                && let s57::AttrValue::Int(scamin) = attr.value
-                && scamin < tile.scale
-            {
-                continue;
-            }
+                // SCAMIN in scale space: tile.scale > scamin → tile is too coarse.
+                if let Some(attr) = feat.attributes.iter().find(|a| a.code == 133)
+                    && let s57::AttrValue::Int(scamin) = attr.value
+                    && scamin < tile.scale
+                {
+                    continue;
+                }
 
-            let valnmr = feat
-                .attributes
-                .iter()
-                .find(|a| a.code == 178)
-                .and_then(|a| {
-                    if let s57::AttrValue::Double(v) = a.value {
-                        Some(v)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(3.0);
-            let r_m = valnmr.mul_add(50.0, 200.0_f64).min(600.0);
-            let d_lat = r_m * 2.0 / 111_320.0;
-            let d_lon = r_m * 2.0 / (111_320.0 * center.y().to_radians().cos());
-            let arc_bbox = Bbox {
-                west: center.x() - d_lon,
-                south: center.y() - d_lat,
-                east: center.x() + d_lon,
-                north: center.y() + d_lat,
-            };
-            if !tile.geom.intersects(&Polygon::from(arc_bbox)) {
-                continue;
+                let valnmr = feat
+                    .attributes
+                    .iter()
+                    .find(|a| a.code == 178)
+                    .and_then(|a| {
+                        if let s57::AttrValue::Double(v) = a.value {
+                            Some(v)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(3.0);
+                let r_m = valnmr.mul_add(50.0, 200.0_f64).min(600.0);
+                let d_lat = r_m * 2.0 / 111_320.0;
+                let d_lon = r_m * 2.0 / (111_320.0 * center.y().to_radians().cos());
+                let arc_bbox = Bbox {
+                    west: center.x() - d_lon,
+                    south: center.y() - d_lat,
+                    east: center.x() + d_lon,
+                    north: center.y() + d_lat,
+                };
+                if !tile.geom.intersects(&Polygon::from(arc_bbox)) {
+                    continue;
+                }
+                light_sectors_to_mvt(*center, &feat.attributes, tile, &mut layers);
             }
-            light_sectors_to_mvt(*center, &feat.attributes, tile, &mut layers);
         }
 
         layers
