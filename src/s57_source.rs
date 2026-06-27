@@ -363,6 +363,14 @@ fn light_sectors_to_mvt(
         }
     }
 
+    // SECTR1/SECTR2 are encoded as bearings observed *from seaward towards
+    // the light* (IHO S-57 light-sector convention) — i.e. the bearing a
+    // vessel on the sector boundary would read pointing at the light. The
+    // boundary ray drawn outward *from* the light therefore needs the
+    // reciprocal bearing: flip by 180°.
+    let sectr1 = sectr1.map(|b| (b + 180.0) % 360.0);
+    let sectr2 = sectr2.map(|b| (b + 180.0) % 360.0);
+
     let hex = light_colour_hex(colour);
     let r_m = valnmr.mul_add(50.0, 200.0_f64).min(600.0_f64);
 
