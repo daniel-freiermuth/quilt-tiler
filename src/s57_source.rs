@@ -63,6 +63,21 @@ impl TileSource for s57::S57Cell {
             }
         }
 
+        let lateral_cardinal_buoy_positions: std::collections::HashSet<(i64, i64)> = self
+            .features
+            .iter()
+            .filter_map(|f| {
+                let acronym = s57::object_acronym(f.type_code)?;
+                if !is_lateral_or_cardinal_buoy(acronym) {
+                    return None;
+                }
+                let s57::Geometry::Point(p) = &f.geometry else {
+                    return None;
+                };
+                Some(quantize_point(*p))
+            })
+            .collect();
+
         {
             profiling::scope!("Collecting lighthouses");
             // Light sector arcs — separate pass: arcs extend beyond the light position,
@@ -107,7 +122,15 @@ impl TileSource for s57::S57Cell {
                 if !tile.geom.intersects(&Polygon::from(arc_bbox)) {
                     continue;
                 }
-                light_sectors_to_mvt(*center, &feat.attributes, tile, &mut layers);
+                let on_lateral_cardinal_buoy =
+                    lateral_cardinal_buoy_positions.contains(&quantize_point(*center));
+                light_sectors_to_mvt(
+                    *center,
+                    &feat.attributes,
+                    tile,
+                    on_lateral_cardinal_buoy,
+                    &mut layers,
+                );
             }
         }
 
@@ -298,12 +321,24 @@ fn light_colour_hex(colour: &str) -> &'static str {
         "3" => "#ee2222",  // Red
         "4" => "#22aa22",  // Green
         "5" => "#2255ee",  // Blue
-        "6" => "#ccaa00",  // Yellow
         "9" => "#cc8800",  // Amber
         "11" => "#ee7700", // Orange
         "12" => "#cc22cc", // Magenta
-        _ => "#f8fafc",    // White (code 1 or unknown)
+        // Yellow (code 6) and white (code 1 or unknown) — white rendered as
+        // yellow too: a near-white ring is invisible against a pale chart
+        // background.
+        _ => "#ccaa00",
     }
+}
+
+/// Quantizes a point to ~1cm precision for exact-coincidence lookups (e.g.
+/// matching a `LIGHTS` point against the buoy/beacon it is mounted on).
+fn quantize_point(p: Point) -> (i64, i64) {
+    #[allow(clippy::cast_possible_truncation)] // bounded by ±180/90 deg * 1e7
+    (
+        (p.x() * 1.0e7).round() as i64,
+        (p.y() * 1.0e7).round() as i64,
+    )
 }
 
 /// Flat-Earth bearing + distance → destination point.  Valid for ≤ 1200 m.
@@ -314,6 +349,38 @@ fn bearing_offset(coord: Coord, bearing_deg: f64, dist_m: f64) -> Coord {
     coord![x: coord.x + d_lon * math_rad.cos(), y: coord.y + d_lat * math_rad.sin()]
 }
 
+/// `true` for lateral and cardinal buoys: their lights are plain all-round
+/// lights with no real sector data, so the synthetic "no sector" full circle
+/// (see `light_sectors_to_mvt`) is just clutter and is suppressed for them.
+fn is_lateral_or_cardinal_buoy(acronym: &str) -> bool {
+    matches!(acronym, "BOYLAT" | "BOYCAR")
+}
+
+/// Emits a small flare-icon marker for a buoy-mounted all-round light that
+/// has no real sector data, and therefore no range-circle drawn for it
+/// (the synthetic "no sector" circle is suppressed as clutter — see
+/// `light_sectors_to_mvt`).  CATLIT 6/8 (flood / subsidiary light) aren't
+/// standalone aids to navigation, so those are skipped too.
+fn emit_buoy_light_flare(
+    center: Point,
+    colour: &str,
+    catlit: Option<&MvtValue>,
+    tile: &TileGeom,
+    layers: &mut HashMap<&'static str, Vec<MvtFeature>>,
+) {
+    let is_flood_or_subsidiary = matches!(catlit, Some(MvtValue::UInt(6 | 8)));
+    if is_flood_or_subsidiary || !tile.geom.intersects(&center) {
+        return;
+    }
+    let mut f = MvtFeature::new(MvtGeometry::Point(to_px(center.into(), tile.merc).into()));
+    f.properties
+        .push(("COLOUR".into(), MvtValue::String(colour.into())));
+    if let Some(cv) = catlit {
+        f.properties.push(("CATLIT".into(), cv.clone()));
+    }
+    layers.entry("LIGHTS_FLARE").or_default().push(f);
+}
+
 /// Generate arc and radial sector features for one `LIGHTS` point.
 ///
 /// Appends to `layers["LIGHTS_SECTOR"]`.
@@ -322,6 +389,7 @@ fn light_sectors_to_mvt(
     center: Point,
     attrs: &[s57::Attribute],
     tile: &TileGeom,
+    on_lateral_cardinal_buoy: bool,
     layers: &mut HashMap<&'static str, Vec<MvtFeature>>,
 ) {
     let mut catlit: Option<MvtValue> = None;
@@ -376,6 +444,14 @@ fn light_sectors_to_mvt(
 
     #[allow(clippy::float_cmp)] // exact equality: same bearing = no sector
     let has_sectors = matches!((&sectr1, &sectr2), (Some(s1), Some(s2)) if s1 != s2);
+    if !has_sectors && on_lateral_cardinal_buoy {
+        // Plain all-round buoy light: skip the synthetic "no sector" full
+        // circle (clutter — it conveys no real sector information here),
+        // and draw a small tilted flare icon instead so the buoy's light
+        // still shows up on the chart.
+        emit_buoy_light_flare(center, colour, catlit.as_ref(), tile, layers);
+        return;
+    }
     let (from_brg, to_brg_raw) = if has_sectors {
         (sectr1.unwrap(), sectr2.unwrap())
     } else {
@@ -640,5 +716,199 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── light_sectors_to_mvt: buoy circle suppression ────────────────────────
+
+    /// A small square tile region centered on `center`, wide enough to
+    /// contain any light-sector arc (max radius 600 m ≪ `margin_deg`).
+    fn test_tile_geom(center: Point, margin_deg: f64) -> TileGeom {
+        let (west, south) = (center.x() - margin_deg, center.y() - margin_deg);
+        let (east, north) = (center.x() + margin_deg, center.y() + margin_deg);
+        let (west_m, south_m) = wgs84_to_webmercator(west, south);
+        let (east_m, north_m) = wgs84_to_webmercator(east, north);
+        TileGeom {
+            geom: rect(west, south, east, north),
+            merc: Bbox {
+                west: west_m,
+                south: south_m,
+                east: east_m,
+                north: north_m,
+            },
+            scale: 0,
+        }
+    }
+
+    fn kind_of(f: &MvtFeature) -> Option<&str> {
+        f.properties.iter().find_map(|(k, v)| {
+            if k != "kind" {
+                return None;
+            }
+            match v {
+                MvtValue::String(s) => Some(s.as_str()),
+                _ => Some(""),
+            }
+        })
+    }
+
+    #[test]
+    fn lateral_or_cardinal_buoy_predicate_matches_only_boylat_boycar() {
+        assert!(is_lateral_or_cardinal_buoy("BOYLAT"));
+        assert!(is_lateral_or_cardinal_buoy("BOYCAR"));
+        assert!(!is_lateral_or_cardinal_buoy("BCNLAT"));
+        assert!(!is_lateral_or_cardinal_buoy("BCNCAR"));
+        assert!(!is_lateral_or_cardinal_buoy("LIGHTS"));
+    }
+
+    #[test]
+    fn buoy_light_without_sector_emits_no_circle_but_emits_flare() {
+        let center = Point::new(10.0, 55.0);
+        let tile = test_tile_geom(center, 0.1);
+        let mut layers = HashMap::new();
+        let attrs = vec![s57::Attribute {
+            code: 75,
+            value: s57::AttrValue::Str("1".into()),
+        }];
+        light_sectors_to_mvt(center, &attrs, &tile, true, &mut layers);
+        assert!(
+            layers.get("LIGHTS_SECTOR").is_none_or(Vec::is_empty),
+            "buoy-mounted all-round light must not draw a synthetic range circle"
+        );
+        let flare = layers
+            .get("LIGHTS_FLARE")
+            .expect("buoy-mounted light without a circle must still show a flare icon");
+        assert_eq!(flare.len(), 1);
+        assert!(
+            flare[0]
+                .properties
+                .iter()
+                .any(|(k, v)| k == "COLOUR" && matches!(v, MvtValue::String(s) if s == "1"))
+        );
+    }
+
+    #[test]
+    fn flood_or_subsidiary_buoy_light_emits_neither_circle_nor_flare() {
+        let center = Point::new(10.0, 55.0);
+        let tile = test_tile_geom(center, 0.1);
+        for catlit in [6_u32, 8_u32] {
+            let mut layers = HashMap::new();
+            let attrs = vec![s57::Attribute {
+                code: 37,
+                value: s57::AttrValue::Int(catlit),
+            }];
+            light_sectors_to_mvt(center, &attrs, &tile, true, &mut layers);
+            assert!(
+                layers.get("LIGHTS_SECTOR").is_none_or(Vec::is_empty),
+                "CATLIT {catlit} must not draw a circle"
+            );
+            assert!(
+                layers.get("LIGHTS_FLARE").is_none_or(Vec::is_empty),
+                "CATLIT {catlit} (flood/subsidiary) must not draw a flare icon either"
+            );
+        }
+    }
+
+    #[test]
+    fn buoy_light_outside_tile_emits_no_flare() {
+        let center = Point::new(10.0, 55.0);
+        let far_away_tile = test_tile_geom(Point::new(20.0, 55.0), 0.1);
+        let mut layers = HashMap::new();
+        light_sectors_to_mvt(center, &[], &far_away_tile, true, &mut layers);
+        assert!(layers.get("LIGHTS_FLARE").is_none_or(Vec::is_empty));
+    }
+
+    #[test]
+    fn non_buoy_light_without_sector_still_emits_circle() {
+        let center = Point::new(10.0, 55.0);
+        let tile = test_tile_geom(center, 0.1);
+        let mut layers = HashMap::new();
+        light_sectors_to_mvt(center, &[], &tile, false, &mut layers);
+        let feats = layers
+            .get("LIGHTS_SECTOR")
+            .expect("standalone light should draw its nominal-range circle");
+        assert!(feats.iter().any(|f| kind_of(f) == Some("arc")));
+    }
+
+    #[test]
+    fn sector_bearings_are_drawn_reciprocal_to_seaward_convention() {
+        let center = Point::new(10.0, 55.0);
+        let tile = test_tile_geom(center, 0.1);
+        let attrs = vec![
+            s57::Attribute {
+                code: 136,
+                value: s57::AttrValue::Double(0.0),
+            },
+            s57::Attribute {
+                code: 137,
+                value: s57::AttrValue::Double(1.0),
+            },
+        ];
+        let mut layers = HashMap::new();
+        light_sectors_to_mvt(center, &attrs, &tile, false, &mut layers);
+        let feats = layers
+            .get("LIGHTS_SECTOR")
+            .expect("sector features expected");
+        let radial = feats
+            .iter()
+            .find(|f| kind_of(f) == Some("radial"))
+            .expect("expected a radial boundary line");
+        let MvtGeometry::LineString(ls) = &radial.geometry else {
+            panic!("radial feature must be a LineString");
+        };
+        let center_px = to_px(center.into(), tile.merc);
+        let tip = ls.0[1];
+        // SECTR1 = 0° means a vessel at sea sees the light bearing due
+        // north of itself — so the vessel (and the boundary ray drawn
+        // outward from the light) lies due *south* of the light, not
+        // due north. Regression for the reciprocal-bearing fix.
+        assert!(
+            tip.y > center_px.y,
+            "boundary ray for SECTR1=0° must point south (larger pixel y) \
+             of the light, got tip={tip:?} center={center_px:?}"
+        );
+        assert!(
+            (tip.x - center_px.x).abs() <= 2,
+            "due-south ray should have ~zero east/west pixel offset, \
+             got tip={tip:?} center={center_px:?}"
+        );
+    }
+
+    #[test]
+    fn buoy_light_with_real_sector_still_emits_arc_and_radials() {
+        let center = Point::new(10.0, 55.0);
+        let tile = test_tile_geom(center, 0.1);
+        let attrs = vec![
+            s57::Attribute {
+                code: 136,
+                value: s57::AttrValue::Double(10.0),
+            },
+            s57::Attribute {
+                code: 137,
+                value: s57::AttrValue::Double(90.0),
+            },
+        ];
+        let mut layers = HashMap::new();
+        light_sectors_to_mvt(center, &attrs, &tile, true, &mut layers);
+        let feats = layers
+            .get("LIGHTS_SECTOR")
+            .expect("real sector data must still be drawn even on a buoy");
+        assert!(feats.iter().any(|f| kind_of(f) == Some("arc")));
+        assert_eq!(
+            feats
+                .iter()
+                .filter(|f| kind_of(f) == Some("radial"))
+                .count(),
+            2
+        );
+        assert!(
+            layers.get("LIGHTS_FLARE").is_none_or(Vec::is_empty),
+            "a light with real sector data already shown via arcs needs no flare icon"
+        );
+    }
+
+    #[test]
+    fn light_colour_hex_white_renders_as_yellow() {
+        assert_eq!(light_colour_hex("1"), "#ccaa00");
+        assert_eq!(light_colour_hex(""), "#ccaa00");
     }
 }

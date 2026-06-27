@@ -130,3 +130,62 @@ pub fn build_style(
 
     serde_json::to_string_pretty(&style).expect("style serialisation cannot fail")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    fn layer<'a>(style: &'a Value, id: &str) -> &'a Value {
+        style["layers"]
+            .as_array()
+            .expect("layers is an array")
+            .iter()
+            .find(|l| l["id"] == id)
+            .unwrap_or_else(|| panic!("layer {id} not found in built style"))
+    }
+
+    #[test]
+    fn cardinal_buoy_body_and_topmark_are_separate_layers_with_topmark_on_top() {
+        let style: Value = serde_json::from_str(&build_style(
+            5.0,
+            10.0,
+            "http://localhost/{z}/{x}/{y}",
+            6,
+            18,
+        ))
+        .expect("build_style output is valid JSON");
+
+        let layers = style["layers"].as_array().expect("layers is an array");
+        let body_idx = layers
+            .iter()
+            .position(|l| l["id"] == "BOYCAR-body")
+            .expect("BOYCAR-body layer missing");
+        let topmark_idx = layers
+            .iter()
+            .position(|l| l["id"] == "TOPMAR")
+            .expect("TOPMAR layer missing");
+        assert!(
+            body_idx < topmark_idx,
+            "buoy body must be drawn before (i.e. beneath) the topmark"
+        );
+        assert!(
+            !layers.iter().any(|l| l["id"] == "BOYCAR-topmark"),
+            "BOYCAR-topmark (CATCAM-guessed cone icon) must be gone — topmarks \
+             are real S-57 TOPMAR objects with their own TOPSHP shape attribute"
+        );
+
+        let body = layer(&style, "BOYCAR-body");
+        assert_eq!(body["source-layer"], "BOYCAR");
+
+        // Topmarks are shared across every buoy/beacon class, not just
+        // cardinal buoys: one generic layer sourced from the real TOPMAR
+        // object class, keyed on its own TOPSHP attribute.
+        let topmark = layer(&style, "TOPMAR");
+        assert_eq!(topmark["source-layer"], "TOPMAR");
+        let icon_image = topmark["layout"]["icon-image"]
+            .as_array()
+            .expect("icon-image is a match expression array");
+        assert_eq!(icon_image[1], serde_json::json!(["get", "TOPSHP"]));
+    }
+}

@@ -334,22 +334,20 @@
       "paint": {}
     },
     {
-      "id": "BOYCAR",
+      "id": "BOYCAR-body",
       "type": "symbol",
       "source": "enc",
       "source-layer": "BOYCAR",
       "minzoom": 10,
       "layout": {
-        "icon-image": [
-          "match", ["get", "CATCAM"],
-          1, "Q9_2_cones_points_upward_D",
-          2, "Q9_Cone_point_up_D",
-          3, "Q9_2_cones_base_to_base_D",
-          4, "Q9_Cone_point_down_D",
-          5, "Q9_2_cones_points_downward_D",
-          6, "Q9_Cone_point_down_D",
-          7, "Q9_2_cones_point_to_point_D",
-          8, "Q9_Cone_point_up_D",
+        "icon-image": ["match", ["get", "BOYSHP"],
+          1, "Q20b_Conical_buoy",
+          2, "Q21b_Can_buoy",
+          3, "Q22a_Spherical_buoy",
+          4, "Q23b_Pillar_buoy",
+          5, "Q24_Spar_buoy",
+          6, "Q25a_Barrel_buoy",
+          7, "Q26_Super_buoy",
           "Q23b_Pillar_buoy"
         ],
         "icon-size": 1,
@@ -437,6 +435,41 @@
       "paint": {}
     },
     {
+      "id": "TOPMAR",
+      "type": "symbol",
+      "source": "enc",
+      "source-layer": "TOPMAR",
+      "minzoom": 10,
+      "layout": {
+        "icon-image": [
+          "match", ["get", "TOPSHP"],
+          1,  "Q9_Cone_point_up_D",
+          2,  "Q9_Cone_point_down_A",
+          3,  "Q9_Sphere_D",
+          4,  "Q9_2_spheres_D",
+          5,  "Q9_Cylinder_D",
+          7,  "Q9_Xshape_D",
+          10, "Q9_2_cones_point_to_point_D",
+          11, "Q9_2_cones_base_to_base_D",
+          12, "Q9_Rhombus_D",
+          13, "Q9_2_cones_points_upward_D",
+          14, "Q9_2_cones_points_downward_D",
+          17, "Q9_Flag_A",
+          18, "Q9_Sphere_over_rhombus_D",
+          19, "Q9_Square_D",
+          21, "Q9_Rectangle_vertical_D",
+          24, "Q9_Triangle_point_up_D",
+          25, "Q9_Triangle_point_down_D",
+          26, "Q9_Circle_D",
+          "NO_SYMBOL"
+        ],
+        "icon-size": 1,
+        "icon-allow-overlap": true,
+        "icon-ignore-placement": true
+      },
+      "paint": {}
+    },
+    {
       "id": "PILBOP",
       "type": "symbol",
       "source": "enc",
@@ -482,12 +515,11 @@
       }
     },
     {
-      "id": "LIGHTS",
+      "id": "LIGHTS-flare",
       "type": "symbol",
       "source": "enc",
-      "source-layer": "LIGHTS",
+      "source-layer": "LIGHTS_FLARE",
       "minzoom": 10,
-      "filter": ["!", ["match", ["get", "CATLIT"], ["6", "8"], true, false]],
       "layout": {
         "icon-image": [
           "match", ["to-string", ["get", "COLOUR"]],
@@ -500,6 +532,7 @@
           "Light_Flare_white"
         ],
         "icon-size": 1,
+        "icon-rotate": 150,
         "icon-allow-overlap": true,
         "icon-ignore-placement": true
       },
