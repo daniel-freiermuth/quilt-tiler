@@ -742,18 +742,61 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
 /// Subtract every NOCOVR ring from whichever COVR exterior(s) it overlaps,
 /// building the cell's coverage [`MultiPolygon`].
 ///
-/// NOCOVR rings are not guaranteed to nest inside their COVR exterior: ENC
-/// production commonly draws a NOCOVR ring by retracing most of COVR's own
-/// boundary (e.g. a coastline) and closing around the cell's nominal grid
-/// extent, so NOCOVR is frequently *adjacent* to COVR rather than contained
-/// by it. A structural `Polygon::new(ext, vec![hole])` requires strict
-/// containment and silently breaks geo's `BooleanOps` when violated
-/// (intersection degenerates to returning the other operand unchanged); a
-/// boolean [`BooleanOps::difference`] is correct regardless of nesting.
+/// # COVR/NOCOVR taxonomy (measured across 582 cells / 614 intersecting
+/// pairs in this corpus via `examples/probe_covr_taxonomy.rs` — re-run it
+/// against fresh chart exports if this ever needs re-validating)
 ///
-/// Overlapping COVR exteriors and NOCOVR rings that match no COVR exterior
-/// are data-quality issues, not parse failures: they are logged and
-/// handled best-effort rather than panicking.
+/// The relationship between a COVR exterior and an intersecting NOCOVR ring
+/// falls into exactly one of two buckets, measured by
+/// `intersection_area(ext, nocovr) / ext_area`. There is no middle ground:
+/// 0 of 614 pairs landed strictly between 0% and 100%.
+///
+/// 1. **Adjacent/complement (444 pairs, ~72%).** Overlap is exactly 0%.
+///    NOCOVR shares ~85% of its vertices with the COVR exterior on average
+///    (it retraces most of COVR's own boundary, e.g. a coastline, then
+///    closes around the cell's nominal grid extent) — the fingerprint of a
+///    shape that was *cut from* COVR rather than independently surveyed.
+///    Subtracting it is a true geometric no-op: confirmed empirically,
+///    `ext.difference(nocovr)` changes 0/582 cells' total coverage area
+///    relative to ignoring NOCOVR outright (`examples/probe_ignore_nocovr.rs`,
+///    since removed — the 0/582 result is the only part worth keeping).
+/// 2. **Full erasure (170 pairs, ~28%).** Overlap is exactly 100%: the
+///    NOCOVR ring completely contains the COVR exterior. In 144/170 cases
+///    NOCOVR is a perfect axis-aligned rectangle matching the cell's
+///    nominal grid quadrant (e.g. exactly 0.25°×0.25°), emitted regardless
+///    of how many or what shape COVR pieces it actually contains — most
+///    visibly when COVR is a handful of small disjoint islands inside one
+///    nominal cell. NOCOVR shares *zero* vertices with COVR in every one of
+///    these 170 pairs (vs. ~85% in bucket 1) — confirms this is unrelated
+///    geometry, not a coastline trace. Subtracting it would erase real,
+///    explicitly-charted data; we detect and skip it instead (see below).
+///
+/// The textbook S-57 `M_NCOV` case — a small *genuine* gap fully nested
+/// inside an otherwise-charted COVR area, producing a partial (neither 0%
+/// nor 100%) overlap — does not occur anywhere in this corpus. It may be
+/// that the source/SENC-compilation pipeline already resolves it into
+/// bucket 1 before these files exist (we have no access to `OpenCPN`'s SENC
+/// writer or the pre-compilation S-57 source to confirm); if so that's
+/// harmless, since subtracting a region COVR's stored boundary already
+/// excludes is a guaranteed no-op regardless of when the exclusion
+/// happened. The `difference`+erasure-guard logic below handles this
+/// hypothetical partial case correctly *if* it ever shows up in future
+/// chart updates or a different catalog/region — at zero behavioural cost
+/// today, since it's proven equivalent to ignoring NOCOVR entirely for
+/// every cell currently in this corpus. That's why the logic stays even
+/// though a simpler "just ignore NOCOVR" implementation currently produces
+/// bit-identical output.
+///
+/// Beyond the two buckets above: NOCOVR rings are not guaranteed to nest
+/// inside their COVR exterior, so a structural `Polygon::new(ext,
+/// vec![hole])` (which requires strict containment) silently breaks geo's
+/// `BooleanOps` when violated — intersection degenerates to returning the
+/// other operand unchanged. A boolean [`BooleanOps::difference`] is correct
+/// regardless of nesting, which is why it's used here instead.
+///
+/// Overlapping COVR exteriors, NOCOVR rings that match no COVR exterior,
+/// and full-erasure NOCOVR rings are data-quality issues, not parse
+/// failures: they are logged and handled best-effort rather than panicking.
 fn decode_covr(source: &str, covr: &[LineString], no_covr: &[LineString]) -> MultiPolygon {
     // OESU COVR/NOCOVR rings arrive with occasional duplicate consecutive
     // coords (zero-length edges) and may not be closed. Deduplicate and
@@ -768,7 +811,7 @@ fn decode_covr(source: &str, covr: &[LineString], no_covr: &[LineString]) -> Mul
         }
         let removed = ring.0.len() - coords.len();
         if removed > 0 {
-            tracing::warn!(
+            tracing::info!(
                 source,
                 kind,
                 index,
@@ -816,7 +859,27 @@ fn decode_covr(source: &str, covr: &[LineString], no_covr: &[LineString]) -> Mul
                 continue;
             }
             claimed.insert(index);
-            remaining = remaining.difference(int);
+            let before_area = remaining.unsigned_area();
+            let after = remaining.difference(int);
+            if before_area > 0.0 && after.unsigned_area() == 0.0 {
+                // A NOCOVR ring that fully overlaps a COVR exterior's entire
+                // remaining area isn't a genuine data gap — real gaps carve a
+                // partial notch out of charted data. Full erasure is this
+                // corpus's other common NOCOVR shape: a clean rectangle equal
+                // to the cell's nominal grid extent, emitted regardless of
+                // how many/what shape COVR pieces it actually contains.
+                // Trusting it here would silently render real charted islands
+                // as blank. Keep the area, warn instead.
+                tracing::info!(
+                    source,
+                    index,
+                    "NOCOVR ring fully overlaps a COVR exterior's remaining area \
+                     (likely a nominal-extent placeholder, not a real data gap); \
+                     ignoring it for this exterior and keeping the COVR area"
+                );
+                continue;
+            }
+            remaining = after;
         }
         polys.extend(remaining);
     }
