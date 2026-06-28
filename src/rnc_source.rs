@@ -4,19 +4,21 @@
 //! resampling: each destination pixel is projected back to `WGS-84`, tested
 //! against this item's exact contribution polygon for the tile (the real
 //! `cover` shape from the footer, not just its bounding box — see
-//! `crate::rnc::cover_to_multipolygon`), and — if inside — reprojected into
-//! the source cell's own (non-`WGS-84`) grid to pick a source pixel.
-//! Nearest-neighbour sampling; see [`render`](TileSource::render) for why
-//! that's sufficient for a first pass.
+//! `rnc_format::RncFooter::coverage`), and — if inside — reprojected via
+//! [`rnc_format::locate_grid_cell`] into the source cell's own grid to
+//! pick a source pixel. Nearest-neighbour sampling; see
+//! [`render`](TileSource::render) for why that's sufficient for a first
+//! pass.
 
 use anyhow::{Context, Result};
 use geo::{Contains, MultiPolygon, Point};
 use image::RgbaImage;
 use martin_tile_utils::webmercator_to_wgs84;
 use pmtiles::TileType;
+use rnc_format::locate_grid_cell;
 
 use crate::bbox::Bbox;
-use crate::rnc::{RncCell, wgs84_to_nv_merc};
+use crate::rnc::RncCell;
 use crate::tile_geom::TileGeom;
 use crate::tile_source::TileSource;
 
@@ -100,11 +102,8 @@ impl TileSource for RncCell {
                     continue;
                 }
 
-                let (x, y) = wgs84_to_nv_merc(lon, lat);
-                let u = ((x - xmin) / (xmax - xmin)).clamp(0.0, 0.999_999_9);
-                let v = ((y - ymin) / (ymax - ymin)).clamp(0.0, 0.999_999_9);
-                let col = (u * f64::from(cols)).floor() as u32;
-                let row = (v * f64::from(rows)).floor() as u32;
+                let (col, row, lu, lv) =
+                    locate_grid_cell(lon, lat, (xmin, ymin, xmax, ymax), cols, rows);
                 let n = row * cols + col;
 
                 let img = match &current {
@@ -133,8 +132,6 @@ impl TileSource for RncCell {
                 if img_w == 0 || img_h == 0 {
                     continue;
                 }
-                let lu = u * f64::from(cols) - f64::from(col);
-                let lv = v * f64::from(rows) - f64::from(row);
                 let sx = ((lu * f64::from(img_w)) as u32).min(img_w - 1);
                 let sy = ((lv * f64::from(img_h)) as u32).min(img_h - 1);
                 let p = img.get_pixel(sx, sy);
@@ -317,7 +314,7 @@ mod tests {
         vertices
             .iter()
             .flat_map(|&(lon, lat)| {
-                let (x, y) = crate::rnc::wgs84_to_nv_merc(lon, lat);
+                let (x, y) = rnc_format::wgs84_to_rnc_merc(lon, lat);
                 [x, y]
             })
             .collect()

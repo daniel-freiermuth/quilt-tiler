@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "oesu", "s57"]
+members = [".", "oesu", "s57", "rnc-format"]
 
 [package]
 name = "quilt-tiler"
@@ -25,6 +25,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 geo = { version = "0.33.1", default-features = false, features = ["earcut", "spade"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 serde = { version = "1.0.228", features = ["derive"] }
+rnc-format      = { path = "rnc-format" }
 
 [lints.rust]
 unsafe_code = "forbid"

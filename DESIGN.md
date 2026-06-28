@@ -382,7 +382,7 @@ scale. Fully self-describing: no sidecar `index.json` needed (`src/rnc.rs` re-de
 Mercator projection — a different sphere radius than standard `WebMercator`/`EPSG:3857`
 (mean-radius sphere vs. WGS-84 equatorial-radius sphere, ~0.1% circumference difference).
 Reprojecting source pixels into output tiles therefore always routes through `WGS-84` as
-the common intermediate (`webmercator_to_wgs84` → `wgs84_to_nv_merc`), never mixing the
+the common intermediate (`webmercator_to_wgs84` → `wgs84_to_rnc_merc`), never mixing the
 two Mercator flavours' metre values directly.
 
 **Output:** one `PMTiles` archive per run, `TileType::Png`, 256×256 tiles (the universal
