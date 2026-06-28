@@ -23,6 +23,8 @@ serde_json      = "1"
 tracing         = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 geo = { version = "0.33.1", default-features = false, features = ["earcut", "spade"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+serde = { version = "1.0.228", features = ["derive"] }
 
 [lints.rust]
 unsafe_code = "forbid"

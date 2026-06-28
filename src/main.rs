@@ -7,6 +7,8 @@
 
 mod bbox;
 mod lattice;
+mod rnc;
+mod rnc_source;
 mod s57_source;
 mod style;
 mod tile_geom;
@@ -74,11 +76,15 @@ use tracing::{debug, info, warn};
 
 use zoom::zoom_from_scale;
 
-/// Convert decrypted OESU chart files to a `PMTiles` vector tile archive and a `MapLibre` GL style.
+/// Convert decrypted `OESU`/`OSENC` vector charts or raster `.rnc`
+/// cells into a `PMTiles` tile archive and a `MapLibre` GL style.
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
-    /// Decrypted `.oesu` files to convert (glob or explicit paths).
+    /// Input chart files to convert (glob or explicit paths): decrypted
+    /// `.oesu`/`.osenc` vector cells, or raster `.rnc` cells.
+    /// All inputs in one run must be the same kind — `PMTiles` stores one
+    /// tile type (vector MVT or raster PNG) per archive.
     #[arg(required = true)]
     input: Vec<PathBuf>,
 
@@ -96,15 +102,16 @@ struct Args {
     #[arg(long)]
     tile_url: Option<String>,
 
-    /// Depth (metres) at or above which water is considered dangerous.
-    /// DEPARE areas shallower than this get the darkest fill; the DEPCNT
-    /// contour at exactly this depth is drawn as a prominent red line.
+    /// Vector input only. Depth (metres) at or above which water is
+    /// considered dangerous. DEPARE areas shallower than this get the
+    /// darkest fill; the DEPCNT contour at exactly this depth is drawn as a
+    /// prominent red line.
     #[arg(long, default_value_t = 3.0)]
     safety_depth: f64,
 
-    /// Upper boundary of the "shallow but navigable" zone (metres).
-    /// DEPARE areas between `safety_depth` and this value get a medium fill;
-    /// deeper areas get the lightest fill.
+    /// Vector input only. Upper boundary of the "shallow but navigable"
+    /// zone (metres). DEPARE areas between `safety_depth` and this value
+    /// get a medium fill; deeper areas get the lightest fill.
     #[arg(long, default_value_t = 10.0)]
     shoal_depth: f64,
 
@@ -126,8 +133,6 @@ struct Args {
     zoom_offset: f64,
 }
 
-// Rayon pool setup + style/metadata output push main past 100 lines. Accept.
-#[allow(clippy::too_many_lines)]
 fn main() -> Result<()> {
     // Tracy must start before rayon spins up its workers so every thread
     // is registered with the profiler from the moment it first runs.
@@ -163,6 +168,46 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    // PMTiles stores one tile type per archive, so a run's inputs must be
+    // uniformly vector or uniformly raster — dispatch on extension and
+    // fail fast on a mix rather than silently dropping one kind.
+    let raster_count = args.input.iter().filter(|p| is_rnc(p)).count();
+    match raster_count {
+        0 => run_vector(&args),
+        n if n == args.input.len() => run_raster(&args),
+        n => anyhow::bail!(
+            "cannot mix raster (.rnc) and vector inputs in one run ({n} of {} inputs are .rnc); convert them separately",
+            args.input.len()
+        ),
+    }
+}
+
+/// `true` if `path`'s extension is `.rnc` (a raster cell), case-insensitive.
+fn is_rnc(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("rnc"))
+}
+
+/// Derive `(source_id, chart_name, tile_url)` from CLI args — shared by the
+/// vector and raster pipelines.
+fn output_identity(args: &Args) -> (String, String, String) {
+    let source_id = args
+        .output
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("chart")
+        .to_owned();
+    let chart_name = args.name.clone().unwrap_or_else(|| source_id.clone());
+    let tile_url = args
+        .tile_url
+        .clone()
+        .unwrap_or_else(|| format!("http://localhost:3000/{source_id}/{{z}}/{{x}}/{{y}}"));
+    (source_id, chart_name, tile_url)
+}
+
+/// Convert decrypted `OESU`/`OSENC` vector cells into an MVT `PMTiles` archive.
+fn run_vector(args: &Args) -> Result<()> {
     // Parse all input files in parallel; skip files that fail to parse.
     let cells: Vec<s57::S57Cell> = args
         .input
@@ -224,21 +269,12 @@ fn main() -> Result<()> {
     let (min_zoom, out_max_zoom) =
         tiles::write_pmtiles(&cells, &args.output, args.max_zoom, args.zoom_offset)?;
 
-    // Derive output siblings from the PMTiles path unless overridden.
-    let source_id = args
-        .output
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("chart")
-        .to_owned();
-    let chart_name = args.name.unwrap_or_else(|| source_id.clone());
-    let tile_url = args
-        .tile_url
-        .unwrap_or_else(|| format!("http://localhost:3000/{source_id}/{{z}}/{{x}}/{{y}}"));
+    let (source_id, chart_name, tile_url) = output_identity(args);
 
     // Write style.json
     let style_path = args
         .style_output
+        .clone()
         .unwrap_or_else(|| args.output.with_extension("style.json"));
     let style_filename = style_path
         .file_name()
@@ -270,6 +306,105 @@ fn main() -> Result<()> {
         "bounds":      bounds,
         "tilemapUrl":  tile_url,
         "styleUrl":    style_filename,
+    });
+    std::fs::write(&meta_path, serde_json::to_string_pretty(&metadata)?)
+        .with_context(|| format!("writing metadata to {}", meta_path.display()))?;
+    info!(path = %meta_path.display(), "metadata written");
+
+    Ok(())
+}
+
+/// Convert raster `.rnc` cells into a PNG `PMTiles` archive.
+fn run_raster(args: &Args) -> Result<()> {
+    // Parse all input files in parallel; skip files that fail to parse.
+    let cells: Vec<rnc::RncCell> = args
+        .input
+        .par_iter()
+        .filter_map(|path| {
+            profiling::scope!("parse");
+            #[cfg(feature = "profiling")]
+            let _frame = tracy_client::non_continuous_frame!("parse");
+            let data = match std::fs::read(path) {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(file = %path.display(), error = %e, "cannot read");
+                    return None;
+                }
+            };
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("cell")
+                .to_owned();
+            match rnc::RncCell::parse(name.clone(), data) {
+                Ok(cell) => {
+                    let z = zoom_from_scale(rnc::RncCell::native_scale(&cell), args.zoom_offset);
+                    debug!(
+                        name = %name,
+                        scale = rnc::RncCell::native_scale(&cell),
+                        zoom = z,
+                        cols = cell.cols(),
+                        rows = cell.rows(),
+                        "parsed"
+                    );
+                    Some(cell)
+                }
+                Err(e) => {
+                    warn!(file = %path.display(), error = %e, "skipping");
+                    None
+                }
+            }
+        })
+        .collect();
+
+    info!(parsed = cells.len(), "raster cells parsed, writing tiles");
+
+    // Aggregate geographic bounds from parsed cells for metadata.
+    let bounds = cells.iter().fold(
+        [
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ],
+        |mut acc, c| {
+            let b = c.bbox();
+            acc[0] = acc[0].min(b.west);
+            acc[1] = acc[1].min(b.south);
+            acc[2] = acc[2].max(b.east);
+            acc[3] = acc[3].max(b.north);
+            acc
+        },
+    );
+
+    let (min_zoom, out_max_zoom) =
+        tiles::write_pmtiles(&cells, &args.output, args.max_zoom, args.zoom_offset)?;
+
+    let (source_id, chart_name, tile_url) = output_identity(args);
+
+    // Write style.json (MapLibre raster style — no vector layer styling needed)
+    let style_path = args
+        .style_output
+        .clone()
+        .unwrap_or_else(|| args.output.with_extension("style.json"));
+    let style_json = style::build_raster_style(&tile_url, min_zoom, out_max_zoom);
+    std::fs::write(&style_path, &style_json)
+        .with_context(|| format!("writing style to {}", style_path.display()))?;
+    info!(path = %style_path.display(), "style written");
+
+    // Write metadata.json (Signal K charts plugin format: raster "tilelayer")
+    let meta_path = args.output.with_extension("metadata.json");
+    let metadata = serde_json::json!({
+        "id":          source_id,
+        "name":        chart_name,
+        "description": "RNCs cells converted by quilt-tiler",
+        "type":        "tilelayer",
+        "format":      "png",
+        "created":     chrono_now(),
+        "minZoom":     min_zoom,
+        "maxZoom":     out_max_zoom,
+        "bounds":      bounds,
+        "tilemapUrl":  tile_url,
     });
     std::fs::write(&meta_path, serde_json::to_string_pretty(&metadata)?)
         .with_context(|| format!("writing metadata to {}", meta_path.display()))?;

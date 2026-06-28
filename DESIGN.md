@@ -364,3 +364,37 @@ the next finer chart takes over (i.e., the next finer chart's `minzoom - 1`).
 - SERVER_STATUS payload: 6 × u16 (serverStatus, decryptStatus, expireStatus,
   expireDaysRemaining, graceDaysAllowed, graceDaysRemaining)
 - Authoritative reference: `o-charts_pi/src/Osenc.cpp` + `Osenc.h`
+
+
+---
+
+## Raster Charts (`.rnc`)
+
+Note: `.rnc` is unrelated to `.oernc` (OpenCPN's
+encrypted BSB raster, rejected by `oesu::parse_file` above) — same letters, different
+publishers, different binary formats, no relation.
+
+**Source format:** `.rnc` files — a header (grid `cols`×`rows`), a byte-offset table, `cols*rows` packed
+raw PNG blobs, and a trailing JSON footer with the cell's `WGS-84` bounds and native
+scale. Fully self-describing: no sidecar `index.json` needed (`src/rnc.rs` re-derives everything from the footer).
+
+**Projection:** `RNC` tiles are laid out on a grid uniform in *its own* spherical
+Mercator projection — a different sphere radius than standard `WebMercator`/`EPSG:3857`
+(mean-radius sphere vs. WGS-84 equatorial-radius sphere, ~0.1% circumference difference).
+Reprojecting source pixels into output tiles therefore always routes through `WGS-84` as
+the common intermediate (`webmercator_to_wgs84` → `wgs84_to_nv_merc`), never mixing the
+two Mercator flavours' metre values directly.
+
+**Output:** one `PMTiles` archive per run, `TileType::Png`, 256×256 tiles (the universal
+raster-tile default). `write_pmtiles`'s generic quilting loop (coverage-based candidate
+selection, greedy uncovered-area tracking) is unchanged — raster cells use `Coverage =
+Bbox` (axis-aligned, no exact-shaped `COVR`/`NOCOVR` polygons like S-57), so each output
+tile's `render()` call rasterises by nearest-neighbour resampling rather than rendering
+vector features. `PMTiles` stores one tile type per archive, so a run's inputs must be
+uniformly vector or uniformly raster (`main.rs` dispatches on `.rnc` extension and
+rejects a mix rather than silently dropping one kind).
+
+**Why nearest-neighbour, not bilinear/area-averaged:** simplest correct option for a
+first pass; chart raster scans look like scans either way at typical zoom mismatch.
+Revisit with profiling/visual evidence if it's not good enough — no evidence yet that
+it isn't.

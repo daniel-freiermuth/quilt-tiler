@@ -131,6 +131,41 @@ pub fn build_style(
     serde_json::to_string_pretty(&style).expect("style serialisation cannot fail")
 }
 
+/// Build a minimal `MapLibre` GL raster style for a PNG tile source.
+///
+/// Unlike [`build_style`], there is no vector layer styling to generate —
+/// a raster source only needs a `tileSize` and one `raster` layer.
+///
+/// # Parameters
+/// * `tile_url` — full PNG tile URL template, e.g.
+///   `http://localhost:3000/chart/{z}/{x}/{y}`.
+/// * `min_zoom` / `max_zoom` — zoom range for the tile source.
+pub fn build_raster_style(tile_url: &str, min_zoom: u8, max_zoom: u8) -> String {
+    use serde_json::json;
+
+    let style = json!({
+        "version": 8,
+        "sources": {
+            "raster": {
+                "type": "raster",
+                "tiles": [tile_url],
+                "tileSize": crate::rnc_source::TILE_PX,
+                "minzoom": min_zoom,
+                "maxzoom": max_zoom,
+            }
+        },
+        "layers": [
+            {
+                "id": "raster",
+                "type": "raster",
+                "source": "raster",
+            }
+        ]
+    });
+
+    serde_json::to_string_pretty(&style).expect("style serialisation cannot fail")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
