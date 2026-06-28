@@ -86,6 +86,12 @@ pub fn write_pmtiles<S: TileSource>(
             .progress_with(pb.clone())
             .map(|idx| -> Result<Option<EncodedTile>> {
                 profiling::scope!("tile");
+                // Tiles are encoded across rayon worker threads concurrently, so a
+                // single global frame mark doesn't fit; Tracy's non-continuous
+                // (secondary) frame set supports overlapping FrameMarkStart/End
+                // pairs and renders each tile as its own row in the Frames panel.
+                #[cfg(feature = "profiling")]
+                let _frame = tracy_client::non_continuous_frame!("tile");
                 #[allow(clippy::cast_possible_truncation)] // idx % width < width ≤ u32::MAX
                 let col = col_lo + (idx % u64::from(width)) as u32;
                 #[allow(clippy::cast_possible_truncation)] // idx / width < height ≤ u32::MAX
@@ -173,12 +179,18 @@ pub fn write_pmtiles<S: TileSource>(
         .context("creating PMTiles writer")?;
 
     let pb_write = ProgressBar::new(tile_bytes.len() as u64).with_style(bar_style());
-    for (_, (coord, bytes)) in tile_bytes {
-        writer.add_tile(coord, &bytes).context("writing tile")?;
-        pb_write.inc(1);
+    {
+        profiling::scope!("writing pmtiles");
+        for (_, (coord, bytes)) in tile_bytes {
+            writer.add_tile(coord, &bytes).context("writing tile")?;
+            pb_write.inc(1);
+        }
     }
     pb_write.finish_and_clear();
-    writer.finalize().context("finalizing PMTiles")?;
+    {
+        profiling::scope!("finalizing pmtiles");
+        writer.finalize().context("finalizing PMTiles")?;
+    }
 
     info!(output = %output.display(), "PMTiles written");
     Ok((zoom_floor, zoom_ceil))

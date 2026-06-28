@@ -168,6 +168,13 @@ fn main() -> Result<()> {
         .input
         .par_iter()
         .filter_map(|path| {
+            profiling::scope!("parse");
+            // Mirrors the per-tile frame in tiles.rs: parsing is also a
+            // parallel rayon batch over independent units (input files), so
+            // it gets its own non-continuous (secondary) frame set rather
+            // than reusing "tile".
+            #[cfg(feature = "profiling")]
+            let _frame = tracy_client::non_continuous_frame!("parse");
             let data = match std::fs::read(path) {
                 Ok(d) => d,
                 Err(e) => {
