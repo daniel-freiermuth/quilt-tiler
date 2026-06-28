@@ -14,18 +14,22 @@
 //! ...                                   trailing JSON footer (marker `{"cover"`)
 //! ```
 //!
-//! The footer carries the cell's `WGS-84` bounds and native scale — exactly what
+//! The footer carries the cell's `WGS-84` bounds, native scale, and (when
+//! present) an exact coverage polygon — exactly what
 //! [`crate::tile_source::TileSource`] needs, with no separate catalog lookup.
 //!
 //! Tiles are laid out on a grid uniform in its own spherical Mercator
 //! projection (not `WGS-84`), so resampling a tile (see `crate::rnc_source`)
-//! has to reproject through that same projection — see [`wgs84_to_nv_merc`].
+//! has to reproject through that same projection — see [`wgs84_to_nv_merc`]
+//! and its inverse, [`nv_merc_to_wgs84`].
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{Context, Result, bail};
+use geo::{Area, Coord, LineString, MultiPolygon, Polygon, coord};
 use image::RgbaImage;
+use serde::Deserialize;
 
 use crate::bbox::Bbox;
 
@@ -53,6 +57,17 @@ pub fn wgs84_to_nv_merc(lon: f64, lat: f64) -> (f64, f64) {
     (x, y)
 }
 
+/// Internal Mercator (x, y) in metres → `WGS-84` (lon, lat) in degrees.
+///
+/// Inverse of [`wgs84_to_nv_merc`] — mirrors `merc_to_wgs84`:
+/// `lon = x/BASE*360 - 180`, `lat = atan(sinh(π - 2π·y/BASE))·180/π`.
+pub fn nv_merc_to_wgs84(x: f64, y: f64) -> (f64, f64) {
+    let lon = (x / MERC_SPHERE_BASE).mul_add(360.0, -180.0);
+    let inner = (2.0 * std::f64::consts::PI).mul_add(-(y / MERC_SPHERE_BASE), std::f64::consts::PI);
+    let lat = inner.sinh().atan().to_degrees();
+    (lon, lat)
+}
+
 /// Trailing JSON footer embedded in every `.rnc` file (marker `{"cover"`).
 #[derive(serde::Deserialize, Debug)]
 struct RncFooter {
@@ -62,6 +77,75 @@ struct RncFooter {
     lon1: f64,
     /// Scale denominator, e.g. `3_000_000.0`.
     scale: f64,
+    /// Coverage polygon, internal Mercator metres.
+    ///
+    /// Real files store this as a
+    /// **flat** single ring `[x0, y0, x1, y1, …]`. No official schema
+    /// either way, so [`deserialize_cover`] accepts both shapes defensively
+    /// and normalizes to "list of rings". Falls back to the bbox rectangle
+    /// (see [`RncCell::parse`]) when absent, empty, or degenerate.
+    #[serde(default, deserialize_with = "deserialize_cover")]
+    cover: Vec<Vec<f64>>,
+}
+
+/// Normalize `cover` into "list of rings" regardless of whether the source
+/// JSON nests rings (`[[x0,y0,…], [x1,y1,…]]`) or — as observed in real
+/// `.rnc` files — gives one flat ring (`[x0,y0,x1,y1,…]`) directly.
+fn deserialize_cover<'de, D>(deserializer: D) -> std::result::Result<Vec<Vec<f64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let Some(items) = value.as_array() else {
+        return Ok(Vec::new());
+    };
+    let is_nested = items.first().is_some_and(serde_json::Value::is_array);
+    if is_nested {
+        Ok(items
+            .iter()
+            .map(|ring| {
+                ring.as_array()
+                    .map(|r| r.iter().filter_map(serde_json::Value::as_f64).collect())
+                    .unwrap_or_default()
+            })
+            .collect())
+    } else {
+        let ring: Vec<f64> = items.iter().filter_map(serde_json::Value::as_f64).collect();
+        Ok(if ring.is_empty() {
+            Vec::new()
+        } else {
+            vec![ring]
+        })
+    }
+}
+
+/// Convert footer `cover` rings (flat internal-Mercator `x, y` pairs) into a
+/// `WGS-84` [`MultiPolygon`]. Each ring becomes an independent exterior (no
+/// holes; degenerate rings
+/// (fewer than 3 points, zero area) are dropped. Returns `None` when nothing
+/// usable remains, so the caller can fall back to the bbox rectangle.
+fn cover_to_multipolygon(rings: &[Vec<f64>]) -> Option<MultiPolygon> {
+    let polygons: Vec<Polygon> = rings
+        .iter()
+        .filter_map(|ring| {
+            if ring.len() < 6 || ring.len() % 2 != 0 {
+                return None; // need at least 3 points (6 numbers)
+            }
+            let mut coords: Vec<Coord> = ring
+                .chunks_exact(2)
+                .map(|p| {
+                    let (lon, lat) = nv_merc_to_wgs84(p[0], p[1]);
+                    coord! { x: lon, y: lat }
+                })
+                .collect();
+            if coords.first() != coords.last() {
+                coords.push(coords[0]);
+            }
+            let poly = Polygon::new(LineString::new(coords), vec![]);
+            (poly.unsigned_area() > 0.0).then_some(poly)
+        })
+        .collect();
+    (!polygons.is_empty()).then(|| MultiPolygon::new(polygons))
 }
 
 /// Locate and parse the trailing JSON footer.
@@ -100,6 +184,10 @@ pub struct RncCell {
     rows: u32,
     /// `WGS-84` bounding box, parsed from the footer.
     bbox: Bbox,
+    /// Exact `WGS-84` coverage polygon — the footer's `cover` rings when
+    /// present and valid, else `bbox` as a rectangle (see
+    /// [`cover_to_multipolygon`]).
+    coverage: MultiPolygon,
     /// Cell extent in special Mercator metres: `(xmin, ymin, xmax, ymax)`.
     /// `ymin` is the NORTH edge (smaller `y` = higher latitude).
     merc: (f64, f64, f64, f64),
@@ -175,6 +263,14 @@ impl RncCell {
             bail!("degenerate cell extent: bbox {bbox:?}");
         }
 
+        let coverage = cover_to_multipolygon(&footer.cover).unwrap_or_else(|| {
+            tracing::debug!(
+                name,
+                "no usable cover polygon in footer, using bbox rectangle"
+            );
+            MultiPolygon::from(bbox)
+        });
+
         let native_scale = footer.scale.round().clamp(1.0, f64::from(u32::MAX)) as u32;
 
         Ok(Self {
@@ -184,6 +280,7 @@ impl RncCell {
             cols,
             rows,
             bbox,
+            coverage,
             merc: (xmin, ymin, xmax, ymax),
             native_scale,
             cache: Mutex::new(HashMap::new()),
@@ -196,6 +293,10 @@ impl RncCell {
 
     pub const fn bbox(&self) -> Bbox {
         self.bbox
+    }
+
+    pub fn coverage(&self) -> MultiPolygon {
+        self.coverage.clone()
     }
 
     pub const fn native_scale(&self) -> u32 {
@@ -266,11 +367,9 @@ mod tests {
     fn build_rnc(
         cols: u32,
         rows: u32,
-        lon0: f64,
-        lat0: f64,
-        lon1: f64,
-        lat1: f64,
+        (lon0, lat0, lon1, lat1): (f64, f64, f64, f64),
         scale: f64,
+        cover: &[Vec<f64>],
     ) -> Vec<u8> {
         let png = solid_png(4, 4, [255, 0, 0, 255]);
         let n_tiles = cols * rows;
@@ -296,7 +395,7 @@ mod tests {
             buf.extend_from_slice(&png);
         }
         let footer = serde_json::json!({
-            "cover": [],
+            "cover": cover,
             "lat0": lat0, "lat1": lat1, "lon0": lon0, "lon1": lon1,
             "edate": "01/01/2026", "name": "TEST", "scale": scale,
         });
@@ -306,7 +405,7 @@ mod tests {
 
     #[test]
     fn parses_header_bbox_and_scale() {
-        let data = build_rnc(2, 3, 11.0, 57.0, 12.0, 58.0, 3_000_000.0);
+        let data = build_rnc(2, 3, (11.0, 57.0, 12.0, 58.0), 3_000_000.0, &[]);
         let cell = RncCell::parse("TEST".to_owned(), data).expect("valid .rnc parses");
         assert_eq!(cell.cols(), 2);
         assert_eq!(cell.rows(), 3);
@@ -321,7 +420,7 @@ mod tests {
     #[test]
     fn normalizes_swapped_footer_corners() {
         // lat0/lon0 given as the "max" corner — parser must not assume order.
-        let data = build_rnc(1, 1, 12.0, 58.0, 11.0, 57.0, 1_000_000.0);
+        let data = build_rnc(1, 1, (12.0, 58.0, 11.0, 57.0), 1_000_000.0, &[]);
         let cell = RncCell::parse("TEST".to_owned(), data).expect("valid .rnc parses");
         let b = cell.bbox();
         assert!((b.west - 11.0).abs() < 1e-9);
@@ -330,7 +429,7 @@ mod tests {
 
     #[test]
     fn decodes_subtile_pixels() {
-        let data = build_rnc(2, 1, 11.0, 57.0, 12.0, 58.0, 3_000_000.0);
+        let data = build_rnc(2, 1, (11.0, 57.0, 12.0, 58.0), 3_000_000.0, &[]);
         let cell = RncCell::parse("TEST".to_owned(), data).expect("valid .rnc parses");
         let img = cell.subtile_image(0).expect("subtile decodes");
         assert_eq!(img.get_pixel(0, 0).0, [255, 0, 0, 255]);
@@ -356,7 +455,7 @@ mod tests {
 
     #[test]
     fn rejects_missing_footer() {
-        let mut data = build_rnc(1, 1, 11.0, 57.0, 12.0, 58.0, 3_000_000.0);
+        let mut data = build_rnc(1, 1, (11.0, 57.0, 12.0, 58.0), 3_000_000.0, &[]);
         // Truncate right after the PNG blob, dropping the JSON footer.
         let png_len = solid_png(4, 4, [255, 0, 0, 255]).len();
         let blobs_start = 16 + (1u32 + 2) * 4;
@@ -375,5 +474,60 @@ mod tests {
         let (x0, y0) = wgs84_to_nv_merc(0.0, 0.0);
         assert!((x0 - MERC_SPHERE_BASE / 2.0).abs() < 1e-6);
         assert!((y0 - MERC_SPHERE_BASE / 2.0).abs() < 1e-6);
+    }
+
+    /// Flatten WGS-84 ring vertices into the footer's special Mercator
+    /// `[x0, y0, x1, y1, …]` shape.
+    #[allow(clippy::tuple_array_conversions)] // [x, y] is the natural flat_map yield shape
+    fn cover_ring(vertices: &[(f64, f64)]) -> Vec<f64> {
+        vertices
+            .iter()
+            .flat_map(|&(lon, lat)| {
+                let (x, y) = wgs84_to_nv_merc(lon, lat);
+                [x, y]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mercator_projection_round_trips() {
+        for (lon, lat) in [(11.8, 57.7), (-179.0, -60.0), (0.0, 0.0), (179.0, 80.0)] {
+            let (x, y) = wgs84_to_nv_merc(lon, lat);
+            let (lon2, lat2) = nv_merc_to_wgs84(x, y);
+            assert!((lon - lon2).abs() < 1e-9, "lon round-trip: {lon} -> {lon2}");
+            assert!((lat - lat2).abs() < 1e-9, "lat round-trip: {lat} -> {lat2}");
+        }
+    }
+
+    #[test]
+    fn cover_polygon_is_smaller_than_bbox_when_present() {
+        // Triangle over the SW/SE/NE corners of the 11-12E, 57-58N bbox —
+        // omits the NW corner, so its area is exactly half the rectangle's.
+        let bbox = Bbox {
+            west: 11.0,
+            south: 57.0,
+            east: 12.0,
+            north: 58.0,
+        };
+        let triangle = cover_ring(&[(11.0, 57.0), (12.0, 57.0), (12.0, 58.0)]);
+        let data = build_rnc(1, 1, (11.0, 57.0, 12.0, 58.0), 3_000_000.0, &[triangle]);
+        let cell = RncCell::parse("TEST".to_owned(), data).expect("valid .rnc parses");
+
+        let bbox_area = Polygon::from(bbox).unsigned_area();
+        let cover_area = cell.coverage().unsigned_area();
+        assert!(
+            (cover_area - bbox_area / 2.0).abs() < bbox_area * 1e-6,
+            "triangle cover ({cover_area}) should be half the bbox rectangle ({bbox_area})"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_bbox_rectangle_when_cover_is_degenerate() {
+        // A two-point "ring" (4 numbers) has no area — must be dropped.
+        let degenerate = vec![1.0, 2.0, 3.0, 4.0];
+        let data = build_rnc(1, 1, (11.0, 57.0, 12.0, 58.0), 3_000_000.0, &[degenerate]);
+        let cell = RncCell::parse("TEST".to_owned(), data).expect("valid .rnc parses");
+        let bbox_area = Polygon::from(cell.bbox()).unsigned_area();
+        assert!((cell.coverage().unsigned_area() - bbox_area).abs() < 1e-9);
     }
 }

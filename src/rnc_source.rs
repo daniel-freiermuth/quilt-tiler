@@ -2,12 +2,15 @@
 //!
 //! Unlike the vector path ([`crate::s57_source`]), a raster tile is built by
 //! resampling: each destination pixel is projected back to `WGS-84`, tested
-//! against this item's exact contribution rectangle for the tile, and — if
-//! inside — reprojected into the source cell's own (non-`WGS-84`) grid to
-//! pick a source pixel. Nearest-neighbour sampling; see [`render`](TileSource::render)
-//! for why that's sufficient for a first pass.
+//! against this item's exact contribution polygon for the tile (the real
+//! `cover` shape from the footer, not just its bounding box — see
+//! `crate::rnc::cover_to_multipolygon`), and — if inside — reprojected into
+//! the source cell's own (non-`WGS-84`) grid to pick a source pixel.
+//! Nearest-neighbour sampling; see [`render`](TileSource::render) for why
+//! that's sufficient for a first pass.
 
 use anyhow::{Context, Result};
+use geo::{Contains, MultiPolygon, Point};
 use image::RgbaImage;
 use martin_tile_utils::webmercator_to_wgs84;
 use pmtiles::TileType;
@@ -26,14 +29,14 @@ impl TileSource for RncCell {
     /// top-left (north-west) corner. Transparent (`alpha = 0`) outside this
     /// item's contribution area for the tile.
     type Content = Vec<u8>;
-    type Coverage = Bbox;
+    type Coverage = MultiPolygon;
 
     fn source(&self) -> String {
         self.name().to_owned()
     }
 
     fn coverage(&self) -> Self::Coverage {
-        self.bbox()
+        Self::coverage(self)
     }
 
     fn native_scale(&self) -> u32 {
@@ -57,12 +60,14 @@ impl TileSource for RncCell {
     fn render(&self, tile: &TileGeom) -> Self::Content {
         let mut buf = vec![0u8; (TILE_PX * TILE_PX * 4) as usize];
 
-        // This item's exact contribution rectangle for this tile (already
+        // This item's exact contribution polygon for this tile (already
         // clipped by the quilting loop in `tiles::write_pmtiles` so disjoint
-        // contributors never double-paint). `Coverage = Bbox` is always
-        // axis-aligned, so `tile.geom`'s bounding rect *is* the contribution.
-        let contrib = Bbox::from(&tile.geom);
-        if contrib.is_bottom() {
+        // contributors never double-paint). `contrib_bbox` is a cheap
+        // broad-phase rejection before the exact-but-pricier polygon test
+        // below — most pixels in a partially-covered tile are unambiguously
+        // outside it.
+        let contrib_bbox = Bbox::from(&tile.geom);
+        if contrib_bbox.is_bottom() {
             return buf;
         }
 
@@ -86,10 +91,11 @@ impl TileSource for RncCell {
                     ((f64::from(px) + 0.5) / f64::from(TILE_PX)).mul_add(merc_w, tile.merc.west);
                 let (lon, lat) = webmercator_to_wgs84(x_m, y_m);
 
-                if lon < contrib.west
-                    || lon > contrib.east
-                    || lat < contrib.south
-                    || lat > contrib.north
+                if lon < contrib_bbox.west
+                    || lon > contrib_bbox.east
+                    || lat < contrib_bbox.south
+                    || lat > contrib_bbox.north
+                    || !tile.geom.contains(&Point::new(lon, lat))
                 {
                     continue;
                 }
@@ -302,6 +308,99 @@ mod tests {
             .to_rgba8();
         assert_eq!(img.get_pixel(0, 0).0, [255, 0, 0, 255]);
         assert_eq!(img.get_pixel(TILE_PX - 1, 0).0, [0, 255, 0, 255]);
+    }
+
+    /// Flatten WGS-84 ring vertices into the footer's Mercator
+    /// `[x0, y0, x1, y1, …]` shape (mirrors `crate::rnc::tests::cover_ring`).
+    #[allow(clippy::tuple_array_conversions)] // [x, y] is the natural flat_map yield shape
+    fn cover_ring(vertices: &[(f64, f64)]) -> Vec<f64> {
+        vertices
+            .iter()
+            .flat_map(|&(lon, lat)| {
+                let (x, y) = crate::rnc::wgs84_to_nv_merc(lon, lat);
+                [x, y]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn render_honors_non_rectangular_cover_polygon() {
+        let bbox = Bbox {
+            west: 11.0,
+            south: 57.0,
+            east: 12.0,
+            north: 58.0,
+        };
+        // Triangle over SW/SE/NE — excludes the NW corner of the bbox.
+        let triangle = cover_ring(&[(11.0, 57.0), (12.0, 57.0), (12.0, 58.0)]);
+        let png = {
+            let img = RgbaImage::from_pixel(8, 8, Rgba([200, 30, 30, 255]));
+            let mut out = Vec::new();
+            img.write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
+                .unwrap();
+            out
+        };
+        let n_offsets = 3u32;
+        let blobs_start = 16 + n_offsets * 4;
+        let offsets = [
+            blobs_start,
+            blobs_start + u32::try_from(png.len()).unwrap(),
+            blobs_start + u32::try_from(png.len()).unwrap(),
+        ];
+        let mut data = vec![0u8; 8];
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        for o in &offsets {
+            data.extend_from_slice(&o.to_le_bytes());
+        }
+        data.extend_from_slice(&png);
+        let footer = serde_json::json!({
+            "cover": [triangle],
+            "lat0": bbox.south, "lat1": bbox.north,
+            "lon0": bbox.west, "lon1": bbox.east,
+            "edate": "01/01/2026", "name": "TEST", "scale": 3_000_000.0,
+        });
+        data.extend_from_slice(serde_json::to_string(&footer).unwrap().as_bytes());
+        let cell = RncCell::parse("TEST".to_owned(), data).expect("valid .rnc parses");
+
+        let (w_m, s_m) = martin_tile_utils::wgs84_to_webmercator(bbox.west, bbox.south);
+        let (e_m, n_m) = martin_tile_utils::wgs84_to_webmercator(bbox.east, bbox.north);
+        let merc = Bbox {
+            west: w_m,
+            south: s_m,
+            east: e_m,
+            north: n_m,
+        };
+        let tile = TileGeom {
+            geom: cell.coverage(),
+            merc,
+            scale: 3_000_000,
+        };
+
+        let out = TileSource::render(&cell, &tile);
+
+        // Pixel index for a given (lon, lat), top-left origin, north-up.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let pixel_alpha = |lon: f64, lat: f64| -> u8 {
+            let (x_m, y_m) = martin_tile_utils::wgs84_to_webmercator(lon, lat);
+            let px = (((x_m - merc.west) / (merc.east - merc.west)) * f64::from(TILE_PX)) as u32;
+            let py = (((merc.north - y_m) / (merc.north - merc.south)) * f64::from(TILE_PX)) as u32;
+            let idx = ((py.min(TILE_PX - 1) * TILE_PX + px.min(TILE_PX - 1)) * 4) as usize;
+            out[idx + 3]
+        };
+
+        // Inside the triangle (near its centroid).
+        assert_eq!(
+            pixel_alpha(11.7, 57.3),
+            255,
+            "centroid of cover triangle should be painted"
+        );
+        // Inside the bbox rectangle but outside the triangle (NW corner).
+        assert_eq!(
+            pixel_alpha(11.05, 57.95),
+            0,
+            "NW corner excluded by cover polygon should stay transparent"
+        );
     }
 
     #[test]
