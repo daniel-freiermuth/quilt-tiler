@@ -16,6 +16,7 @@ use image::RgbaImage;
 use martin_tile_utils::webmercator_to_wgs84;
 use pmtiles::TileType;
 use rnc_format::locate_grid_cell;
+use s57::EditionDate;
 
 use crate::bbox::Bbox;
 use crate::rnc::RncCell;
@@ -32,6 +33,7 @@ impl TileSource for RncCell {
     /// item's contribution area for the tile.
     type Content = Vec<u8>;
     type Coverage = MultiPolygon;
+    type Tiebreaker = EditionDate;
 
     fn source(&self) -> String {
         self.name().to_owned()
@@ -43,6 +45,10 @@ impl TileSource for RncCell {
 
     fn native_scale(&self) -> u32 {
         Self::native_scale(self)
+    }
+
+    fn tiebreak(&self) -> Self::Tiebreaker {
+        self.edition_date()
     }
 
     /// Resample this cell into `tile`'s pixel grid.

@@ -71,7 +71,7 @@ struct NodeEntry {
     lat: f64,
 }
 
-#[allow(dead_code)] // fields parsed for cursor advancement; only name/scale/bounds/features are forwarded to S57Cell
+#[allow(dead_code)] // fields parsed for cursor advancement; only name/scale/bounds/features/dates are forwarded to S57Cell
 struct OesuCell {
     name: String,
     native_scale: u32,
@@ -95,6 +95,15 @@ struct OesuCell {
 
 impl From<OesuCell> for s57::S57Cell {
     fn from(c: OesuCell) -> Self {
+        // `update_date` mirrors `publish_date` until a real update is
+        // applied (then it's strictly newer) — see oesu/src/lib.rs's own
+        // header parsing. Prefer it; fall back when a malformed cell omits
+        // the UPDATEDATE record entirely.
+        let edition_date = s57::EditionDate::from_ccyymmdd(if c.update_date.is_empty() {
+            &c.publish_date
+        } else {
+            &c.update_date
+        });
         Self {
             name: c.name,
             native_scale: c.native_scale,
@@ -103,6 +112,7 @@ impl From<OesuCell> for s57::S57Cell {
             coverage: c.coverage,
             source: c.source,
             text_descriptions: c.text_descriptions,
+            edition_date,
         }
     }
 }

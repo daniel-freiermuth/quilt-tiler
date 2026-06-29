@@ -38,6 +38,14 @@ pub trait TileSource: Sync {
     /// the whole tile, so overlapping sources never double-paint.
     type Coverage: BoundedLattice + From<Bbox> + Into<Bbox> + Into<MultiPolygon> + Debug + Clone;
 
+    /// Tie-break key for `tiles::render_tile`'s candidate sort, when
+    /// multiple candidates are equally well-fitted to a tile's zoom level
+    /// (same floored `zoom_from_scale`) — the greater value wins the tie.
+    /// This isn't the source type's natural identity/ordering (it has
+    /// none); it exists solely for this one selection decision, so it
+    /// lives behind a dedicated method rather than the type's own `Ord`.
+    type Tiebreaker: Ord;
+
     /// Source identifier for this item (debug/diagnostic use by callers).
     #[allow(dead_code)] // consumed by debug logging in a follow-up commit
     fn source(&self) -> String;
@@ -47,6 +55,9 @@ pub trait TileSource: Sync {
 
     /// Native display scale denominator (e.g. `50_000` for 1:50 000).
     fn native_scale(&self) -> u32;
+
+    /// This item's recency/priority ranking — see [`Self::Tiebreaker`].
+    fn tiebreak(&self) -> Self::Tiebreaker;
 
     /// Render this item into tile-space content.  `tile.geom` is this item's
     /// exact contribution region for this tile — not necessarily the whole

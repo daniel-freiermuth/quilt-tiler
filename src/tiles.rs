@@ -1,9 +1,11 @@
 //! Generic tile quilting: build a `PMTiles` archive from any [`TileSource`].
 //!
 //! For every `(z, col, row)` in the data's zoom range, candidate source items
-//! are selected by coverage overlap, sorted by native scale, then added
-//! greedily until the tile is covered by their combined [`TileSource::Coverage`].
+//! are selected by coverage overlap, sorted by zoom fit (ties broken by
+//! [`TileSource::tiebreak`] — newer edition wins), then added greedily until
+//! the tile is covered by their combined [`TileSource::Coverage`].
 
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::Path;
@@ -206,10 +208,16 @@ pub fn render_tile<S: TileSource>(
 
     {
         profiling::scope!("Sorting candidates");
-        // Sort: coarsest-appropriate zoom first, finer after, too-coarse last.
+        // Sort: coarsest-appropriate zoom first, finer after, too-coarse
+        // last; ties at the same floored zoom broken by recency (newer
+        // edition wins — see `TileSource::tiebreak`).
         candidates.sort_unstable_by_key(|&i| {
             let nz = i32::from(zoom_from_scale(items[i].native_scale(), zoom_offset));
-            (nz < zi, if nz >= zi { nz } else { -nz })
+            (
+                nz < zi,
+                if nz >= zi { nz } else { -nz },
+                Reverse(items[i].tiebreak()),
+            )
         });
     }
 
@@ -307,4 +315,106 @@ fn hilbert_xy_to_d(n: u64, mut x: u64, mut y: u64) -> u64 {
         s /= 2;
     }
     d
+}
+
+#[cfg(test)]
+mod tests {
+    use image::Rgba;
+
+    use super::*;
+    use crate::rnc::RncCell;
+
+    /// Build a minimal single-tile `.rnc` byte buffer: one `8×8` solid-color
+    /// PNG, rectangular `cover` (the bbox itself), given `edate`.
+    #[allow(clippy::cast_possible_truncation)] // test PNG size is a tiny constant
+    fn build_rnc(bbox: Bbox, color: [u8; 4], scale: f64, edate: &str) -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(8, 8, Rgba(color));
+        let mut png = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encoding test PNG cannot fail");
+
+        let offsets = [
+            16 + 3 * 4,
+            16 + 3 * 4 + png.len() as u32,
+            16 + 3 * 4 + png.len() as u32,
+        ];
+        let mut buf = vec![0u8; 8];
+        buf.extend_from_slice(&1u32.to_le_bytes()); // cols
+        buf.extend_from_slice(&1u32.to_le_bytes()); // rows
+        for o in offsets {
+            buf.extend_from_slice(&o.to_le_bytes());
+        }
+        buf.extend_from_slice(&png);
+        let footer = serde_json::json!({
+            "cover": [],
+            "lat0": bbox.south, "lat1": bbox.north,
+            "lon0": bbox.west, "lon1": bbox.east,
+            "edate": edate, "name": "TEST", "scale": scale,
+        });
+        buf.extend_from_slice(serde_json::to_string(&footer).unwrap().as_bytes());
+        buf
+    }
+
+    /// Two fully-overlapping cells with identical `native_scale` (so they
+    /// land in the same floored tile zoom and tie the zoom-fit sort key)
+    /// but different edition dates. The newer one must win the whole tile
+    /// — its color, not the older's, comes out — regardless of input order.
+    #[test]
+    fn newer_edition_wins_tie_at_same_zoom() {
+        let bbox = Bbox {
+            west: 10.0,
+            south: 56.0,
+            east: 11.0,
+            north: 57.0,
+        };
+        let older = RncCell::parse(
+            "OLDER".to_owned(),
+            build_rnc(bbox, [200, 30, 30, 255], 3_000_000.0, "01/01/2020"),
+        )
+        .expect("older cell parses");
+        let newer = RncCell::parse(
+            "NEWER".to_owned(),
+            build_rnc(bbox, [30, 200, 30, 255], 3_000_000.0, "01/01/2026"),
+        )
+        .expect("newer cell parses");
+        assert!(
+            older.edition_date() < newer.edition_date(),
+            "fixture sanity: OLDER must parse strictly before NEWER"
+        );
+
+        // Render at the cell's own natural zoom so its bbox fills (most
+        // of) the tile — center is reliably inside its contribution.
+        let z = zoom_from_scale(3_000_000, 0.0);
+        let (col, row, _, _) = bbox_to_xyz(bbox.west, bbox.south, bbox.east, bbox.north, z);
+
+        // Older listed first: only the tiebreak (not array order) should
+        // determine which one wins.
+        let bytes = render_tile(&[older, newer], z, col, row, 0.0)
+            .expect("render_tile succeeds")
+            .expect("tile has coverage");
+        let img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+            .expect("re-decodes")
+            .to_rgba8();
+
+        // Sample the bbox's own centroid, projected into this tile's pixel
+        // space — robust regardless of where the bbox sits within the tile.
+        let tile_merc = tile_mercator_bbox(Bbox::from(xyz_to_bbox(z, col, row, col, row)));
+        let (centroid_x, centroid_y) = wgs84_to_webmercator(
+            f64::midpoint(bbox.west, bbox.east),
+            f64::midpoint(bbox.south, bbox.north),
+        );
+        let extent = f64::from(crate::rnc_source::TILE_PX);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let px =
+            (((centroid_x - tile_merc.west) / (tile_merc.east - tile_merc.west)) * extent) as u32;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let py = (((tile_merc.north - centroid_y) / (tile_merc.north - tile_merc.south)) * extent)
+            as u32;
+
+        assert_eq!(
+            img.get_pixel(px, py).0,
+            [30, 200, 30, 255],
+            "newer edition's color should win the fully-overlapping tile"
+        );
+    }
 }

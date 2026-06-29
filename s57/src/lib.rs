@@ -3,10 +3,13 @@
 //! Shared types produced by chart parsers (OESU, native S-57, …) and
 //! consumed by tile writers and other chart processing tools.
 
+mod edition_date;
+
 // ── Feature data model ───────────────────────────────────────────────────────
 
 use std::collections::HashMap;
 
+pub use edition_date::EditionDate;
 use geo_types::{LineString, MultiPolygon, Point, Polygon};
 
 #[derive(Debug, Clone)]
@@ -61,6 +64,13 @@ pub struct S57Cell {
     pub coverage: MultiPolygon,
     pub source: String,
     pub text_descriptions: HashMap<String, String>,
+    /// Most recent edition/update date — `HEADER_CELL_UPDATEDATE` if the
+    /// cell has updates applied, else `HEADER_CELL_PUBLISHDATE`.
+    /// [`EditionDate::unknown`] if neither header was present. Consumed by
+    /// `quilt_tiler::tile_source::TileSource::tiebreak` to rank otherwise
+    /// equally-zoom-fit tile candidates — not a general identity/ordering
+    /// for this type, so `S57Cell` deliberately has no `Eq`/`Ord` impl.
+    pub edition_date: EditionDate,
 }
 
 // ── Object-class and attribute code tables ───────────────────────────────────

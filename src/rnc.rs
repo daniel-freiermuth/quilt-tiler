@@ -16,6 +16,7 @@ use anyhow::{Context, Result, bail};
 use geo::MultiPolygon;
 use image::RgbaImage;
 use rnc_format::{RncFooter, RncHeader};
+use s57::EditionDate;
 
 use crate::bbox::Bbox;
 
@@ -38,6 +39,11 @@ pub struct RncCell {
     /// `ymin` is the NORTH edge (smaller `y` = higher latitude).
     merc: (f64, f64, f64, f64),
     native_scale: u32,
+    /// Footer `edate`, parsed; [`EditionDate::unknown`] if absent or
+    /// unparseable. Consumed by `TileSource::tiebreak` to rank otherwise
+    /// equally-zoom-fit tile candidates — not a general identity/ordering
+    /// for this type, so `RncCell` deliberately has no `Eq`/`Ord` impl.
+    edition_date: EditionDate,
     /// Lazily-decoded subtile cache, keyed by grid index `row * cols + col`.
     cache: Mutex<HashMap<u32, Arc<RgbaImage>>>,
 }
@@ -68,6 +74,7 @@ impl RncCell {
 
         let coverage = footer.coverage();
         let native_scale = footer.scale.round().clamp(1.0, f64::from(u32::MAX)) as u32;
+        let edition_date = EditionDate::from_ddmmyyyy(&footer.edate);
 
         Ok(Self {
             name,
@@ -77,8 +84,13 @@ impl RncCell {
             coverage,
             merc,
             native_scale,
+            edition_date,
             cache: Mutex::new(HashMap::new()),
         })
+    }
+
+    pub const fn edition_date(&self) -> EditionDate {
+        self.edition_date
     }
 
     pub fn name(&self) -> &str {

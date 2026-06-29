@@ -29,6 +29,7 @@ const EXTENT: f64 = DEFAULT_EXTENT.get() as f64;
 impl TileSource for s57::S57Cell {
     type Content = HashMap<&'static str, Vec<MvtFeature>>;
     type Coverage = MultiPolygon;
+    type Tiebreaker = s57::EditionDate;
 
     #[profiling::function]
     fn coverage(&self) -> Self::Coverage {
@@ -37,6 +38,10 @@ impl TileSource for s57::S57Cell {
 
     fn native_scale(&self) -> u32 {
         self.native_scale
+    }
+
+    fn tiebreak(&self) -> Self::Tiebreaker {
+        self.edition_date
     }
 
     fn source(&self) -> String {
