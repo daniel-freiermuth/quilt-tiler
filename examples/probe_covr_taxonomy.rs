@@ -46,7 +46,10 @@ fn raw_rings(data: &[u8]) -> Option<RawCell> {
                 let lat = f32_at(p);
                 let lon = f32_at(p + 4);
                 p += 8;
-                coords.push(Coord { x: f64::from(lon), y: f64::from(lat) });
+                coords.push(Coord {
+                    x: f64::from(lon),
+                    y: f64::from(lat),
+                });
             }
             if coords.len() >= 3 {
                 let poly = Polygon::new(LineString::new(coords), vec![]);
@@ -169,7 +172,9 @@ fn main() {
             Ok(d) => d,
             Err(_) => continue,
         };
-        let Some(raw) = raw_rings(&data) else { continue };
+        let Some(raw) = raw_rings(&data) else {
+            continue;
+        };
         n_cells += 1;
         *covr_count_hist.entry(raw.covr.len()).or_insert(0) += 1;
         *nocovr_count_hist.entry(raw.nocovr.len()).or_insert(0) += 1;
@@ -192,7 +197,11 @@ fn main() {
                 let int_mp = MultiPolygon::new(vec![int.clone()]);
                 let ext_area = ext.unsigned_area();
                 let overlap = ext_mp.intersection(&int_mp).unsigned_area();
-                let frac = if ext_area > 0.0 { overlap / ext_area } else { 0.0 };
+                let frac = if ext_area > 0.0 {
+                    overlap / ext_area
+                } else {
+                    0.0
+                };
                 let nocovr_rect = {
                     let a = int.unsigned_area();
                     let b = bbox_area(int.exterior());
@@ -215,7 +224,14 @@ fn main() {
                 } else if bucket == "100%" {
                     full_stats.push((frac, nocovr_rect, svf));
                 } else {
-                    interesting_partial.push((path.to_string_lossy().to_string(), ei, ni, frac, nocovr_rect, svf));
+                    interesting_partial.push((
+                        path.to_string_lossy().to_string(),
+                        ei,
+                        ni,
+                        frac,
+                        nocovr_rect,
+                        svf,
+                    ));
                 }
             }
         }
@@ -223,14 +239,22 @@ fn main() {
             let unique: BTreeSet<&&str> = buckets.iter().collect();
             if unique.len() > 1 {
                 mixed_within_ext += 1;
-                println!("MIXED within one exterior: {} COVR[{ei}] sees {:?}", path.display(), buckets);
+                println!(
+                    "MIXED within one exterior: {} COVR[{ei}] sees {:?}",
+                    path.display(),
+                    buckets
+                );
             }
         }
         if per_ext_buckets.len() > 1 {
             let all: BTreeSet<&str> = per_ext_buckets.values().flatten().copied().collect();
             if all.len() > 1 {
                 mixed_across_exts += 1;
-                println!("MIXED across exteriors in one cell: {} sees {:?}", path.display(), all);
+                println!(
+                    "MIXED across exteriors in one cell: {} sees {:?}",
+                    path.display(),
+                    all
+                );
             }
         }
         if !any_pair {
@@ -242,8 +266,12 @@ fn main() {
     println!("cells with zero NOCOVR records: {n_no_nocovr}");
     println!("cells with NOCOVR but no intersecting COVR/NOCOVR pair: {n_no_intersecting_pairs}");
     println!("total intersecting (COVR,NOCOVR) pairs: {n_pairs}");
-    println!("cells with mixed pattern within one exterior (multiple NOCOVR, different buckets): {mixed_within_ext}");
-    println!("cells with mixed pattern across exteriors (same cell, different buckets): {mixed_across_exts}");
+    println!(
+        "cells with mixed pattern within one exterior (multiple NOCOVR, different buckets): {mixed_within_ext}"
+    );
+    println!(
+        "cells with mixed pattern across exteriors (same cell, different buckets): {mixed_across_exts}"
+    );
     println!("\ncovr_count histogram: {covr_count_hist:?}");
     println!("nocovr_count histogram: {nocovr_count_hist:?}");
     println!("\noverlap_fraction buckets:");
