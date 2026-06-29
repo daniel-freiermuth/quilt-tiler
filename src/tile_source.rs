@@ -56,6 +56,10 @@ pub trait TileSource: Sync {
     /// Encode one tile's accumulated `contents` into raw bytes.
     ///
     /// Return an empty `Vec` to omit the tile from the archive.
+    ///
+    /// # Errors
+    /// Returns an error if encoding the contents into this source's tile
+    /// format fails.
     fn encode(contents: Vec<Self::Content>) -> Result<Vec<u8>>;
 
     /// `PMTiles` tile type emitted by this source (e.g. `TileType::Mvt`).

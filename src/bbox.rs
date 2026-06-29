@@ -19,6 +19,7 @@ pub struct Bbox {
 impl Bbox {
     /// A degenerate point-extent bbox.
     #[inline]
+    #[must_use]
     pub const fn point(lon: f64, lat: f64) -> Self {
         Self {
             west: lon,
@@ -42,6 +43,7 @@ impl Bbox {
     }
 
     #[inline]
+    #[must_use]
     pub fn is_bottom(&self) -> bool {
         self.west > self.east || self.south > self.north
     }

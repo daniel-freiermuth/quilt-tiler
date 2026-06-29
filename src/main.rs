@@ -5,16 +5,7 @@
 //! into a `PMTiles` v3 archive alongside `<stem>.style.json` and
 //! `<stem>.metadata.json`.
 
-mod bbox;
-mod lattice;
-mod rnc;
-mod rnc_source;
-mod s57_source;
-mod style;
-mod tile_geom;
-mod tile_source;
-mod tiles;
-mod zoom;
+use quilt_tiler::{loader, rnc, style, tiles};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Current UTC time as `YYYY-MM-DDTHH:MM:SSZ` without pulling in chrono.
@@ -71,10 +62,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Parser;
 use rayon::ThreadPoolBuilder;
-use rayon::prelude::*;
-use tracing::{debug, info, warn};
-
-use zoom::zoom_from_scale;
+use tracing::info;
 
 /// Convert decrypted `OESU`/`OSENC` vector charts or raster `.rnc`
 /// cells into a `PMTiles` tile archive and a `MapLibre` GL style.
@@ -171,7 +159,7 @@ fn main() -> Result<()> {
     // PMTiles stores one tile type per archive, so a run's inputs must be
     // uniformly vector or uniformly raster — dispatch on extension and
     // fail fast on a mix rather than silently dropping one kind.
-    let raster_count = args.input.iter().filter(|p| is_rnc(p)).count();
+    let raster_count = args.input.iter().filter(|p| loader::is_rnc(p)).count();
     match raster_count {
         0 => run_vector(&args),
         n if n == args.input.len() => run_raster(&args),
@@ -180,13 +168,6 @@ fn main() -> Result<()> {
             args.input.len()
         ),
     }
-}
-
-/// `true` if `path`'s extension is `.rnc` (a raster cell), case-insensitive.
-fn is_rnc(path: &std::path::Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("rnc"))
 }
 
 /// Derive `(source_id, chart_name, tile_url)` from CLI args — shared by the
@@ -208,44 +189,7 @@ fn output_identity(args: &Args) -> (String, String, String) {
 
 /// Convert decrypted `OESU`/`OSENC` vector cells into an MVT `PMTiles` archive.
 fn run_vector(args: &Args) -> Result<()> {
-    // Parse all input files in parallel; skip files that fail to parse.
-    let cells: Vec<s57::S57Cell> = args
-        .input
-        .par_iter()
-        .filter_map(|path| {
-            profiling::scope!("parse");
-            // Mirrors the per-tile frame in tiles.rs: parsing is also a
-            // parallel rayon batch over independent units (input files), so
-            // it gets its own non-continuous (secondary) frame set rather
-            // than reusing "tile".
-            #[cfg(feature = "profiling")]
-            let _frame = tracy_client::non_continuous_frame!("parse");
-            let data = match std::fs::read(path) {
-                Ok(d) => d,
-                Err(e) => {
-                    warn!(file = %path.display(), error = %e, "cannot read");
-                    return None;
-                }
-            };
-            match oesu::parse_file(path.to_str().unwrap().to_owned(), &data) {
-                Ok(cell) => {
-                    let z = zoom_from_scale(cell.native_scale, args.zoom_offset);
-                    debug!(
-                        name = %cell.name,
-                        scale = cell.native_scale,
-                        zoom = z,
-                        features = cell.features.len(),
-                        "parsed"
-                    );
-                    Some(cell)
-                }
-                Err(e) => {
-                    warn!(file = %path.display(), error = %e, "skipping");
-                    None
-                }
-            }
-        })
-        .collect();
+    let cells: Vec<s57::S57Cell> = loader::load_s57_cells(&args.input, args.zoom_offset);
 
     info!(parsed = cells.len(), "charts parsed, writing tiles");
 
@@ -316,46 +260,7 @@ fn run_vector(args: &Args) -> Result<()> {
 
 /// Convert raster `.rnc` cells into a PNG `PMTiles` archive.
 fn run_raster(args: &Args) -> Result<()> {
-    // Parse all input files in parallel; skip files that fail to parse.
-    let cells: Vec<rnc::RncCell> = args
-        .input
-        .par_iter()
-        .filter_map(|path| {
-            profiling::scope!("parse");
-            #[cfg(feature = "profiling")]
-            let _frame = tracy_client::non_continuous_frame!("parse");
-            let data = match std::fs::read(path) {
-                Ok(d) => d,
-                Err(e) => {
-                    warn!(file = %path.display(), error = %e, "cannot read");
-                    return None;
-                }
-            };
-            let name = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("cell")
-                .to_owned();
-            match rnc::RncCell::parse(name.clone(), data) {
-                Ok(cell) => {
-                    let z = zoom_from_scale(rnc::RncCell::native_scale(&cell), args.zoom_offset);
-                    debug!(
-                        name = %name,
-                        scale = rnc::RncCell::native_scale(&cell),
-                        zoom = z,
-                        cols = cell.cols(),
-                        rows = cell.rows(),
-                        "parsed"
-                    );
-                    Some(cell)
-                }
-                Err(e) => {
-                    warn!(file = %path.display(), error = %e, "skipping");
-                    None
-                }
-            }
-        })
-        .collect();
+    let cells: Vec<rnc::RncCell> = loader::load_rnc_cells(&args.input, args.zoom_offset);
 
     info!(parsed = cells.len(), "raster cells parsed, writing tiles");
 

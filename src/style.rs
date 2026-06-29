@@ -25,6 +25,7 @@ const STYLE_JSON: &str = include_str!("style.json");
 ///
 /// # Panics
 /// Panics if the embedded `style.json` is malformed (compile-time guarantee).
+#[must_use]
 pub fn build_style(
     safety_depth: f64,
     shoal_depth: f64,
@@ -140,6 +141,10 @@ pub fn build_style(
 /// * `tile_url` — full PNG tile URL template, e.g.
 ///   `http://localhost:3000/chart/{z}/{x}/{y}`.
 /// * `min_zoom` / `max_zoom` — zoom range for the tile source.
+/// # Panics
+/// Panics if `serde_json` fails to serialise the style (cannot happen — the
+/// value is built entirely from this function's own literals and inputs).
+#[must_use]
 pub fn build_raster_style(tile_url: &str, min_zoom: u8, max_zoom: u8) -> String {
     use serde_json::json;
 

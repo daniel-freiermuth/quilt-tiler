@@ -31,6 +31,10 @@ type EncodedTile = (u64, TileCoord, Vec<u8>);
 ///
 /// `zoom_offset` shifts every item's native scale to a zoom level (positive =
 /// finer, negative = coarser).  Returns `(min_zoom, max_zoom)`.
+///
+/// # Errors
+/// Returns an error if `max_zoom` is below the data's minimum zoom, a tile
+/// fails to encode, or writing/finalizing the `PMTiles` archive fails.
 pub fn write_pmtiles<S: TileSource>(
     items: &[S],
     output: &Path,
@@ -39,24 +43,7 @@ pub fn write_pmtiles<S: TileSource>(
 ) -> Result<(u8, u8)> {
     let mut tile_bytes: BTreeMap<u64, (TileCoord, Vec<u8>)> = BTreeMap::new();
 
-    let zooms: Vec<u8> = items
-        .iter()
-        .map(|item| zoom_from_scale(item.native_scale(), zoom_offset))
-        .collect();
-
-    let zoom_floor = zooms.iter().copied().min().unwrap_or(0).saturating_sub(2);
-    let zoom_ceil_native = zooms.iter().copied().max().unwrap_or(0);
-    let zoom_ceil = match max_zoom {
-        Some(cap) if cap < zoom_floor => {
-            anyhow::bail!("--max-zoom {cap} is below the data's minimum zoom {zoom_floor}");
-        }
-        Some(cap) => cap.min(zoom_ceil_native),
-        None => zoom_ceil_native,
-    };
-
-    let overall = items.iter().fold(Bbox::bottom(), |acc, item| {
-        acc.join(&item.coverage().into())
-    });
+    let (zoom_floor, zoom_ceil, overall) = zoom_range_and_bounds(items, max_zoom, zoom_offset)?;
 
     let total_tiles: u64 = (zoom_floor..=zoom_ceil)
         .map(|z| {
@@ -68,7 +55,7 @@ pub fn write_pmtiles<S: TileSource>(
 
     info!(
         count = items.len(),
-        zoom_floor, zoom_ceil_native, zoom_ceil, total_tiles, "encoding tiles",
+        zoom_floor, zoom_ceil, total_tiles, "encoding tiles",
     );
     let pb = ProgressBar::new(total_tiles).with_style(bar_style());
 
@@ -78,14 +65,11 @@ pub fn write_pmtiles<S: TileSource>(
         let width = col_hi - col_lo + 1;
         let height = row_hi - row_lo + 1;
         let count = u64::from(width) * u64::from(height);
-        let zi = i32::from(z);
-        let tile_scale = scale_from_zoom(z, zoom_offset);
 
         (0u64..count)
             .into_par_iter()
             .progress_with(pb.clone())
             .map(|idx| -> Result<Option<EncodedTile>> {
-                profiling::scope!("tile");
                 // Tiles are encoded across rayon worker threads concurrently, so a
                 // single global frame mark doesn't fit; Tracy's non-continuous
                 // (secondary) frame set supports overlapping FrameMarkStart/End
@@ -97,64 +81,9 @@ pub fn write_pmtiles<S: TileSource>(
                 #[allow(clippy::cast_possible_truncation)] // idx / width < height ≤ u32::MAX
                 let row = row_lo + (idx / u64::from(width)) as u32;
 
-                let tile_wgs84 = Bbox::from(xyz_to_bbox(z, col, row, col, row));
-                let tile_merc = tile_mercator_bbox(tile_wgs84);
-
-                // Candidates: items whose coverage bbox overlaps this tile.
-                let mut candidates: Vec<usize> = {
-                    profiling::scope!("Collecting candidates");
-                    (0..items.len())
-                        .filter(|&i| {
-                            let bbox: Bbox = items[i].coverage().into();
-                            bbox.overlaps(&tile_wgs84)
-                        })
-                        .collect()
+                let Some(bytes) = render_tile(items, z, col, row, zoom_offset)? else {
+                    return Ok(None);
                 };
-
-                if candidates.is_empty() {
-                    return Ok(None);
-                }
-
-                {
-                    profiling::scope!("Sorting candidates");
-                    // Sort: coarsest-appropriate zoom first, finer after, too-coarse last.
-                    candidates.sort_unstable_by_key(|&i| {
-                        let nz = i32::from(zooms[i]);
-                        (nz < zi, if nz >= zi { nz } else { -nz })
-                    });
-                }
-
-                // Greedy coverage: include an item only if its contribution
-                // adds area not yet covered.  `Coverage`'s real polygon
-                // algebra correctly handles disjoint coverage areas (e.g.
-                // NE + SW ≠ full tile), unlike a bounding-box hull.
-                let mut uncovered = S::Coverage::from(tile_wgs84);
-                let mut contents: Vec<S::Content> = Vec::new();
-
-                {
-                    profiling::scope!("Collecting features");
-                    for &i in &candidates {
-                        let contrib = items[i].coverage().meet(&uncovered);
-                        if contrib.area() == 0.0 {
-                            continue;
-                        }
-                        let item_tile = TileGeom {
-                            geom: contrib.clone().into(),
-                            merc: tile_merc,
-                            scale: tile_scale,
-                        };
-                        contents.push(items[i].render(&item_tile));
-                        uncovered = uncovered.minus(&contrib);
-                        if uncovered.area() == 0.0 {
-                            break;
-                        }
-                    }
-                }
-
-                let bytes = S::encode(contents)?;
-                if bytes.is_empty() {
-                    return Ok(None);
-                }
                 let coord = TileCoord::new(z, col, row).context("invalid tile coord")?;
                 Ok(Some((tile_id(z, col, row), coord, bytes)))
             })
@@ -194,6 +123,125 @@ pub fn write_pmtiles<S: TileSource>(
 
     info!(output = %output.display(), "PMTiles written");
     Ok((zoom_floor, zoom_ceil))
+}
+
+/// Compute `(zoom_floor, zoom_ceil, overall_bbox)` for `items`: the tile zoom
+/// range and combined `WGS84` extent that a [`write_pmtiles`] batch or a live
+/// server's `/style.json` should advertise.
+///
+/// `zoom_floor` is the coarsest native zoom among `items`, minus 2 (so the
+/// finest chart's detail still fills down a couple of levels below its own
+/// native zoom). `zoom_ceil` is the finest native zoom, capped by `max_zoom`
+/// when given.
+///
+/// # Errors
+/// Returns an error if `max_zoom` is below the data's minimum zoom.
+pub fn zoom_range_and_bounds<S: TileSource>(
+    items: &[S],
+    max_zoom: Option<u8>,
+    zoom_offset: f64,
+) -> Result<(u8, u8, Bbox)> {
+    let zoom_floor = items
+        .iter()
+        .map(|item| zoom_from_scale(item.native_scale(), zoom_offset))
+        .min()
+        .unwrap_or(0)
+        .saturating_sub(2);
+    let zoom_ceil_native = items
+        .iter()
+        .map(|item| zoom_from_scale(item.native_scale(), zoom_offset))
+        .max()
+        .unwrap_or(0);
+    let zoom_ceil = match max_zoom {
+        Some(cap) if cap < zoom_floor => {
+            anyhow::bail!("max_zoom {cap} is below the data's minimum zoom {zoom_floor}");
+        }
+        Some(cap) => cap.min(zoom_ceil_native),
+        None => zoom_ceil_native,
+    };
+
+    let overall = items.iter().fold(Bbox::bottom(), |acc, item| {
+        acc.join(&item.coverage().into())
+    });
+
+    Ok((zoom_floor, zoom_ceil, overall))
+}
+
+/// Render one `(z, col, row)` tile from `items`'s combined coverage.
+///
+/// Returns `None` if nothing overlaps it, or [`TileSource::encode`] decides
+/// to omit it. Pure given `(z, col, row)` — no shared mutable state across
+/// calls — so it's safe to call concurrently and on demand. Backs both
+/// [`write_pmtiles`]'s batch loop and a live tile server.
+///
+/// # Errors
+/// Returns an error if [`TileSource::encode`] fails for this tile's contents.
+pub fn render_tile<S: TileSource>(
+    items: &[S],
+    z: u8,
+    col: u32,
+    row: u32,
+    zoom_offset: f64,
+) -> Result<Option<Vec<u8>>> {
+    profiling::scope!("tile");
+    let zi = i32::from(z);
+    let tile_wgs84 = Bbox::from(xyz_to_bbox(z, col, row, col, row));
+    let tile_merc = tile_mercator_bbox(tile_wgs84);
+    let tile_scale = scale_from_zoom(z, zoom_offset);
+
+    // Candidates: items whose coverage bbox overlaps this tile.
+    let mut candidates: Vec<usize> = {
+        profiling::scope!("Collecting candidates");
+        (0..items.len())
+            .filter(|&i| {
+                let bbox: Bbox = items[i].coverage().into();
+                bbox.overlaps(&tile_wgs84)
+            })
+            .collect()
+    };
+
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    {
+        profiling::scope!("Sorting candidates");
+        // Sort: coarsest-appropriate zoom first, finer after, too-coarse last.
+        candidates.sort_unstable_by_key(|&i| {
+            let nz = i32::from(zoom_from_scale(items[i].native_scale(), zoom_offset));
+            (nz < zi, if nz >= zi { nz } else { -nz })
+        });
+    }
+
+    // Greedy coverage: include an item only if its contribution adds area
+    // not yet covered.  `Coverage`'s real polygon algebra correctly handles
+    // disjoint coverage areas (e.g. NE + SW ≠ full tile), unlike a
+    // bounding-box hull.
+    let mut uncovered = S::Coverage::from(tile_wgs84);
+    let mut contents: Vec<S::Content> = Vec::new();
+
+    {
+        profiling::scope!("Collecting features");
+        for &i in &candidates {
+            let contrib = items[i].coverage().meet(&uncovered);
+            if contrib.area() == 0.0 {
+                continue;
+            }
+            let item_tile = TileGeom {
+                geom: contrib.clone().into(),
+                merc: tile_merc,
+                scale: tile_scale,
+            };
+            contents.push(items[i].render(&item_tile));
+            uncovered = uncovered.minus(&contrib);
+            if uncovered.area() == 0.0 {
+                break;
+            }
+        }
+    }
+
+    let bytes = S::encode(contents)?;
+    Ok(if bytes.is_empty() { None } else { Some(bytes) })
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

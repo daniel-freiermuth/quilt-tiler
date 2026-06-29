@@ -44,6 +44,10 @@ pub struct RncCell {
 
 impl RncCell {
     /// Parse a `.rnc` file already read into memory.
+    ///
+    /// # Errors
+    /// Returns an error if the header or footer can't be parsed (truncated
+    /// or corrupt `.rnc` file).
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     // native_scale's cast is clamped immediately beforehand.
     pub fn parse(name: String, data: Vec<u8>) -> Result<Self> {
@@ -107,6 +111,10 @@ impl RncCell {
     }
 
     /// Decode (and cache) grid tile `n = row * cols + col`.
+    ///
+    /// # Errors
+    /// Returns an error if `n` is out of range or the PNG blob it points to
+    /// fails to decode.
     pub fn subtile_image(&self, n: u32) -> Result<Arc<RgbaImage>> {
         {
             let cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);

@@ -15,9 +15,11 @@ pub trait BoundedLattice: Sized {
     fn bottom() -> Self;
 
     /// Least upper bound ∨ (union / hull).
+    #[must_use]
     fn join(&self, other: &Self) -> Self;
 
     /// Greatest lower bound ∧ (intersection / clip).
+    #[must_use]
     fn meet(&self, other: &Self) -> Self;
 
     /// `true` when `self ≥ other` in the lattice order (self covers other).
@@ -27,6 +29,7 @@ pub trait BoundedLattice: Sized {
 
     fn area(&self) -> f64;
 
+    #[must_use]
     fn minus(&self, other: &Self) -> Self;
 }
 

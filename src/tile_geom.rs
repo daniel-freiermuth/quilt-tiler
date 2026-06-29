@@ -3,11 +3,12 @@
 use crate::bbox::Bbox;
 use geo::MultiPolygon;
 
-/// Spatial context for one tile: its extent (possibly non-rectangular —
-/// `geom` need not be a single rectangle) in WGS84, the same extent's
-/// Mercator-projected bounding rectangle (pixel projection is inherently
-/// rectangular), plus the nominal scale — everything a
-/// [`crate::tile_source::TileSource`] render call needs.
+/// Spatial context for one tile.
+///
+/// Holds its extent (possibly non-rectangular — `geom` need not be a single
+/// rectangle) in WGS84, the same extent's Mercator-projected bounding
+/// rectangle (pixel projection is inherently rectangular), plus the nominal
+/// scale — everything a [`crate::tile_source::TileSource`] render call needs.
 #[derive(Clone, Debug)]
 pub struct TileGeom {
     /// Coverage contribution for this source in WGS84.  Area features are

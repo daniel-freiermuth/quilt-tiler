@@ -9,6 +9,7 @@ pub const ZOOM_K: f64 = 559_082_264.0;
 /// Pass `offset = 0.0` for the unshifted result.  Fractional offsets are applied
 /// before flooring, so they shift the scale breakpoints between zoom levels rather
 /// than nudging an already-rounded integer.
+#[must_use]
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn zoom_from_scale(native_scale: u32, offset: f64) -> u8 {
     let log2 = if native_scale == 0 {
@@ -22,6 +23,7 @@ pub fn zoom_from_scale(native_scale: u32, offset: f64) -> u8 {
 
 /// Compute the nominal scale denominator for a tile at `zoom` with `offset`
 /// applied.  Inverse of [`zoom_from_scale`].
+#[must_use]
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn scale_from_zoom(zoom: u8, offset: f64) -> u32 {
     // Safety: value is clamped to a positive finite range before cast.
