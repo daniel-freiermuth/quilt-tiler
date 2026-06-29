@@ -16,7 +16,9 @@ use axum::extract::{Path as TilePath, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use bytes::Bytes;
 use clap::Parser;
+use moka::sync::Cache;
 use quilt_tiler::{loader, rnc, style, tiles};
 use tower_http::cors::CorsLayer;
 use tracing::{error, info};
@@ -64,6 +66,14 @@ struct Args {
     /// finer, negative = coarser).
     #[arg(long, default_value_t = 0.0)]
     zoom_offset: f64,
+
+    /// In-memory tile cache size in megabytes, weighed by each tile's
+    /// encoded byte size (so capacity is approximate memory use, not entry
+    /// count). Concurrent requests for the same uncached tile are
+    /// coalesced — only one render runs, the rest wait for its result.
+    /// `0` disables the cache.
+    #[arg(long, default_value_t = 256)]
+    cache_mb: u64,
 }
 
 /// The parsed cells this server quilts tiles from, plus the zoom range
@@ -83,8 +93,25 @@ enum Sources {
     },
 }
 
+/// `(z, x, y)` → rendered tile bytes, or `None` for a tile nothing covers.
+/// Caching `None` too matters: a marine chart's open-water tiles repeat the
+/// same empty result over huge stretches of panning, and that's still real
+/// candidate-filtering work across every loaded cell without this.
+type TileCache = Cache<(u8, u32, u32), Option<Bytes>>;
+
+/// Weigh a cached entry by its tile size in bytes (a `None` "no coverage"
+/// entry counts as a small fixed weight) — bounds the cache by approximate
+/// memory use rather than a fixed entry count, since tile sizes vary from a
+/// few hundred bytes to several hundred KB.
+#[allow(clippy::cast_possible_truncation)] // tiles are well under u32::MAX bytes
+#[allow(clippy::ref_option)] // signature fixed by moka's `weigher` closure type
+fn tile_weight(_key: &(u8, u32, u32), value: &Option<Bytes>) -> u32 {
+    value.as_ref().map_or(64, |bytes| bytes.len() as u32 + 64)
+}
+
 struct AppState {
     sources: Sources,
+    cache: Option<TileCache>,
     public_url: Option<String>,
     safety_depth: f64,
     shoal_depth: f64,
@@ -92,20 +119,43 @@ struct AppState {
 }
 
 impl AppState {
+    /// MIME type for this server's `/tiles` responses — constant for the
+    /// life of the process, one source kind per server.
+    const fn content_type(&self) -> &'static str {
+        match &self.sources {
+            Sources::Vector { .. } => "application/x-protobuf",
+            Sources::Raster { .. } => "image/png",
+        }
+    }
+
     /// Render one `(z, x, y)` tile, dispatching to the loaded source's
-    /// [`TileSource`] impl. Returns the encoded bytes and their MIME type,
-    /// or `None` when nothing covers the tile.
-    fn render(&self, z: u8, x: u32, y: u32) -> Result<Option<(Vec<u8>, &'static str)>> {
+    /// [`TileSource`] impl. Bypasses the cache.
+    fn render_uncached(&self, z: u8, x: u32, y: u32) -> Result<Option<Bytes>> {
         match &self.sources {
             Sources::Vector { cells, .. } => {
-                Ok(tiles::render_tile(cells, z, x, y, self.zoom_offset)?
-                    .map(|bytes| (bytes, "application/x-protobuf")))
+                Ok(tiles::render_tile(cells, z, x, y, self.zoom_offset)?.map(Bytes::from))
             }
             Sources::Raster { cells, .. } => {
-                Ok(tiles::render_tile(cells, z, x, y, self.zoom_offset)?
-                    .map(|bytes| (bytes, "image/png")))
+                Ok(tiles::render_tile(cells, z, x, y, self.zoom_offset)?.map(Bytes::from))
             }
         }
+    }
+
+    /// Render `(z, x, y)`, transparently caching the result (including a
+    /// "nothing covers this tile" miss) when a cache is configured.
+    ///
+    /// Concurrent requests for the same uncached tile are coalesced by
+    /// [`moka::sync::Cache::try_get_with`]: only one render runs, the rest
+    /// wait for its result instead of duplicating the work.
+    fn render(&self, z: u8, x: u32, y: u32) -> Result<Option<(Bytes, &'static str)>> {
+        let content_type = self.content_type();
+        let tile = match &self.cache {
+            Some(cache) => cache
+                .try_get_with((z, x, y), || self.render_uncached(z, x, y))
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+            None => self.render_uncached(z, x, y)?,
+        };
+        Ok(tile.map(|bytes| (bytes, content_type)))
     }
 
     /// Build the `style.json` body, embedding `tile_url` as the source's
@@ -226,8 +276,21 @@ async fn main() -> Result<()> {
         ),
     };
 
+    let cache = (args.cache_mb > 0).then(|| {
+        Cache::builder()
+            .max_capacity(args.cache_mb * 1024 * 1024)
+            .weigher(tile_weight)
+            .build()
+    });
+    info!(
+        cache_mb = args.cache_mb,
+        cache_enabled = cache.is_some(),
+        "tile cache configured"
+    );
+
     let state = Arc::new(AppState {
         sources,
+        cache,
         public_url: args.public_url,
         safety_depth: args.safety_depth,
         shoal_depth: args.shoal_depth,
