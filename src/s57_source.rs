@@ -373,7 +373,11 @@ fn emit_buoy_light_flare(
     tile: &TileGeom,
     layers: &mut HashMap<&'static str, Vec<MvtFeature>>,
 ) {
-    let is_flood_or_subsidiary = matches!(catlit, Some(MvtValue::UInt(6 | 8)));
+    let is_flood_or_subsidiary = match catlit {
+        Some(MvtValue::UInt(6 | 8)) => true,
+        Some(MvtValue::String(s)) if s == "6" || s == "8" => true,
+        _ => false,
+    };
     if is_flood_or_subsidiary || !tile.geom.intersects(&center) {
         return;
     }
