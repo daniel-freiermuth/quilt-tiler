@@ -500,7 +500,7 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
                 }
                 // Read the scale_factor from the EXT header (at offset 44 in payload)
                 let mut hdr_p = Cursor::new(payload_bytes.as_slice());
-                for _ in 0..5 {
+                for _ in 0..4 {
                     let _ = read_f64(&mut hdr_p);
                 } // skip 4×f64 extent
                 let _ = read_u32(&mut hdr_p); // contour_count
