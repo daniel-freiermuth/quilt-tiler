@@ -89,7 +89,7 @@ impl TileSource for RncCell {
         // pixels overwhelmingly land in the same source subtile, so this
         // avoids a cache lookup per pixel in the common case.
         let mut current: Option<(u32, std::sync::Arc<RgbaImage>)> = None;
-        let mut decode_failed = false;
+        let mut decode_warned: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
         for py in 0..TILE_PX {
             let y_m =
@@ -120,14 +120,13 @@ impl TileSource for RncCell {
                             img
                         }
                         Err(e) => {
-                            if !decode_failed {
+                            if decode_warned.insert(n) {
                                 tracing::warn!(
                                     cell = self.name(),
                                     n,
                                     error = %e,
                                     "failed to decode raster subtile; leaving transparent"
                                 );
-                                decode_failed = true;
                             }
                             continue;
                         }
