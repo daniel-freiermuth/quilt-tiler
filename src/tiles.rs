@@ -143,6 +143,7 @@ pub fn zoom_range_and_bounds<S: TileSource>(
     max_zoom: Option<u8>,
     zoom_offset: f64,
 ) -> Result<(u8, u8, Bbox)> {
+    anyhow::ensure!(!items.is_empty(), "no items to tile");
     let zoom_floor = items
         .iter()
         .map(|item| zoom_from_scale(item.native_scale(), zoom_offset))
