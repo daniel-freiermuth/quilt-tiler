@@ -818,6 +818,28 @@ mod tests {
     }
 
     #[test]
+    fn flood_or_subsidiary_buoy_light_string_encoded_also_suppressed() {
+        let center = Point::new(10.0, 55.0);
+        let tile = test_tile_geom(center, 0.1);
+        for catlit_str in ["6", "8"] {
+            let mut layers = HashMap::new();
+            let attrs = vec![s57::Attribute {
+                code: 37,
+                value: s57::AttrValue::Str(catlit_str.into()),
+            }];
+            light_sectors_to_mvt(center, &attrs, &tile, true, &mut layers);
+            assert!(
+                layers.get("LIGHTS_SECTOR").is_none_or(Vec::is_empty),
+                "string-encoded CATLIT {catlit_str} must not draw a circle"
+            );
+            assert!(
+                layers.get("LIGHTS_FLARE").is_none_or(Vec::is_empty),
+                "string-encoded CATLIT {catlit_str} (flood/subsidiary) must not draw a flare"
+            );
+        }
+    }
+
+    #[test]
     fn buoy_light_outside_tile_emits_no_flare() {
         let center = Point::new(10.0, 55.0);
         let far_away_tile = test_tile_geom(Point::new(20.0, 55.0), 0.1);
