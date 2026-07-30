@@ -417,4 +417,13 @@ mod tests {
             "newer edition's color should win the fully-overlapping tile"
         );
     }
+
+    #[test]
+    fn zoom_range_and_bounds_empty_items_must_bail() {
+        let result = zoom_range_and_bounds::<RncCell>(&[], None, 0.0);
+        assert!(
+            result.is_err(),
+            "empty items must bail, but got Ok with ±Infinity bbox"
+        );
+    }
 }
