@@ -373,7 +373,11 @@ fn emit_buoy_light_flare(
     tile: &TileGeom,
     layers: &mut HashMap<&'static str, Vec<MvtFeature>>,
 ) {
-    let is_flood_or_subsidiary = matches!(catlit, Some(MvtValue::UInt(6 | 8)));
+    let is_flood_or_subsidiary = match catlit {
+        Some(MvtValue::UInt(6 | 8)) => true,
+        Some(MvtValue::String(s)) if s == "6" || s == "8" => true,
+        _ => false,
+    };
     if is_flood_or_subsidiary || !tile.geom.intersects(&center) {
         return;
     }
@@ -809,6 +813,28 @@ mod tests {
             assert!(
                 layers.get("LIGHTS_FLARE").is_none_or(Vec::is_empty),
                 "CATLIT {catlit} (flood/subsidiary) must not draw a flare icon either"
+            );
+        }
+    }
+
+    #[test]
+    fn flood_or_subsidiary_buoy_light_string_encoded_also_suppressed() {
+        let center = Point::new(10.0, 55.0);
+        let tile = test_tile_geom(center, 0.1);
+        for catlit_str in ["6", "8"] {
+            let mut layers = HashMap::new();
+            let attrs = vec![s57::Attribute {
+                code: 37,
+                value: s57::AttrValue::Str(catlit_str.into()),
+            }];
+            light_sectors_to_mvt(center, &attrs, &tile, true, &mut layers);
+            assert!(
+                layers.get("LIGHTS_SECTOR").is_none_or(Vec::is_empty),
+                "string-encoded CATLIT {catlit_str} must not draw a circle"
+            );
+            assert!(
+                layers.get("LIGHTS_FLARE").is_none_or(Vec::is_empty),
+                "string-encoded CATLIT {catlit_str} (flood/subsidiary) must not draw a flare"
             );
         }
     }
