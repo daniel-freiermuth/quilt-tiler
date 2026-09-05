@@ -1495,4 +1495,127 @@ mod tests {
             "two substantial rings merely touching must stay separate, not merge into one"
         );
     }
+
+    // ── decode_covr tests ───────────────────────────────────────────────────
+
+    /// Helper: build a closed rectangular `LineString`.
+    fn rect_ring(x0: f64, y0: f64, x1: f64, y1: f64) -> LineString {
+        LineString::new(vec![
+            Coord { x: x0, y: y0 },
+            Coord { x: x1, y: y0 },
+            Coord { x: x1, y: y1 },
+            Coord { x: x0, y: y1 },
+            Coord { x: x0, y: y0 },
+        ])
+    }
+
+    #[test]
+    fn decode_covr_empty_covr_gives_empty_multipoly() {
+        let result = decode_covr("test", &[], &[]);
+        assert!(result.0.is_empty(), "no COVR → empty MultiPolygon");
+    }
+
+    #[test]
+    fn decode_covr_empty_covr_with_nocovr_gives_empty_multipoly() {
+        let nocovr = vec![rect_ring(0.0, 0.0, 1.0, 1.0)];
+        let result = decode_covr("test", &[], &nocovr);
+        assert!(result.0.is_empty(), "no COVR even with NOCOVR → empty");
+    }
+
+    #[test]
+    fn decode_covr_covr_without_nocovr_passes_through() {
+        let covr = vec![rect_ring(0.0, 0.0, 10.0, 10.0)];
+        let result = decode_covr("test", &covr, &[]);
+        assert_eq!(result.0.len(), 1, "single COVR → one polygon");
+        let area = result.unsigned_area();
+        assert!(
+            (area - 100.0).abs() < 1e-6,
+            "10×10 square area = 100, got {area}"
+        );
+    }
+
+    #[test]
+    fn decode_covr_full_erasure_guard_keeps_covr() {
+        // NOCOVR that fully covers the COVR exterior should be ignored,
+        // preserving the charted area (the full-erasure guard at line 874).
+        let covr = vec![rect_ring(1.0, 1.0, 5.0, 5.0)];
+        let nocovr = vec![rect_ring(0.0, 0.0, 10.0, 10.0)];
+        let result = decode_covr("test", &covr, &nocovr);
+        assert_eq!(result.0.len(), 1, "full-erasure NOCOVR must be skipped");
+        let area = result.unsigned_area();
+        assert!(
+            (area - 16.0).abs() < 1e-6,
+            "COVR 4×4 area must survive, got {area}"
+        );
+    }
+
+    #[test]
+    fn decode_covr_partial_subtraction_reduces_area() {
+        // A smaller NOCOVR inside a larger COVR should carve out a portion.
+        let covr = vec![rect_ring(0.0, 0.0, 10.0, 10.0)];
+        let nocovr = vec![rect_ring(2.0, 2.0, 4.0, 4.0)];
+        let result = decode_covr("test", &covr, &nocovr);
+        let area = result.unsigned_area();
+        // 10×10 = 100, minus 2×2 = 4 → 96
+        assert!(
+            (area - 96.0).abs() < 1e-6,
+            "partial subtraction: expected 96, got {area}"
+        );
+    }
+
+    #[test]
+    fn decode_covr_deduplicates_consecutive_coords() {
+        // Ring with duplicate consecutive coordinates — should be normalised
+        // and produce the same polygon as a clean ring.
+        let dirty_ring = LineString::new(vec![
+            Coord { x: 0.0, y: 0.0 },
+            Coord { x: 0.0, y: 0.0 }, // duplicate
+            Coord { x: 5.0, y: 0.0 },
+            Coord { x: 5.0, y: 0.0 }, // duplicate
+            Coord { x: 5.0, y: 5.0 },
+            Coord { x: 0.0, y: 5.0 },
+            Coord { x: 0.0, y: 0.0 },
+        ]);
+        let result = decode_covr("test", &[dirty_ring], &[]);
+        assert_eq!(result.0.len(), 1);
+        let area = result.unsigned_area();
+        assert!(
+            (area - 25.0).abs() < 1e-6,
+            "deduped ring area = 25, got {area}"
+        );
+    }
+
+    #[test]
+    fn decode_covr_auto_closes_unclosed_ring() {
+        // Ring missing the closing coordinate — should be auto-closed.
+        let unclosed = LineString::new(vec![
+            Coord { x: 0.0, y: 0.0 },
+            Coord { x: 3.0, y: 0.0 },
+            Coord { x: 3.0, y: 4.0 },
+            Coord { x: 0.0, y: 4.0 },
+            // no closing coord back to (0,0)
+        ]);
+        let result = decode_covr("test", &[unclosed], &[]);
+        assert_eq!(result.0.len(), 1, "auto-closed ring → one polygon");
+        let area = result.unsigned_area();
+        assert!(
+            (area - 12.0).abs() < 1e-6,
+            "3×4 auto-closed ring area = 12, got {area}"
+        );
+    }
+
+    #[test]
+    fn decode_covr_unclaimed_nocovr_ignored() {
+        // NOCOVR ring that doesn't intersect any COVR — should be ignored
+        // and the COVR polygon should be returned unchanged.
+        let covr = vec![rect_ring(0.0, 0.0, 5.0, 5.0)];
+        let nocovr = vec![rect_ring(100.0, 100.0, 110.0, 110.0)];
+        let result = decode_covr("test", &covr, &nocovr);
+        assert_eq!(result.0.len(), 1, "unclaimed NOCOVR doesn't affect COVR");
+        let area = result.unsigned_area();
+        assert!(
+            (area - 25.0).abs() < 1e-6,
+            "COVR area intact when NOCOVR is outside, got {area}"
+        );
+    }
 }
