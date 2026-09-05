@@ -31,3 +31,83 @@ pub fn scale_from_zoom(zoom: u8, offset: f64) -> u32 {
         .round()
         .clamp(1.0, f64::from(u32::MAX)) as u32
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── zoom_from_scale boundaries ──────────────────────────────────────
+
+    #[test]
+    fn zero_native_scale_returns_zoom_14() {
+        assert_eq!(zoom_from_scale(0, 0.0), 14);
+    }
+
+    #[test]
+    fn very_large_native_scale_clamps_to_zoom_0() {
+        assert_eq!(zoom_from_scale(u32::MAX, 0.0), 0);
+    }
+
+    #[test]
+    fn very_small_native_scale_clamps_to_zoom_22() {
+        assert_eq!(zoom_from_scale(1, 0.0), 22);
+    }
+
+    #[test]
+    fn negative_offset_clamps_zoom_to_zero() {
+        // log2(ZOOM_K / 1_000_000) ≈ 9.13; offset −15 → floor(−5.87) → clamp 0.
+        assert_eq!(zoom_from_scale(1_000_000, -15.0), 0);
+    }
+
+    #[test]
+    fn large_positive_offset_clamps_zoom_to_22() {
+        // log2(ZOOM_K / 1_000_000) ≈ 9.13; offset +20 → floor(29.13) → clamp 22.
+        assert_eq!(zoom_from_scale(1_000_000, 20.0), 22);
+    }
+
+    // ── scale_from_zoom contract ────────────────────────────────────────
+
+    #[test]
+    fn scale_from_zoom_is_always_at_least_one() {
+        // Extreme zoom or offset must never produce 0.
+        assert!(scale_from_zoom(255, 0.0) >= 1);
+        assert!(scale_from_zoom(22, 0.0) >= 1);
+        assert!(scale_from_zoom(0, -100.0) >= 1);
+    }
+
+    #[test]
+    fn scale_from_zoom_large_positive_offset_saturates_to_u32_max() {
+        // zoom 0 with offset +100 → ZOOM_K / 2^(−100) = ZOOM_K × 2^100 → clamp to u32::MAX.
+        assert_eq!(scale_from_zoom(0, 100.0), u32::MAX);
+    }
+
+    // ── round-trip stability ────────────────────────────────────────────
+
+    #[test]
+    fn zoom_round_trip_within_one_level() {
+        // zoom → representative scale → zoom may lose at most one level
+        // because zoom_from_scale floors while scale_from_zoom rounds.
+        for z in 0..=22_u8 {
+            let s = scale_from_zoom(z, 0.0);
+            let z2 = zoom_from_scale(s, 0.0);
+            assert!(
+                z2 == z || z.checked_sub(1) == Some(z2),
+                "round-trip failed: z={z} → scale={s} → z2={z2}",
+            );
+        }
+    }
+
+    #[test]
+    fn scale_round_trip_within_factor_of_two() {
+        // scale → zoom → scale stays within a factor of 2 (one zoom step).
+        for native in [500_000_u32, 1_000_000, 3_000_000, 10_000_000] {
+            let z = zoom_from_scale(native, 0.0);
+            let s_back = scale_from_zoom(z, 0.0);
+            let ratio = f64::from(s_back) / f64::from(native);
+            assert!(
+                (0.5..=2.0).contains(&ratio),
+                "scale round-trip out of range: native={native} → z={z} → s_back={s_back} (ratio={ratio:.3})",
+            );
+        }
+    }
+}
