@@ -360,7 +360,9 @@ fn cover_to_multipolygon(rings: &[Vec<f64>]) -> Option<MultiPolygon> {
                 return None; // need at least 3 points (6 numbers)
             }
             let mut coords: Vec<Coord> = ring
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|p| {
                     let (lon, lat) = rnc_merc_to_wgs84(p[0], p[1]);
                     coord! { x: lon, y: lat }
