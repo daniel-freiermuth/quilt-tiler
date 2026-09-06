@@ -24,6 +24,14 @@ pub fn is_rnc(path: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("rnc"))
 }
 
+/// Read a cell file from disk, logging a warning and returning `None` on I/O
+/// failure so the caller can skip the file without aborting the batch.
+fn read_cell_data(path: &Path) -> Option<Vec<u8>> {
+    std::fs::read(path)
+        .inspect_err(|e| warn!(file = %path.display(), error = %e, "cannot read"))
+        .ok()
+}
+
 /// Parse all `.oesu`/`.osenc` vector cell files in `paths` in parallel.
 pub fn load_s57_cells(paths: &[impl AsRef<Path> + Sync], zoom_offset: f64) -> Vec<s57::S57Cell> {
     paths
@@ -33,13 +41,7 @@ pub fn load_s57_cells(paths: &[impl AsRef<Path> + Sync], zoom_offset: f64) -> Ve
             profiling::scope!("parse");
             #[cfg(feature = "profiling")]
             let _frame = tracy_client::non_continuous_frame!("parse");
-            let data = match std::fs::read(path) {
-                Ok(d) => d,
-                Err(e) => {
-                    warn!(file = %path.display(), error = %e, "cannot read");
-                    return None;
-                }
-            };
+            let data = read_cell_data(path)?;
             match oesu::parse_file(path.to_str().unwrap_or_default().to_owned(), &data) {
                 Ok(cell) => {
                     let z = zoom_from_scale(cell.native_scale, zoom_offset);
@@ -70,13 +72,7 @@ pub fn load_rnc_cells(paths: &[impl AsRef<Path> + Sync], zoom_offset: f64) -> Ve
             profiling::scope!("parse");
             #[cfg(feature = "profiling")]
             let _frame = tracy_client::non_continuous_frame!("parse");
-            let data = match std::fs::read(path) {
-                Ok(d) => d,
-                Err(e) => {
-                    warn!(file = %path.display(), error = %e, "cannot read");
-                    return None;
-                }
-            };
+            let data = read_cell_data(path)?;
             let name = path
                 .file_stem()
                 .and_then(|s| s.to_str())
