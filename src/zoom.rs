@@ -9,14 +9,15 @@ pub const ZOOM_K: f64 = 559_082_264.0;
 /// Pass `offset = 0.0` for the unshifted result.  Fractional offsets are applied
 /// before flooring, so they shift the scale breakpoints between zoom levels rather
 /// than nudging an already-rounded integer.
+///
+/// `native_scale` must be ≥ 1; passing 0 produces division by zero in the
+/// formula (returns zoom 22 via `f64::INFINITY` clamping, but the result is
+/// meaningless).  Callers are expected to reject cells with unknown scale
+/// at parse time.
 #[must_use]
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn zoom_from_scale(native_scale: u32, offset: f64) -> u8 {
-    let log2 = if native_scale == 0 {
-        14.0
-    } else {
-        (ZOOM_K / f64::from(native_scale)).log2()
-    };
+    let log2 = (ZOOM_K / f64::from(native_scale)).log2();
     // Safety: value is clamped to [0.0, 22.0] before cast.
     (log2 + offset).floor().clamp(0.0, 22.0) as u8
 }
@@ -38,10 +39,6 @@ mod tests {
 
     // ── zoom_from_scale boundaries ──────────────────────────────────────
 
-    #[test]
-    fn zero_native_scale_returns_zoom_14() {
-        assert_eq!(zoom_from_scale(0, 0.0), 14);
-    }
 
     #[test]
     fn very_large_native_scale_clamps_to_zoom_0() {
