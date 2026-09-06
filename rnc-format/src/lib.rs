@@ -453,6 +453,98 @@ mod tests {
         assert!(format!("{err:#}").contains("offset"));
     }
 
+    /// Build a minimal `.rnc` byte buffer for a `cols×rows` grid with the
+    /// given offset table entries (must be `cols*rows + 2` values).
+    fn make_rnc_bytes(cols: u32, rows: u32, offsets: &[u32], payload_len: usize) -> Vec<u8> {
+        let mut data = vec![0u8; 8]; // 8-byte ignored header
+        data.extend_from_slice(&cols.to_le_bytes());
+        data.extend_from_slice(&rows.to_le_bytes());
+        for &o in offsets {
+            data.extend_from_slice(&o.to_le_bytes());
+        }
+        data.resize(data.len() + payload_len, 0xAB);
+        data
+    }
+
+    #[test]
+    fn header_rejects_zero_cols() {
+        // cols=0, rows=5 → n_tiles=0 → "empty tile grid"
+        let mut data = vec![0u8; 8];
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&5u32.to_le_bytes());
+        let err = RncHeader::parse(&data).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("empty tile grid"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn header_rejects_zero_rows() {
+        // cols=3, rows=0 → n_tiles=0 → "empty tile grid"
+        let mut data = vec![0u8; 8];
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        let err = RncHeader::parse(&data).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("empty tile grid"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn header_rejects_overflow_grid() {
+        // cols=u32::MAX, rows=u32::MAX → n_tiles overflows checked_mul(4)
+        let mut data = vec![0u8; 8];
+        data.extend_from_slice(&u32::MAX.to_le_bytes());
+        data.extend_from_slice(&u32::MAX.to_le_bytes());
+        let err = RncHeader::parse(&data).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("too large") || msg.contains("overflow"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn header_rejects_non_monotonic_offsets() {
+        // 1x1 grid: offsets [100, 90, 100] — second < first → non-monotonic
+        let offsets = [100u32, 90, 100];
+        let data = make_rnc_bytes(1, 1, &offsets, 80);
+        let err = RncHeader::parse(&data).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("monotonically"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn header_rejects_offsets_past_eof() {
+        // 1x1 grid: valid offsets but last tile end points beyond data length.
+        // Header = 8 + 4 + 4 = 16, offset table = 3 * 4 = 12 → table ends at 28.
+        // Set offsets to [28, 128, 128] but provide only 20 bytes of payload
+        // (total 48 bytes), so offset 128 > 48.
+        let offsets = [28u32, 128, 128];
+        let data = make_rnc_bytes(1, 1, &offsets, 20);
+        let err = RncHeader::parse(&data).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("past end of file"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn header_parses_minimal_1x1() {
+        // 1x1 grid: 3 offsets, one tile of 10 bytes.
+        // Header = 16 bytes, offset table = 3 * 4 = 12 bytes → table ends at 28.
+        let offsets = [28u32, 38, 38];
+        let data = make_rnc_bytes(1, 1, &offsets, 10);
+        let header = RncHeader::parse(&data).expect("minimal 1x1 should parse");
+        assert_eq!(header.cols, 1);
+        assert_eq!(header.rows, 1);
+        assert_eq!(header.tile_range(0, 0), Some((28, 38)));
+        assert_eq!(header.tile_range(1, 0), None);
+        assert_eq!(header.tile_range(0, 1), None);
+    }
+
     #[test]
     fn footer_parses_flat_cover_ring() {
         // The real on-disk shape (not the docs' claimed nested shape).
