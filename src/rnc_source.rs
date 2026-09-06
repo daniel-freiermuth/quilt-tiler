@@ -156,7 +156,12 @@ impl TileSource for RncCell {
         let mut canvas = vec![0u8; (TILE_PX * TILE_PX * 4) as usize];
         let mut any_opaque = false;
         for content in &contents {
-            for (dst, src) in canvas.chunks_exact_mut(4).zip(content.chunks_exact(4)) {
+            for (dst, src) in canvas
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(content.as_chunks::<4>().0)
+            {
                 if src[3] > 0 {
                     dst.copy_from_slice(src);
                     any_opaque = true;
