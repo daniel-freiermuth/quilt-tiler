@@ -300,7 +300,7 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
                 update_number = read_u16(&mut p).unwrap_or(0);
             }
             HEADER_CELL_NATIVESCALE => {
-                native_scale = read_u32(&mut p).unwrap_or(0);
+                native_scale = read_u32(&mut p).context("reading HEADER_CELL_NATIVESCALE")?;
             }
             HEADER_CELL_SENCCREATEDATE => {
                 senc_create_date = read_cstring(&mut p, payload_len).unwrap_or_default();
@@ -666,6 +666,10 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
                 tracing::warn!(rec_type = unknown, rec_len, "unknown record type, skipping");
             }
         }
+    }
+
+    if native_scale == 0 {
+        bail!("cell {source:?} has no HEADER_CELL_NATIVESCALE record (or scale is zero)");
     }
 
     // Push the last in-flight feature.
