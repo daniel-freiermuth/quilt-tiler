@@ -1,15 +1,12 @@
-//! [`TileSource`] — the trait that [`crate::tiles::write_pmtiles`] is generic over.
+//! [`TileSource`] and [`TileAccumulator`] — the traits that
+//! [`crate::tiles::write_pmtiles`] is generic over.
 //!
-//! Implement this to quilt a new kind of source data into a `PMTiles` archive.
-//! Current implementation: [`crate::s57_source`] (`S-57` cells → MVT).
+//! Implement both to quilt a new kind of source data into a `PMTiles` archive.
+//! Current implementations: [`crate::s57_source`] (S-57 cells → MVT) and
+//! [`crate::rnc_source`] (raster cells → PNG).
 //!
-//! All methods are associated functions (no `&self`): the implementing type
-//! carries no runtime state.  If per-run configuration is ever needed, wrap
-//! the item type in a newtype and implement the trait on the wrapper.
-//!
-//! Note: the trait is intentionally *not* object-safe (static functions cannot
-//! be called through `dyn TileSource`).  It is designed for monomorphised
-//! static dispatch only.
+//! Both traits are intentionally *not* object-safe — they are designed for
+//! monomorphised static dispatch only.
 
 use std::fmt::Debug;
 
@@ -21,11 +18,39 @@ use crate::bbox::Bbox;
 use crate::lattice::BoundedLattice;
 use crate::tile_geom::TileGeom;
 
+/// Accumulates per-cell [`TileSource::Content`]s into a single tile, then
+/// encodes them to raw bytes.
+///
+/// Separating accumulation from rendering keeps [`TileSource::render`] pure
+/// (no shared mutable state) and makes the cross-cell merge step explicit.
+pub trait TileAccumulator: Send {
+    /// The per-cell content type produced by [`TileSource::render`].
+    type Content: Send;
+
+    /// Create an empty accumulator for a fresh tile.
+    fn empty() -> Self;
+
+    /// Merge one cell's rendered content into this accumulator.
+    fn push(&mut self, content: Self::Content);
+
+    /// Finish accumulation and encode to raw tile bytes.
+    ///
+    /// Return an empty `Vec` to omit the tile from the archive.
+    ///
+    /// # Errors
+    /// Returns an error if serialisation fails.
+    fn encode(self) -> Result<Vec<u8>>;
+}
+
 /// A source of data that can be quilted into a `PMTiles` archive.
 pub trait TileSource: Sync {
-    /// Accumulated tile content produced by [`Self::render`] and consumed by
-    /// [`Self::encode`] (e.g. a `HashMap` of MVT layers, or a pixel buffer).
+    /// Per-cell content produced by [`Self::render`] and consumed by
+    /// [`Self::Accumulator::push`].
     type Content: Send;
+
+    /// Accumulator that collects one tile's worth of per-cell content and
+    /// encodes it to bytes.
+    type Accumulator: TileAccumulator<Content = Self::Content>;
 
     /// Lattice element used to track coverage within a tile.
     ///
@@ -41,9 +66,6 @@ pub trait TileSource: Sync {
     /// Tie-break key for `tiles::render_tile`'s candidate sort, when
     /// multiple candidates are equally well-fitted to a tile's zoom level
     /// (same floored `zoom_from_scale`) — the greater value wins the tie.
-    /// This isn't the source type's natural identity/ordering (it has
-    /// none); it exists solely for this one selection decision, so it
-    /// lives behind a dedicated method rather than the type's own `Ord`.
     type Tiebreaker: Ord;
 
     /// Source identifier for this item (debug/diagnostic use by callers).
@@ -63,15 +85,6 @@ pub trait TileSource: Sync {
     /// exact contribution region for this tile — not necessarily the whole
     /// tile — so all geometry should be clipped against it.
     fn render(&self, tile: &TileGeom) -> Self::Content;
-
-    /// Encode one tile's accumulated `contents` into raw bytes.
-    ///
-    /// Return an empty `Vec` to omit the tile from the archive.
-    ///
-    /// # Errors
-    /// Returns an error if encoding the contents into this source's tile
-    /// format fails.
-    fn encode(contents: Vec<Self::Content>) -> Result<Vec<u8>>;
 
     /// `PMTiles` tile type emitted by this source (e.g. `TileType::Mvt`).
     fn tile_type() -> TileType;

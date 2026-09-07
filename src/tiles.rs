@@ -20,7 +20,7 @@ use tracing::info;
 use crate::bbox::Bbox;
 use crate::lattice::BoundedLattice;
 use crate::tile_geom::TileGeom;
-use crate::tile_source::TileSource;
+use crate::tile_source::{TileAccumulator, TileSource};
 use crate::zoom::{scale_from_zoom, zoom_from_scale};
 
 /// A single encoded tile ready for insertion into the output archive.
@@ -227,7 +227,7 @@ pub fn render_tile<S: TileSource>(
     // disjoint coverage areas (e.g. NE + SW ≠ full tile), unlike a
     // bounding-box hull.
     let mut uncovered = S::Coverage::from(tile_wgs84);
-    let mut contents: Vec<S::Content> = Vec::new();
+    let mut acc = S::Accumulator::empty();
 
     {
         profiling::scope!("Collecting features");
@@ -241,7 +241,7 @@ pub fn render_tile<S: TileSource>(
                 merc: tile_merc,
                 scale: tile_scale,
             };
-            contents.push(items[i].render(&item_tile));
+            acc.push(items[i].render(&item_tile));
             uncovered = uncovered.minus(&contrib);
             if uncovered.area() == 0.0 {
                 break;
@@ -249,7 +249,7 @@ pub fn render_tile<S: TileSource>(
         }
     }
 
-    let bytes = S::encode(contents)?;
+    let bytes = acc.encode()?;
     Ok(if bytes.is_empty() { None } else { Some(bytes) })
 }
 

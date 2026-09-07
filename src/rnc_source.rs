@@ -21,7 +21,7 @@ use s57::EditionDate;
 use crate::bbox::Bbox;
 use crate::rnc::RncCell;
 use crate::tile_geom::TileGeom;
-use crate::tile_source::TileSource;
+use crate::tile_source::{TileAccumulator, TileSource};
 
 /// Output raster tile size in pixels. `256` is the universal default for XYZ
 /// raster tiles (`MapLibre` raster sources default `tileSize` to `256`).
@@ -32,6 +32,7 @@ impl TileSource for RncCell {
     /// top-left (north-west) corner. Transparent (`alpha = 0`) outside this
     /// item's contribution area for the tile.
     type Content = Vec<u8>;
+    type Accumulator = RasterAccumulator;
     type Coverage = MultiPolygon;
     type Tiebreaker = EditionDate;
 
@@ -149,39 +150,58 @@ impl TileSource for RncCell {
         buf
     }
 
+    fn tile_type() -> TileType {
+        TileType::Png
+    }
+}
+
+// ── Accumulator ───────────────────────────────────────────────────────────────
+
+/// Composites per-cell RGBA pixel buffers onto a single canvas, then
+/// PNG-encodes it.
+pub struct RasterAccumulator {
+    canvas: Vec<u8>,
+    any_opaque: bool,
+}
+
+impl TileAccumulator for RasterAccumulator {
+    type Content = Vec<u8>;
+
+    fn empty() -> Self {
+        Self {
+            canvas: vec![0u8; (TILE_PX * TILE_PX * 4) as usize],
+            any_opaque: false,
+        }
+    }
+
+    fn push(&mut self, content: Self::Content) {
+        for (dst, src) in self
+            .canvas
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(content.as_chunks::<4>().0)
+        {
+            if src[3] > 0 {
+                dst.copy_from_slice(src);
+                self.any_opaque = true;
+            }
+        }
+    }
+
     /// Composite contributions (already spatially disjoint) onto one canvas
     /// and PNG-encode it. Returns an empty `Vec` — omitting the tile — when
     /// every pixel stayed transparent.
-    fn encode(contents: Vec<Self::Content>) -> Result<Vec<u8>> {
-        let mut canvas = vec![0u8; (TILE_PX * TILE_PX * 4) as usize];
-        let mut any_opaque = false;
-        for content in &contents {
-            for (dst, src) in canvas
-                .as_chunks_mut::<4>()
-                .0
-                .iter_mut()
-                .zip(content.as_chunks::<4>().0)
-            {
-                if src[3] > 0 {
-                    dst.copy_from_slice(src);
-                    any_opaque = true;
-                }
-            }
-        }
-        if !any_opaque {
+    fn encode(self) -> Result<Vec<u8>> {
+        if !self.any_opaque {
             return Ok(Vec::new());
         }
-
-        let img = RgbaImage::from_raw(TILE_PX, TILE_PX, canvas)
+        let img = RgbaImage::from_raw(TILE_PX, TILE_PX, self.canvas)
             .context("building output raster tile buffer")?;
         let mut out = Vec::new();
         img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
             .context("encoding PNG tile")?;
         Ok(out)
-    }
-
-    fn tile_type() -> TileType {
-        TileType::Png
     }
 }
 
@@ -308,7 +328,12 @@ mod tests {
                 right[idx..idx + 4].copy_from_slice(&[0, 255, 0, 255]);
             }
         }
-        let bytes = RncCell::encode(vec![left, right]).expect("encode succeeds");
+        let bytes = {
+            let mut acc = RasterAccumulator::empty();
+            acc.push(left);
+            acc.push(right);
+            acc.encode().expect("encode succeeds")
+        };
         assert!(!bytes.is_empty());
         let img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
             .expect("re-decodes")
@@ -413,7 +438,11 @@ mod tests {
     #[test]
     fn encode_returns_empty_for_fully_transparent_tile() {
         let blank = vec![0u8; (TILE_PX * TILE_PX * 4) as usize];
-        let bytes = RncCell::encode(vec![blank]).expect("encode succeeds");
+        let bytes = {
+            let mut acc = RasterAccumulator::empty();
+            acc.push(blank);
+            acc.encode().expect("encode succeeds")
+        };
         assert!(bytes.is_empty());
     }
 }
