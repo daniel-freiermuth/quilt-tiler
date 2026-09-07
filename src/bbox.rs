@@ -180,22 +180,42 @@ mod tests {
 
     /// Helper: a "normal" bbox around a region.
     fn bbox_a() -> Bbox {
-        Bbox { west: 1.0, south: 2.0, east: 5.0, north: 6.0 }
+        Bbox {
+            west: 1.0,
+            south: 2.0,
+            east: 5.0,
+            north: 6.0,
+        }
     }
 
     /// A second bbox that partially overlaps `bbox_a`.
     fn bbox_b() -> Bbox {
-        Bbox { west: 3.0, south: 4.0, east: 7.0, north: 8.0 }
+        Bbox {
+            west: 3.0,
+            south: 4.0,
+            east: 7.0,
+            north: 8.0,
+        }
     }
 
     /// A bbox fully inside `bbox_a`.
     fn bbox_inner() -> Bbox {
-        Bbox { west: 2.0, south: 3.0, east: 4.0, north: 5.0 }
+        Bbox {
+            west: 2.0,
+            south: 3.0,
+            east: 4.0,
+            north: 5.0,
+        }
     }
 
     /// A bbox completely disjoint from `bbox_a`.
     fn bbox_disjoint() -> Bbox {
-        Bbox { west: 10.0, south: 10.0, east: 12.0, north: 12.0 }
+        Bbox {
+            west: 10.0,
+            south: 10.0,
+            east: 12.0,
+            north: 12.0,
+        }
     }
 
     // ── bottom ──────────────────────────────────────────────────────
@@ -285,7 +305,12 @@ mod tests {
     #[test]
     fn overlaps_with_degenerate_inverted_bbox() {
         // An "inverted" bbox where west > east acts like bottom.
-        let inverted = Bbox { west: 5.0, south: 2.0, east: 1.0, north: 6.0 };
+        let inverted = Bbox {
+            west: 5.0,
+            south: 2.0,
+            east: 1.0,
+            north: 6.0,
+        };
         assert!(inverted.is_bottom());
         assert!(!inverted.overlaps(&bbox_a()));
         assert!(!bbox_a().overlaps(&inverted));
@@ -327,7 +352,10 @@ mod tests {
     fn minus_full_subsumption_returns_bottom() {
         // bbox_a fully contains bbox_inner, so bbox_inner − bbox_a = ⊥
         let result = bbox_inner().minus(&bbox_a());
-        assert!(result.is_bottom(), "fully subsumed minus must return bottom");
+        assert!(
+            result.is_bottom(),
+            "fully subsumed minus must return bottom"
+        );
     }
 
     #[test]

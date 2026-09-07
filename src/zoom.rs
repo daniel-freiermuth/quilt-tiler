@@ -39,7 +39,6 @@ mod tests {
 
     // ── zoom_from_scale boundaries ──────────────────────────────────────
 
-
     #[test]
     fn very_large_native_scale_clamps_to_zoom_0() {
         assert_eq!(zoom_from_scale(u32::MAX, 0.0), 0);

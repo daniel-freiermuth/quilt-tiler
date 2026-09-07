@@ -194,7 +194,7 @@ impl AppState {
     /// life of the process, one source kind per server.
     const fn content_type(&self) -> &'static str {
         match &self.sources {
-            Sources::Vector { .. } => "application/x-protobuf",
+            Sources::Vector { .. } => "application/vnd.maplibre-tile",
             Sources::Raster { .. } => "image/png",
         }
     }
