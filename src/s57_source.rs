@@ -248,8 +248,10 @@ impl TileAccumulator for S57Accumulator {
 
     fn encode(self) -> Result<Vec<u8>> {
         let cfg = EncoderConfig::default();
+        let mut layers: Vec<_> = self.0.into_iter().collect();
+        layers.sort_unstable_by_key(|(name, _)| *name);
         let mut out = Vec::new();
-        for (_, buf) in self.0 {
+        for (_, buf) in layers {
             if buf.feature_count() == 0 {
                 continue;
             }
