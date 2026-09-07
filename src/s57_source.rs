@@ -1,33 +1,113 @@
-//! [`TileSource`] implementation for OESU/S-57 vector cells → MVT tiles.
+//! [`TileSource`] implementation for OESU/S-57 vector cells → MLT tiles.
+//!
+//! `render` returns plain [`RawFeature`] tuples (geometry + property list) per
+//! layer — no builder state, no schema decisions.  [`S57Accumulator`] collects
+//! those tuples across cells and lazily feeds them into [`LayerBuf`]s via
+//! [`TileAccumulator::push`].  [`LayerBuf`] wraps [`TileLayerBuilder`] and
+//! registers property columns on the fly (back-filling earlier features with
+//! typed nulls).  [`S57Accumulator::encode`] finishes the builders and
+//! serialises each layer as MLT.
 
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use fast_mvt::{
-    DEFAULT_EXTENT, MvtFeature, MvtGeometry, MvtLayer, MvtLineString, MvtTile, MvtValue,
-};
 use geo::{
     BooleanOps, Coord, HasDimensions, Intersects, LineString, MapCoords, MultiLineString,
     MultiPolygon, Point, Polygon, coord,
 };
-
 use martin_tile_utils::wgs84_to_webmercator;
+use mlt_core::{
+    PropKind, PropValue, PropertyKey, TileLayer, TileLayerBuilder, encoder::EncoderConfig,
+};
 use pmtiles::TileType;
 
 use crate::bbox::Bbox;
 use crate::tile_geom::TileGeom;
 use crate::tile_source::{TileAccumulator, TileSource};
 
-/// Pixel-space scale `to_px` projects into — must match the MVT layer's
-/// declared extent ([`DEFAULT_EXTENT`]), or geometry and the tile's own
-/// coordinate-space header disagree.  Derived from it, not duplicated.
-#[allow(clippy::cast_precision_loss)] // exact: any u32 fits a f64 mantissa
-const EXTENT: f64 = DEFAULT_EXTENT.get() as f64;
+/// Standard tile grid extent: 4096 units per axis.
+const TILE_EXTENT: u32 = 4096;
+#[allow(clippy::cast_precision_loss)] // exact: 4096 fits a f64 mantissa
+const EXTENT: f64 = TILE_EXTENT as f64;
 
-// ── TileSource impl ──────────────────────────────────────────────────────────
+/// A feature in tile pixel-space: geometry + untyped property list.
+///
+/// This is the pure data that [`TileSource::render`] returns.  Schema
+/// inference and columnar encoding happen later inside [`S57Accumulator`].
+type RawFeature = (geo::Geometry<i32>, Vec<(String, PropValue)>);
+
+// ── LayerBuf ──────────────────────────────────────────────────────────────────
+
+/// Accumulates MLT features for one layer during rendering.
+///
+/// Properties are registered lazily: the first time a name is seen,
+/// [`TileLayerBuilder::add_property`] is called (which back-fills all already-
+/// pushed features with a typed null).  Relies on S-57's stable per-layer
+/// attribute types, so the first-seen type for a column is authoritative.
+pub struct LayerBuf {
+    builder: TileLayerBuilder,
+    /// `name` → `(PropertyKey, registered kind)`
+    keys: HashMap<String, (PropertyKey, PropKind)>,
+    count: usize,
+}
+
+impl LayerBuf {
+    fn new(name: &str) -> Self {
+        Self {
+            builder: TileLayer::builder(name, TILE_EXTENT)
+                .expect("non-empty S-57 acronym and non-zero extent"),
+            keys: HashMap::new(),
+            count: 0,
+        }
+    }
+
+    /// Push one pixel-space feature.  New property names are registered on the
+    /// fly; existing features get a typed null via `add_property`'s back-fill.
+    fn push(&mut self, geom: geo::Geometry<i32>, props: Vec<(String, PropValue)>) {
+        // One pass: get-or-register each column, collecting (key, kind, value).
+        // Both fields are borrowed separately so the or_insert_with closure can
+        // call builder.add_property while entry() holds the map borrow.
+        let keyed_props: Vec<(PropertyKey, PropKind, PropValue)> = {
+            let keys = &mut self.keys;
+            let builder = &mut self.builder;
+            props
+                .into_iter()
+                .map(|(name, val)| {
+                    let (key, kind) = *keys.entry(name.clone()).or_insert_with(|| {
+                        let kind = PropKind::from(&val);
+                        let key = builder
+                            .add_property(&name, kind)
+                            .expect("name is new — or_insert_with only runs when absent");
+                        (key, kind)
+                    });
+                    (key, kind, val)
+                })
+                .collect()
+        };
+
+        let mut feat = self.builder.feature(geom);
+        for (key, kind, val) in keyed_props {
+            feat.property(key, coerce(val, kind))
+                .expect("key from our builder, coerce ensures kind matches");
+        }
+        feat.finish().expect("schema is consistent by construction");
+        self.count += 1;
+    }
+
+    #[must_use]
+    pub const fn feature_count(&self) -> usize {
+        self.count
+    }
+
+    fn finish(self) -> TileLayer {
+        self.builder.finish()
+    }
+}
+
+// ── TileSource impl ───────────────────────────────────────────────────────────
 
 impl TileSource for s57::S57Cell {
-    type Content = HashMap<&'static str, Vec<MvtFeature>>;
+    type Content = HashMap<&'static str, Vec<RawFeature>>;
     type Accumulator = S57Accumulator;
     type Coverage = MultiPolygon;
     type Tiebreaker = s57::EditionDate;
@@ -51,7 +131,7 @@ impl TileSource for s57::S57Cell {
 
     #[profiling::function]
     fn render(&self, tile: &TileGeom) -> Self::Content {
-        let mut layers: HashMap<&'static str, Vec<MvtFeature>> = HashMap::new();
+        let mut layers: HashMap<&'static str, Vec<RawFeature>> = HashMap::new();
 
         for feat in &self.features {
             let Some(layer_name) = s57::object_acronym(feat.type_code) else {
@@ -63,10 +143,7 @@ impl TileSource for s57::S57Cell {
                     continue;
                 }
             }
-            let feats = to_mvt_features(feat, tile);
-            if !feats.is_empty() {
-                layers.entry(layer_name).or_default().extend(feats);
-            }
+            push_features(feat, tile, layers.entry(layer_name).or_default());
         }
 
         let lateral_cardinal_buoy_positions: std::collections::HashSet<(i64, i64)> = self
@@ -130,7 +207,7 @@ impl TileSource for s57::S57Cell {
                 }
                 let on_lateral_cardinal_buoy =
                     lateral_cardinal_buoy_positions.contains(&quantize_point(*center));
-                light_sectors_to_mvt(
+                light_sectors_to_features(
                     *center,
                     &feat.attributes,
                     tile,
@@ -144,69 +221,88 @@ impl TileSource for s57::S57Cell {
     }
 
     fn tile_type() -> TileType {
-        TileType::Mvt
+        TileType::Mlt
     }
 }
 
 // ── Accumulator ───────────────────────────────────────────────────────────────
 
-/// Accumulates MVT features across cells, then encodes to MVT bytes.
-pub struct S57Accumulator(HashMap<&'static str, Vec<MvtFeature>>);
+/// Accumulates raw per-cell features into [`LayerBuf`]s, then encodes as MLT.
+pub struct S57Accumulator(HashMap<&'static str, LayerBuf>);
 
 impl TileAccumulator for S57Accumulator {
-    type Content = HashMap<&'static str, Vec<MvtFeature>>;
+    type Content = HashMap<&'static str, Vec<RawFeature>>;
 
     fn empty() -> Self {
         Self(HashMap::new())
     }
 
     fn push(&mut self, content: Self::Content) {
-        for (layer, feats) in content {
-            self.0.entry(layer).or_default().extend(feats);
+        for (name, feats) in content {
+            let buf = self.0.entry(name).or_insert_with(|| LayerBuf::new(name));
+            for (geom, props) in feats {
+                buf.push(geom, props);
+            }
         }
     }
 
     fn encode(self) -> Result<Vec<u8>> {
-        encode_tile(self.0)
+        let cfg = EncoderConfig::default();
+        let mut out = Vec::new();
+        for (_, buf) in self.0 {
+            if buf.feature_count() == 0 {
+                continue;
+            }
+            let encoded = buf.finish().encode(cfg).context("encoding MLT layer")?;
+            out.extend_from_slice(&encoded);
+        }
+        Ok(out)
     }
 }
 
-// ── MVT encoding ─────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-#[profiling::function]
-fn encode_tile(layers: HashMap<&'static str, Vec<MvtFeature>>) -> Result<Vec<u8>> {
-    let mut tile = MvtTile::new();
-    for (name, features) in layers {
-        if features.is_empty() {
-            continue;
-        }
-        let mut layer = MvtLayer::new(name, DEFAULT_EXTENT);
-        for feat in features {
-            layer.add_feature(feat);
-        }
-        tile.add_layer(layer);
+/// Coerce `val` to `kind`, converting to a string representation as a last resort.
+///
+/// S-57 attribute types are stable per attribute code, so this is normally a
+/// no-op.  It defends against the rare case where the same attribute appears
+/// with different types across features (e.g. CATLIT as both U64 and Str).
+fn coerce(val: PropValue, kind: PropKind) -> PropValue {
+    if PropKind::from(&val) == kind {
+        return val;
     }
-    if tile.layers.is_empty() {
-        return Ok(vec![]);
+    match (val, kind) {
+        (PropValue::U64(Some(v)), PropKind::I64) => {
+            PropValue::I64(Some(i64::try_from(v).unwrap_or(i64::MAX)))
+        }
+        (PropValue::F32(Some(v)), PropKind::F64) => PropValue::F64(Some(f64::from(v))),
+        (v, PropKind::Str) => PropValue::Str(Some(match v {
+            PropValue::Bool(Some(b)) => b.to_string(),
+            PropValue::I64(Some(i)) => i.to_string(),
+            PropValue::U64(Some(u)) => u.to_string(),
+            PropValue::F32(Some(f)) => f.to_string(),
+            PropValue::F64(Some(f)) => f.to_string(),
+            _ => return PropValue::Str(None),
+        })),
+        (_, k) => PropValue::null(k),
     }
-    tile.encode().context("encoding MVT tile")
 }
 
-// ── Coordinate projection ────────────────────────────────────────────────────
+// ── Coordinate projection ─────────────────────────────────────────────────────
 
 /// Project `(lon, lat)` WGS84 to tile pixel coordinates in `[0, EXTENT]` space.
 ///
 /// Geometry is clipped to the tile bbox before this is called, so all
 /// projected coordinates stay within the valid range.
 #[allow(clippy::cast_possible_truncation)] // deliberate floor-truncation to pixel
-fn to_px(wgs84_coord: Coord, merc: Bbox) -> fast_mvt::MvtCoord {
+fn to_px(wgs84_coord: Coord, merc: Bbox) -> Coord<i32> {
     let (x_m, y_m) = wgs84_to_webmercator(wgs84_coord.x, wgs84_coord.y);
     let px = ((x_m - merc.west) / (merc.east - merc.west) * EXTENT) as i32;
     let py = ((merc.north - y_m) / (merc.north - merc.south) * EXTENT) as i32; // y=0 at north
-    (px, py).into()
+    coord! { x: px, y: py }
 }
 
-// ── Feature filtering ────────────────────────────────────────────────────────
+// ── Feature filtering ─────────────────────────────────────────────────────────
 
 fn feat_intersects(feat: &s57::Feature, tile_geom: &MultiPolygon) -> bool {
     match &feat.geometry {
@@ -218,7 +314,7 @@ fn feat_intersects(feat: &s57::Feature, tile_geom: &MultiPolygon) -> bool {
     }
 }
 
-// ── Geometry clipping ────────────────────────────────────────────────────────
+// ── Geometry clipping ─────────────────────────────────────────────────────────
 
 /// Clip a polyline stroke to `clip` — an arbitrary [`MultiPolygon`] region,
 /// not necessarily a single rectangle.
@@ -240,92 +336,76 @@ fn clip_ring(subject: &Polygon, clip: &MultiPolygon) -> MultiPolygon {
     subject.intersection(clip)
 }
 
-// ── Feature → MVT conversion ─────────────────────────────────────────────────
+// ── Feature → tile pixel push ─────────────────────────────────────────────────
 
-/// Convert one S-57 feature to zero or more MVT features in tile pixel space.
-///
-/// All geometry is clipped to `tile.geom`.  `Soundings` points are
-/// additionally filtered to their exact containing tile.
+/// Push pixel-space features for one S-57 feature directly into `out`.
+/// Geometry is clipped to `tile.geom`; soundings are additionally filtered to
+/// their exact containing tile.
 #[profiling::function]
-fn to_mvt_features(feat: &s57::Feature, tile: &TileGeom) -> Vec<MvtFeature> {
+fn push_features(feat: &s57::Feature, tile: &TileGeom, out: &mut Vec<RawFeature>) {
     // SCAMIN: skip features whose minimum display scale is coarser than this tile.
-    // tile.scale > scamin → tile is too coarse to show this feature.
     const SCAMIN_CODE: u16 = 133;
     if let Some(attr) = feat.attributes.iter().find(|a| a.code == SCAMIN_CODE)
         && let s57::AttrValue::Int(scamin) = attr.value
         && scamin < tile.scale
     {
-        return vec![];
+        return;
     }
 
     let props = build_props(&feat.attributes);
 
     match &feat.geometry {
-        s57::Geometry::None => vec![],
+        s57::Geometry::None => {}
 
         s57::Geometry::Point(p) => {
             let c = to_px((*p).into(), tile.merc);
-            let mut f = MvtFeature::new(MvtGeometry::Point(c.into()));
-            f.properties = props;
-            vec![f]
+            out.push((geo::Geometry::Point(geo::Point::new(c.x, c.y)), props));
         }
 
-        s57::Geometry::Soundings(pts) => pts
-            .iter()
-            .filter(|(wgs_coord, _)| {
-                // Each sounding belongs to exactly one tile.
-                tile.geom.intersects(wgs_coord)
-            })
-            .map(|(wgs_coord, depth)| {
+        s57::Geometry::Soundings(pts) => {
+            for (wgs_coord, depth) in pts.iter().filter(|(p, _)| tile.geom.intersects(p)) {
                 let c = to_px((*wgs_coord).into(), tile.merc);
-                let mut f = MvtFeature::new(MvtGeometry::Point(c.into()));
-                f.properties.clone_from(&props);
-                f.add_tag_double("VALDCO", *depth);
-                f
-            })
-            .collect(),
+                let mut feat_props = props.clone();
+                feat_props.push(("VALDCO".to_string(), PropValue::F64(Some(*depth))));
+                out.push((geo::Geometry::Point(geo::Point::new(c.x, c.y)), feat_props));
+            }
+        }
 
         s57::Geometry::Line(stroke) => {
             if stroke.is_empty() {
-                return vec![];
+                return;
             }
             let clipped: MultiLineString = clip_stroke(stroke, &tile.geom);
             if clipped.is_empty() {
-                return vec![];
+                return;
             }
-            let mvt_linestring = clipped.map_coords(|coord| to_px(coord, tile.merc));
-            let geom = MvtGeometry::MultiLineString(mvt_linestring);
-            let mut f = MvtFeature::new(geom);
-            f.properties = props;
-            vec![f]
+            let px: geo::MultiLineString<i32> = clipped.map_coords(|coord| to_px(coord, tile.merc));
+            out.push((geo::Geometry::MultiLineString(px), props));
         }
 
         s57::Geometry::Area(ag) => {
             if ag.is_empty() {
-                return vec![];
+                return;
             }
-            let clipped_wgs84 = clip_ring(ag, &tile.geom);
-            if clipped_wgs84.is_empty() {
-                return vec![];
+            let clipped = clip_ring(ag, &tile.geom);
+            if clipped.is_empty() {
+                return;
             }
-            let clipped_px = clipped_wgs84.map_coords(|coord| to_px(coord, tile.merc));
-
-            let mut f = MvtFeature::new(MvtGeometry::MultiPolygon(clipped_px));
-            f.properties = props;
-            vec![f]
+            let px: geo::MultiPolygon<i32> = clipped.map_coords(|coord| to_px(coord, tile.merc));
+            out.push((geo::Geometry::MultiPolygon(px), props));
         }
     }
 }
 
-fn build_props(attrs: &[s57::Attribute]) -> Vec<(String, MvtValue)> {
+fn build_props(attrs: &[s57::Attribute]) -> Vec<(String, PropValue)> {
     attrs
         .iter()
         .filter_map(|attr| {
             let key = s57::attribute_acronym(attr.code)?;
             let val = match &attr.value {
-                s57::AttrValue::Int(i) => MvtValue::UInt(u64::from(*i)),
-                s57::AttrValue::Double(f) => MvtValue::Double(*f),
-                s57::AttrValue::Str(s) => MvtValue::String(s.clone()),
+                s57::AttrValue::Int(i) => PropValue::U64(Some(u64::from(*i))),
+                s57::AttrValue::Double(f) => PropValue::F64(Some(*f)),
+                s57::AttrValue::Str(s) => PropValue::Str(Some(s.clone())),
             };
             Some((key.to_string(), val))
         })
@@ -369,7 +449,7 @@ fn bearing_offset(coord: Coord, bearing_deg: f64, dist_m: f64) -> Coord {
 
 /// `true` for lateral and cardinal buoys: their lights are plain all-round
 /// lights with no real sector data, so the synthetic "no sector" full circle
-/// (see `light_sectors_to_mvt`) is just clutter and is suppressed for them.
+/// (see `light_sectors_to_features`) is just clutter and is suppressed for them.
 fn is_lateral_or_cardinal_buoy(acronym: &str) -> bool {
     matches!(acronym, "BOYLAT" | "BOYCAR")
 }
@@ -377,44 +457,48 @@ fn is_lateral_or_cardinal_buoy(acronym: &str) -> bool {
 /// Emits a small flare-icon marker for a buoy-mounted all-round light that
 /// has no real sector data, and therefore no range-circle drawn for it
 /// (the synthetic "no sector" circle is suppressed as clutter — see
-/// `light_sectors_to_mvt`).  CATLIT 6/8 (flood / subsidiary light) aren't
+/// `light_sectors_to_features`).  CATLIT 6/8 (flood / subsidiary light) aren't
 /// standalone aids to navigation, so those are skipped too.
 fn emit_buoy_light_flare(
     center: Point,
     colour: &str,
-    catlit: Option<&MvtValue>,
+    catlit: Option<&PropValue>,
     tile: &TileGeom,
-    layers: &mut HashMap<&'static str, Vec<MvtFeature>>,
+    out: &mut Vec<RawFeature>,
 ) {
     let is_flood_or_subsidiary = match catlit {
-        Some(MvtValue::UInt(6 | 8)) => true,
-        Some(MvtValue::String(s)) if s == "6" || s == "8" => true,
+        Some(PropValue::U64(Some(6 | 8))) => true,
+        Some(PropValue::Str(Some(s))) if s == "6" || s == "8" => true,
         _ => false,
     };
     if is_flood_or_subsidiary || !tile.geom.intersects(&center) {
         return;
     }
-    let mut f = MvtFeature::new(MvtGeometry::Point(to_px(center.into(), tile.merc).into()));
-    f.properties
-        .push(("COLOUR".into(), MvtValue::String(colour.into())));
+    let c = to_px(center.into(), tile.merc);
+    let geom = geo::Geometry::Point(geo::Point::new(c.x, c.y));
+    let mut props = vec![(
+        "COLOUR".to_string(),
+        PropValue::Str(Some(colour.to_string())),
+    )];
     if let Some(cv) = catlit {
-        f.properties.push(("CATLIT".into(), cv.clone()));
+        props.push(("CATLIT".to_string(), cv.clone()));
     }
-    layers.entry("LIGHTS_FLARE").or_default().push(f);
+    out.push((geom, props));
 }
 
 /// Generate arc and radial sector features for one `LIGHTS` point.
 ///
 /// Appends to `layers["LIGHTS_SECTOR"]`.
 /// Attribute codes: `CATLIT=37  COLOUR=75  SECTR1=136  SECTR2=137  VALNMR=178`
-fn light_sectors_to_mvt(
+#[allow(clippy::too_many_lines)]
+fn light_sectors_to_features(
     center: Point,
     attrs: &[s57::Attribute],
     tile: &TileGeom,
     on_lateral_cardinal_buoy: bool,
-    layers: &mut HashMap<&'static str, Vec<MvtFeature>>,
+    layers: &mut HashMap<&'static str, Vec<RawFeature>>,
 ) {
-    let mut catlit: Option<MvtValue> = None;
+    let mut catlit: Option<PropValue> = None;
     let mut colour = "";
     let mut sectr1: Option<f64> = None;
     let mut sectr2: Option<f64> = None;
@@ -424,9 +508,9 @@ fn light_sectors_to_mvt(
         match attr.code {
             37 => {
                 catlit = Some(match &attr.value {
-                    s57::AttrValue::Int(i) => MvtValue::UInt(u64::from(*i)),
-                    s57::AttrValue::Str(s) => MvtValue::String(s.clone()),
-                    s57::AttrValue::Double(f) => MvtValue::Double(*f),
+                    s57::AttrValue::Int(i) => PropValue::U64(Some(u64::from(*i))),
+                    s57::AttrValue::Str(s) => PropValue::Str(Some(s.clone())),
+                    s57::AttrValue::Double(f) => PropValue::F64(Some(*f)),
                 });
             }
             75 => {
@@ -471,7 +555,13 @@ fn light_sectors_to_mvt(
         // circle (clutter — it conveys no real sector information here),
         // and draw a small tilted flare icon instead so the buoy's light
         // still shows up on the chart.
-        emit_buoy_light_flare(center, colour, catlit.as_ref(), tile, layers);
+        emit_buoy_light_flare(
+            center,
+            colour,
+            catlit.as_ref(),
+            tile,
+            layers.entry("LIGHTS_FLARE").or_default(),
+        );
         return;
     }
     let (from_brg, to_brg_raw) = if has_sectors {
@@ -498,18 +588,18 @@ fn light_sectors_to_mvt(
             .collect(),
     );
 
+    let sector_feats = layers.entry("LIGHTS_SECTOR").or_default();
     let mut push_line = |pts: LineString, kind: &'static str| {
         for stroke in clip_stroke(&pts, &tile.geom) {
-            let ls: MvtLineString = stroke.map_coords(|c| to_px(c, tile.merc));
-            let mut f = MvtFeature::new(MvtGeometry::LineString(ls));
-            f.properties
-                .push(("kind".into(), MvtValue::String(kind.into())));
-            f.properties
-                .push(("color".into(), MvtValue::String(hex.into())));
+            let ls: geo::LineString<i32> = stroke.map_coords(|c| to_px(c, tile.merc));
+            let mut props = vec![
+                ("kind".to_string(), PropValue::Str(Some(kind.to_string()))),
+                ("color".to_string(), PropValue::Str(Some(hex.to_string()))),
+            ];
             if let Some(cv) = &catlit {
-                f.properties.push(("CATLIT".into(), cv.clone()));
+                props.push(("CATLIT".to_string(), cv.clone()));
             }
-            layers.entry("LIGHTS_SECTOR").or_default().push(f);
+            sector_feats.push((geo::Geometry::LineString(ls), props));
         }
     };
 
@@ -527,7 +617,7 @@ fn light_sectors_to_mvt(
     }
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────────
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -598,9 +688,6 @@ mod tests {
 
     #[test]
     fn stroke_clips_to_two_disjoint_rects() {
-        // Non-rectangular clip region: two separate rects, not their hull.
-        // A stroke crossing the gap between them must split into two pieces
-        // and never touch the uncovered middle strip [4, 6].
         let clip = MultiPolygon::new(vec![
             Polygon::from(Bbox {
                 west: 0.0,
@@ -636,8 +723,6 @@ mod tests {
 
     #[test]
     fn ring_fully_inside_is_unchanged() {
-        // Same vertex set as the input, no clipping needed — winding/start
-        // point may differ from the boolean-op engine's normalisation.
         let clip = rect(0.0, 0.0, 10.0, 10.0);
         let points = vec![[1.0, 1.0], [9.0, 1.0], [9.0, 9.0], [1.0, 9.0]];
         let ring = Polygon::new(LineString::from(points.clone()), vec![]);
@@ -704,8 +789,6 @@ mod tests {
 
     #[test]
     fn ring_clipped_to_two_disjoint_rects_yields_two_polygons() {
-        // Non-rectangular clip region: a ring spanning both rects (and the
-        // uncovered gap between them) must split into two separate polygons.
         let clip = MultiPolygon::new(vec![
             Polygon::from(Bbox {
                 west: 0.0,
@@ -740,7 +823,7 @@ mod tests {
         }
     }
 
-    // ── light_sectors_to_mvt: buoy circle suppression ────────────────────────
+    // ── light_sectors_to_features: buoy circle suppression ───────────────────
 
     /// A small square tile region centered on `center`, wide enough to
     /// contain any light-sector arc (max radius 600 m ≪ `margin_deg`).
@@ -761,14 +844,15 @@ mod tests {
         }
     }
 
-    fn kind_of(f: &MvtFeature) -> Option<&str> {
-        f.properties.iter().find_map(|(k, v)| {
+    fn kind_of(feat: &RawFeature) -> Option<&str> {
+        feat.1.iter().find_map(|(k, v)| {
             if k != "kind" {
                 return None;
             }
-            match v {
-                MvtValue::String(s) => Some(s.as_str()),
-                _ => Some(""),
+            if let PropValue::Str(Some(s)) = v {
+                Some(s.as_str())
+            } else {
+                None
             }
         })
     }
@@ -791,20 +875,20 @@ mod tests {
             code: 75,
             value: s57::AttrValue::Str("1".into()),
         }];
-        light_sectors_to_mvt(center, &attrs, &tile, true, &mut layers);
+        light_sectors_to_features(center, &attrs, &tile, true, &mut layers);
         assert!(
-            layers.get("LIGHTS_SECTOR").is_none_or(Vec::is_empty),
+            layers.get("LIGHTS_SECTOR").is_none_or(|v| v.is_empty()),
             "buoy-mounted all-round light must not draw a synthetic range circle"
         );
         let flare = layers
-            .get("LIGHTS_FLARE")
+            .remove("LIGHTS_FLARE")
             .expect("buoy-mounted light without a circle must still show a flare icon");
         assert_eq!(flare.len(), 1);
         assert!(
             flare[0]
-                .properties
+                .1
                 .iter()
-                .any(|(k, v)| k == "COLOUR" && matches!(v, MvtValue::String(s) if s == "1"))
+                .any(|(k, v)| k == "COLOUR" && matches!(v, PropValue::Str(Some(s)) if s == "1"))
         );
     }
 
@@ -818,7 +902,7 @@ mod tests {
                 code: 37,
                 value: s57::AttrValue::Int(catlit),
             }];
-            light_sectors_to_mvt(center, &attrs, &tile, true, &mut layers);
+            light_sectors_to_features(center, &attrs, &tile, true, &mut layers);
             assert!(
                 layers.get("LIGHTS_SECTOR").is_none_or(Vec::is_empty),
                 "CATLIT {catlit} must not draw a circle"
@@ -840,7 +924,7 @@ mod tests {
                 code: 37,
                 value: s57::AttrValue::Str(catlit_str.into()),
             }];
-            light_sectors_to_mvt(center, &attrs, &tile, true, &mut layers);
+            light_sectors_to_features(center, &attrs, &tile, true, &mut layers);
             assert!(
                 layers.get("LIGHTS_SECTOR").is_none_or(Vec::is_empty),
                 "string-encoded CATLIT {catlit_str} must not draw a circle"
@@ -857,7 +941,7 @@ mod tests {
         let center = Point::new(10.0, 55.0);
         let far_away_tile = test_tile_geom(Point::new(20.0, 55.0), 0.1);
         let mut layers = HashMap::new();
-        light_sectors_to_mvt(center, &[], &far_away_tile, true, &mut layers);
+        light_sectors_to_features(center, &[], &far_away_tile, true, &mut layers);
         assert!(layers.get("LIGHTS_FLARE").is_none_or(Vec::is_empty));
     }
 
@@ -866,11 +950,11 @@ mod tests {
         let center = Point::new(10.0, 55.0);
         let tile = test_tile_geom(center, 0.1);
         let mut layers = HashMap::new();
-        light_sectors_to_mvt(center, &[], &tile, false, &mut layers);
-        let feats = layers
-            .get("LIGHTS_SECTOR")
+        light_sectors_to_features(center, &[], &tile, false, &mut layers);
+        let sector = layers
+            .remove("LIGHTS_SECTOR")
             .expect("standalone light should draw its nominal-range circle");
-        assert!(feats.iter().any(|f| kind_of(f) == Some("arc")));
+        assert!(sector.iter().any(|f| kind_of(f) == Some("arc")));
     }
 
     #[test]
@@ -888,23 +972,19 @@ mod tests {
             },
         ];
         let mut layers = HashMap::new();
-        light_sectors_to_mvt(center, &attrs, &tile, false, &mut layers);
-        let feats = layers
-            .get("LIGHTS_SECTOR")
+        light_sectors_to_features(center, &attrs, &tile, false, &mut layers);
+        let sector = layers
+            .remove("LIGHTS_SECTOR")
             .expect("sector features expected");
-        let radial = feats
+        let radial = sector
             .iter()
             .find(|f| kind_of(f) == Some("radial"))
             .expect("expected a radial boundary line");
-        let MvtGeometry::LineString(ls) = &radial.geometry else {
+        let geo::Geometry::LineString(ls) = &radial.0 else {
             panic!("radial feature must be a LineString");
         };
         let center_px = to_px(center.into(), tile.merc);
         let tip = ls.0[1];
-        // SECTR1 = 0° means a vessel at sea sees the light bearing due
-        // north of itself — so the vessel (and the boundary ray drawn
-        // outward from the light) lies due *south* of the light, not
-        // due north. Regression for the reciprocal-bearing fix.
         assert!(
             tip.y > center_px.y,
             "boundary ray for SECTR1=0° must point south (larger pixel y) \
@@ -932,13 +1012,13 @@ mod tests {
             },
         ];
         let mut layers = HashMap::new();
-        light_sectors_to_mvt(center, &attrs, &tile, true, &mut layers);
-        let feats = layers
-            .get("LIGHTS_SECTOR")
+        light_sectors_to_features(center, &attrs, &tile, true, &mut layers);
+        let sector = layers
+            .remove("LIGHTS_SECTOR")
             .expect("real sector data must still be drawn even on a buoy");
-        assert!(feats.iter().any(|f| kind_of(f) == Some("arc")));
+        assert!(sector.iter().any(|f| kind_of(f) == Some("arc")));
         assert_eq!(
-            feats
+            sector
                 .iter()
                 .filter(|f| kind_of(f) == Some("radial"))
                 .count(),

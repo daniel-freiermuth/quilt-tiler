@@ -123,6 +123,7 @@ pub fn build_style(
     style["sources"] = json!({
         "enc": {
             "type": "vector",
+            "encoding": "mlt",
             "tiles": [tile_url],
             "minzoom": min_zoom,
             "maxzoom": max_zoom
