@@ -16,7 +16,7 @@ use pmtiles::TileType;
 
 use crate::bbox::Bbox;
 use crate::tile_geom::TileGeom;
-use crate::tile_source::TileSource;
+use crate::tile_source::{TileAccumulator, TileSource};
 
 /// Pixel-space scale `to_px` projects into — must match the MVT layer's
 /// declared extent ([`DEFAULT_EXTENT`]), or geometry and the tile's own
@@ -28,6 +28,7 @@ const EXTENT: f64 = DEFAULT_EXTENT.get() as f64;
 
 impl TileSource for s57::S57Cell {
     type Content = HashMap<&'static str, Vec<MvtFeature>>;
+    type Accumulator = S57Accumulator;
     type Coverage = MultiPolygon;
     type Tiebreaker = s57::EditionDate;
 
@@ -142,19 +143,31 @@ impl TileSource for s57::S57Cell {
         layers
     }
 
-    #[profiling::function]
-    fn encode(contents: Vec<Self::Content>) -> Result<Vec<u8>> {
-        let mut merged: HashMap<&'static str, Vec<MvtFeature>> = HashMap::new();
-        for content in contents {
-            for (layer, feats) in content {
-                merged.entry(layer).or_default().extend(feats);
-            }
-        }
-        encode_tile(merged)
-    }
-
     fn tile_type() -> TileType {
         TileType::Mvt
+    }
+}
+
+// ── Accumulator ───────────────────────────────────────────────────────────────
+
+/// Accumulates MVT features across cells, then encodes to MVT bytes.
+pub struct S57Accumulator(HashMap<&'static str, Vec<MvtFeature>>);
+
+impl TileAccumulator for S57Accumulator {
+    type Content = HashMap<&'static str, Vec<MvtFeature>>;
+
+    fn empty() -> Self {
+        Self(HashMap::new())
+    }
+
+    fn push(&mut self, content: Self::Content) {
+        for (layer, feats) in content {
+            self.0.entry(layer).or_default().extend(feats);
+        }
+    }
+
+    fn encode(self) -> Result<Vec<u8>> {
+        encode_tile(self.0)
     }
 }
 
