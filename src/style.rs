@@ -257,6 +257,114 @@ mod tests {
         }
     }
 
+    /// Build the style as a [`Value`] with the given depth configuration.
+    fn build(safety_depth: f64, shoal_depth: f64) -> Value {
+        serde_json::from_str(
+            &build_style(
+                safety_depth,
+                shoal_depth,
+                "http://localhost/{z}/{x}/{y}",
+                6,
+                18,
+                false,
+            )
+            .expect("build_style succeeds"),
+        )
+        .expect("build_style output is valid JSON")
+    }
+
+    /// Return every layer whose `"id"` starts with `prefix`.
+    fn layers_starting_with<'a>(style: &'a Value, prefix: &str) -> Vec<&'a Value> {
+        style["layers"]
+            .as_array()
+            .expect("layers is an array")
+            .iter()
+            .filter(|l| l["id"].as_str().is_some_and(|id| id.starts_with(prefix)))
+            .collect()
+    }
+
+    // --- DEPARE layer contracts ------------------------------------------
+
+    #[test]
+    fn old_depare_variants_collapsed_to_single_generated_layer() {
+        let style = build(5.0, 10.0);
+        let depare_layers = layers_starting_with(&style, "DEPARE");
+
+        // The template has DEPARE-shoal, DEPARE-shallow, DEPARE-deep — all
+        // three must be collapsed into a single "DEPARE" layer.
+        assert_eq!(
+            depare_layers.len(),
+            1,
+            "expected exactly one DEPARE layer, got {}: {:?}",
+            depare_layers.len(),
+            depare_layers
+                .iter()
+                .map(|l| l["id"].as_str().unwrap_or("?"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(depare_layers[0]["id"], "DEPARE");
+    }
+
+    // --- DEPCNT layer contracts ------------------------------------------
+
+    #[test]
+    fn depcnt_replaced_with_base_contour_and_safety_highlight() {
+        let style = build(7.0, 15.0);
+        let layers = style["layers"].as_array().expect("layers is an array");
+
+        let base_idx = layers
+            .iter()
+            .position(|l| l["id"] == "DEPCNT")
+            .expect("base DEPCNT layer missing");
+        let safety_idx = layers
+            .iter()
+            .position(|l| l["id"] == "DEPCNT-safety")
+            .expect("DEPCNT-safety layer missing");
+
+        // Safety highlight must be drawn directly after the base contour.
+        assert_eq!(
+            safety_idx,
+            base_idx + 1,
+            "DEPCNT-safety must immediately follow DEPCNT"
+        );
+
+        // Both must be line layers on the DEPCNT source-layer.
+        let base = &layers[base_idx];
+        let safety = &layers[safety_idx];
+        assert_eq!(base["type"], "line");
+        assert_eq!(safety["type"], "line");
+        assert_eq!(base["source-layer"], "DEPCNT");
+        assert_eq!(safety["source-layer"], "DEPCNT");
+    }
+
+    #[test]
+    fn safety_depth_contour_filter_matches_exact_value() {
+        let style = build(3.25, 10.0);
+        let safety = layer(&style, "DEPCNT-safety");
+
+        let filter = safety["filter"]
+            .as_array()
+            .expect("DEPCNT-safety must have a filter");
+
+        // ["==", ["to-number", ["get", "VALDCO"], -1.0], safety_depth]
+        assert_eq!(filter[0], "==");
+        assert_eq!(
+            filter[2], 3.25,
+            "filter comparison value must equal safety_depth"
+        );
+
+        // The filtered attribute must be VALDCO.
+        let expr = filter[1]
+            .as_array()
+            .expect("filter left-hand side is an expression");
+        assert_eq!(expr[0], "to-number");
+        let get = expr[1]
+            .as_array()
+            .expect("to-number input is a get expression");
+        assert_eq!(get[0], "get");
+        assert_eq!(get[1], "VALDCO");
+    }
+
     #[test]
     fn cardinal_buoy_body_and_topmark_are_separate_layers_with_topmark_on_top() {
         let style: Value = serde_json::from_str(
