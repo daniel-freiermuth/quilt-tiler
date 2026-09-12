@@ -192,6 +192,12 @@ struct AppState {
 impl AppState {
     /// MIME type for this server's `/tiles` responses — constant for the
     /// life of the process, one source kind per server.
+    ///
+    /// Uses `application/vnd.maplibre-tile`, the same Content-Type the
+    /// reference `MapLibre` tile server (martin) sends for MLT.  `PMTiles`
+    /// archives declare the longer `application/vnd.maplibre-vector-tile`
+    /// via `TileType::Mlt`; the mismatch is intentional — martin does the
+    /// same (and accepts both when parsing).
     const fn content_type(&self) -> &'static str {
         match &self.sources {
             Sources::Vector { .. } => "application/vnd.maplibre-tile",
@@ -580,6 +586,59 @@ mod tests {
         assert!(
             body.contains(&format!("/tiles/{}/", state.build_id)),
             "tile URL template must route through the per-process build_id segment, got: {body}"
+        );
+    }
+
+    /// The tileserver's Content-Type must match the MIME the MapLibre
+    /// ecosystem uses for live tile serving:
+    ///
+    /// - MLT vector tiles: `application/vnd.maplibre-tile`
+    ///   (same as martin — the official MapLibre tile server — and the
+    ///   Accept header MapLibre GL JS sends for `encoding: 'mlt'` sources).
+    /// - Raster (PNG) tiles: `image/png`
+    ///
+    /// Note: PMTiles archives declare `application/vnd.maplibre-vector-tile`
+    /// for MLT via `TileType::Mlt.content_type()`.  That longer form is
+    /// correct in the archive header; the shorter form is what goes over
+    /// HTTP.  Martin does the same and accepts both when parsing.
+    #[test]
+    fn content_type_uses_maplibre_ecosystem_mime_types() {
+        let vector_state = AppState {
+            sources: Sources::Vector {
+                cells: Vec::new(),
+                min_zoom: 0,
+                max_zoom: 0,
+            },
+            cache: None,
+            public_url: None,
+            safety_depth: 0.0,
+            shoal_depth: 0.0,
+            zoom_offset: 0.0,
+            build_id: String::new(),
+        };
+        assert_eq!(
+            vector_state.content_type(),
+            "application/vnd.maplibre-tile",
+            "vector (MLT) Content-Type must match martin / MapLibre GL JS convention"
+        );
+
+        let raster_state = AppState {
+            sources: Sources::Raster {
+                cells: Vec::new(),
+                min_zoom: 0,
+                max_zoom: 0,
+            },
+            cache: None,
+            public_url: None,
+            safety_depth: 0.0,
+            shoal_depth: 0.0,
+            zoom_offset: 0.0,
+            build_id: String::new(),
+        };
+        assert_eq!(
+            raster_state.content_type(),
+            "image/png",
+            "raster (PNG) Content-Type must be image/png"
         );
     }
 }
