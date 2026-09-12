@@ -243,7 +243,7 @@ fn run_vector(args: &Args) -> Result<()> {
         "name":        chart_name,
         "description": "OESU chart converted by oesu2geojson",
         "type":        "mapstyleJSON",
-        "format":      "pbf",
+        "format":      "mlt",
         "created":     chrono_now(),
         "minZoom":     min_zoom,
         "maxZoom":     out_max_zoom,
