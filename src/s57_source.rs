@@ -1037,4 +1037,282 @@ mod tests {
         assert_eq!(light_colour_hex("1"), "#ccaa00");
         assert_eq!(light_colour_hex(""), "#ccaa00");
     }
+
+    // ── LayerBuf::push — schema inference & property handling ─────────────
+
+    /// Trivial point geometry for property-focused tests.
+    fn pt() -> geo::Geometry<i32> {
+        geo::Geometry::Point(geo::Point::new(100, 200))
+    }
+
+    /// Shorthand: build a `LayerBuf`, push the given feature property lists,
+    /// finish, and return the resulting `TileLayer` for assertions.
+    fn push_all(rows: Vec<Vec<(&str, PropValue)>>) -> TileLayer {
+        let mut buf = LayerBuf::new("test");
+        for row in rows {
+            buf.push(
+                pt(),
+                row.into_iter()
+                    .map(|(k, v)| (k.to_owned(), v))
+                    .collect(),
+            );
+        }
+        buf.finish()
+    }
+
+    #[test]
+    fn push_first_feature_registers_columns_with_correct_kind() {
+        let layer = push_all(vec![vec![
+            ("name", PropValue::Str(Some("A".into()))),
+            ("depth", PropValue::F64(Some(3.5))),
+            ("count", PropValue::U64(Some(7))),
+        ]]);
+
+        assert_eq!(layer.property_names(), &["name", "depth", "count"]);
+        assert_eq!(layer.feature_count(), 1);
+
+        let props = layer.features()[0].properties();
+        assert_eq!(props[0], PropValue::Str(Some("A".into())));
+        assert_eq!(props[1], PropValue::F64(Some(3.5)));
+        assert_eq!(props[2], PropValue::U64(Some(7)));
+    }
+
+    #[test]
+    fn push_backfills_earlier_features_with_typed_nulls() {
+        // Feature 0 has only "a"; feature 1 introduces "b".
+        let layer = push_all(vec![
+            vec![("a", PropValue::I64(Some(1)))],
+            vec![
+                ("a", PropValue::I64(Some(2))),
+                ("b", PropValue::Str(Some("hello".into()))),
+            ],
+        ]);
+
+        assert_eq!(layer.property_names(), &["a", "b"]);
+
+        // Feature 0 was pushed before "b" existed → back-filled with Str(None).
+        let f0 = layer.features()[0].properties();
+        assert_eq!(f0[0], PropValue::I64(Some(1)));
+        assert_eq!(f0[1], PropValue::Str(None), "back-fill must be a typed null");
+
+        // Feature 1 has both columns populated.
+        let f1 = layer.features()[1].properties();
+        assert_eq!(f1[0], PropValue::I64(Some(2)));
+        assert_eq!(f1[1], PropValue::Str(Some("hello".into())));
+    }
+
+    #[test]
+    fn push_coerces_mismatched_type_to_first_seen_kind() {
+        // First feature establishes "val" as I64.
+        // Second feature provides "val" as U64 → coerced to I64.
+        let layer = push_all(vec![
+            vec![("val", PropValue::I64(Some(10)))],
+            vec![("val", PropValue::U64(Some(20)))],
+        ]);
+
+        let f1 = layer.features()[1].properties();
+        assert_eq!(
+            f1[0],
+            PropValue::I64(Some(20)),
+            "U64(20) must coerce to I64(20)"
+        );
+    }
+
+    #[test]
+    fn push_coerces_f32_to_f64_when_column_is_f64() {
+        let layer = push_all(vec![
+            vec![("depth", PropValue::F64(Some(1.0)))],
+            vec![("depth", PropValue::F32(Some(2.5)))],
+        ]);
+
+        let f1 = layer.features()[1].properties();
+        assert_eq!(
+            f1[0],
+            PropValue::F64(Some(2.5_f64)),
+            "F32(2.5) must widen to F64(2.5)"
+        );
+    }
+
+    #[test]
+    fn push_coerces_incompatible_type_to_string_fallback() {
+        // Column is Str; second feature provides a Bool → coerced to Str.
+        let layer = push_all(vec![
+            vec![("flag", PropValue::Str(Some("yes".into())))],
+            vec![("flag", PropValue::Bool(Some(true)))],
+        ]);
+
+        let f1 = layer.features()[1].properties();
+        assert_eq!(
+            f1[0],
+            PropValue::Str(Some("true".into())),
+            "Bool(true) coerced to Str column must become Str(\"true\")"
+        );
+    }
+
+    #[test]
+    fn push_coerces_to_null_when_no_string_representation() {
+        // Column is I64; second feature provides a Bool → no direct coerce
+        // path, falls through to null(I64).
+        let layer = push_all(vec![
+            vec![("x", PropValue::I64(Some(1)))],
+            vec![("x", PropValue::Bool(Some(true)))],
+        ]);
+
+        let f1 = layer.features()[1].properties();
+        assert_eq!(
+            f1[0],
+            PropValue::I64(None),
+            "incompatible coercion with no conversion path must produce typed null"
+        );
+    }
+
+    #[test]
+    fn push_empty_props_creates_feature_with_no_columns() {
+        let layer = push_all(vec![vec![]]);
+
+        assert_eq!(layer.feature_count(), 1);
+        assert!(layer.property_names().is_empty());
+        assert!(layer.features()[0].properties().is_empty());
+    }
+
+    #[test]
+    fn push_feature_with_no_props_after_one_with_props_still_backfills() {
+        // Feature 0 has "a"; feature 1 has nothing → "a" column exists,
+        // feature 1 gets a null for "a" via the builder.
+        let layer = push_all(vec![
+            vec![("a", PropValue::U64(Some(42)))],
+            vec![],
+        ]);
+
+        assert_eq!(layer.feature_count(), 2);
+        let f1 = layer.features()[1].properties();
+        assert_eq!(
+            f1[0],
+            PropValue::U64(None),
+            "feature with no props should have null in already-registered column"
+        );
+    }
+
+    #[test]
+    fn push_property_key_order_is_stable_across_features() {
+        // Feature 0: a, b, c.  Feature 1: c, a, b (different insertion order
+        // but all keys already registered → order stays a, b, c).
+        let layer = push_all(vec![
+            vec![
+                ("a", PropValue::I64(Some(1))),
+                ("b", PropValue::I64(Some(2))),
+                ("c", PropValue::I64(Some(3))),
+            ],
+            vec![
+                ("c", PropValue::I64(Some(30))),
+                ("a", PropValue::I64(Some(10))),
+                ("b", PropValue::I64(Some(20))),
+            ],
+        ]);
+
+        assert_eq!(
+            layer.property_names(),
+            &["a", "b", "c"],
+            "column order follows first-seen registration"
+        );
+
+        // Values in feature 1 must land in the correct columns despite
+        // different iteration order in the input.
+        let f1 = layer.features()[1].properties();
+        assert_eq!(f1[0], PropValue::I64(Some(10)), "column a");
+        assert_eq!(f1[1], PropValue::I64(Some(20)), "column b");
+        assert_eq!(f1[2], PropValue::I64(Some(30)), "column c");
+    }
+
+    #[test]
+    fn push_null_valued_first_feature_infers_kind_from_variant() {
+        // A null Str is still PropKind::Str — the column type is determined
+        // by the enum variant, not by the inner Option value.
+        let layer = push_all(vec![
+            vec![("tag", PropValue::Str(None))],
+            vec![("tag", PropValue::Str(Some("hi".into())))],
+        ]);
+
+        // Both features should store Str values.
+        assert_eq!(layer.features()[0].properties()[0], PropValue::Str(None));
+        assert_eq!(
+            layer.features()[1].properties()[0],
+            PropValue::Str(Some("hi".into()))
+        );
+    }
+
+    #[test]
+    fn push_feature_count_tracks_correctly() {
+        let mut buf = LayerBuf::new("fc");
+        assert_eq!(buf.feature_count(), 0);
+        buf.push(pt(), vec![]);
+        assert_eq!(buf.feature_count(), 1);
+        buf.push(pt(), vec![]);
+        assert_eq!(buf.feature_count(), 2);
+    }
+
+    // ── coerce unit tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn coerce_same_kind_is_identity() {
+        let val = PropValue::I64(Some(42));
+        assert_eq!(coerce(val.clone(), PropKind::I64), val);
+    }
+
+    #[test]
+    fn coerce_u64_to_i64() {
+        assert_eq!(
+            coerce(PropValue::U64(Some(100)), PropKind::I64),
+            PropValue::I64(Some(100))
+        );
+    }
+
+    #[test]
+    fn coerce_u64_overflow_to_i64_clamps() {
+        assert_eq!(
+            coerce(PropValue::U64(Some(u64::MAX)), PropKind::I64),
+            PropValue::I64(Some(i64::MAX))
+        );
+    }
+
+    #[test]
+    fn coerce_f32_to_f64() {
+        assert_eq!(
+            coerce(PropValue::F32(Some(1.5)), PropKind::F64),
+            PropValue::F64(Some(1.5_f64))
+        );
+    }
+
+    #[test]
+    fn coerce_numeric_to_str() {
+        assert_eq!(
+            coerce(PropValue::I64(Some(99)), PropKind::Str),
+            PropValue::Str(Some("99".into()))
+        );
+        assert_eq!(
+            coerce(PropValue::U64(Some(7)), PropKind::Str),
+            PropValue::Str(Some("7".into()))
+        );
+        assert_eq!(
+            coerce(PropValue::Bool(Some(false)), PropKind::Str),
+            PropValue::Str(Some("false".into()))
+        );
+    }
+
+    #[test]
+    fn coerce_null_to_str_yields_null_str() {
+        assert_eq!(
+            coerce(PropValue::I64(None), PropKind::Str),
+            PropValue::Str(None)
+        );
+    }
+
+    #[test]
+    fn coerce_incompatible_yields_typed_null() {
+        // Bool → I64 has no conversion path → typed null.
+        assert_eq!(
+            coerce(PropValue::Bool(Some(true)), PropKind::I64),
+            PropValue::I64(None)
+        );
+    }
 }
