@@ -1037,4 +1037,95 @@ mod tests {
         assert_eq!(light_colour_hex("1"), "#ccaa00");
         assert_eq!(light_colour_hex(""), "#ccaa00");
     }
+
+    // ── coerce ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn coerce_identity_passthrough() {
+        let val = PropValue::U64(Some(42));
+        assert_eq!(coerce(val.clone(), PropKind::U64), val);
+
+        let val = PropValue::Str(Some("hello".into()));
+        assert_eq!(coerce(val.clone(), PropKind::Str), val);
+
+        let val = PropValue::I64(None);
+        assert_eq!(coerce(val.clone(), PropKind::I64), val);
+    }
+
+    #[test]
+    fn coerce_u64_to_i64_widening() {
+        assert_eq!(
+            coerce(PropValue::U64(Some(100)), PropKind::I64),
+            PropValue::I64(Some(100)),
+        );
+    }
+
+    #[test]
+    fn coerce_u64_max_to_i64_saturates() {
+        // u64::MAX exceeds i64::MAX — try_from fails, fallback is i64::MAX.
+        assert_eq!(
+            coerce(PropValue::U64(Some(u64::MAX)), PropKind::I64),
+            PropValue::I64(Some(i64::MAX)),
+        );
+    }
+
+    #[test]
+    fn coerce_f32_to_f64_widening() {
+        assert_eq!(
+            coerce(PropValue::F32(Some(1.5)), PropKind::F64),
+            PropValue::F64(Some(f64::from(1.5_f32))),
+        );
+    }
+
+    #[test]
+    fn coerce_values_to_str() {
+        assert_eq!(
+            coerce(PropValue::Bool(Some(true)), PropKind::Str),
+            PropValue::Str(Some("true".into())),
+        );
+        assert_eq!(
+            coerce(PropValue::I64(Some(-7)), PropKind::Str),
+            PropValue::Str(Some("-7".into())),
+        );
+        assert_eq!(
+            coerce(PropValue::U64(Some(999)), PropKind::Str),
+            PropValue::Str(Some("999".into())),
+        );
+        assert_eq!(
+            coerce(PropValue::F32(Some(3.14)), PropKind::Str),
+            PropValue::Str(Some(3.14_f32.to_string())),
+        );
+        assert_eq!(
+            coerce(PropValue::F64(Some(2.718)), PropKind::Str),
+            PropValue::Str(Some("2.718".into())),
+        );
+    }
+
+    #[test]
+    fn coerce_null_variant_to_str_produces_str_none() {
+        // A None variant of any type coerced to Str should yield Str(None),
+        // not Str(Some("…")).
+        assert_eq!(
+            coerce(PropValue::I64(None), PropKind::Str),
+            PropValue::Str(None),
+        );
+        assert_eq!(
+            coerce(PropValue::Bool(None), PropKind::Str),
+            PropValue::Str(None),
+        );
+    }
+
+    #[test]
+    fn coerce_unrecognised_mismatch_produces_typed_null() {
+        // I64 → F64 has no explicit coercion arm — falls through to null.
+        assert_eq!(
+            coerce(PropValue::I64(Some(42)), PropKind::F64),
+            PropValue::F64(None),
+        );
+        // Bool → I64 likewise.
+        assert_eq!(
+            coerce(PropValue::Bool(Some(true)), PropKind::I64),
+            PropValue::I64(None),
+        );
+    }
 }
