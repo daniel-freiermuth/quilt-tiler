@@ -229,4 +229,64 @@ mod tests {
             .expect("icon-image is a match expression array");
         assert_eq!(icon_image[1], serde_json::json!(["get", "TOPSHP"]));
     }
+
+    /// Parse the raster style once and hand back the `Value` — shared by the
+    /// tests below so each assertion stays focused on one contract.
+    fn raster_style_fixture() -> Value {
+        serde_json::from_str(&build_raster_style(
+            "http://tiles.local/{z}/{x}/{y}",
+            4,
+            16,
+        ))
+        .expect("build_raster_style output must be valid JSON")
+    }
+
+    #[test]
+    fn raster_style_is_maplibre_version_8() {
+        let style = raster_style_fixture();
+        assert_eq!(style["version"], 8, "MapLibre GL style must declare version 8");
+    }
+
+    #[test]
+    fn raster_style_embeds_tile_url_in_source() {
+        let style = raster_style_fixture();
+        let tiles = style["sources"]["raster"]["tiles"]
+            .as_array()
+            .expect("sources.raster.tiles must be an array");
+        assert_eq!(tiles.len(), 1);
+        assert_eq!(tiles[0], "http://tiles.local/{z}/{x}/{y}");
+    }
+
+    #[test]
+    fn raster_style_embeds_zoom_range() {
+        let style = raster_style_fixture();
+        let src = &style["sources"]["raster"];
+        assert_eq!(src["minzoom"], 4);
+        assert_eq!(src["maxzoom"], 16);
+    }
+
+    #[test]
+    fn raster_style_has_single_raster_layer() {
+        let style = raster_style_fixture();
+        let layers = style["layers"]
+            .as_array()
+            .expect("layers must be an array");
+        assert_eq!(layers.len(), 1, "raster style must have exactly one layer");
+        assert_eq!(layers[0]["id"], "raster");
+        assert_eq!(layers[0]["type"], "raster");
+        assert_eq!(layers[0]["source"], "raster");
+    }
+
+    #[test]
+    fn raster_style_tile_size_matches_tile_px() {
+        let style = raster_style_fixture();
+        let tile_size = style["sources"]["raster"]["tileSize"]
+            .as_u64()
+            .expect("tileSize must be an integer");
+        assert_eq!(
+            tile_size,
+            u64::from(crate::rnc_source::TILE_PX),
+            "tileSize must match TILE_PX constant"
+        );
+    }
 }
