@@ -174,6 +174,382 @@ enum RawGeometry {
     },
 }
 
+// ── Record accumulator ──────────────────────────────────────────────────────
+
+/// Accumulator for record-by-record parsing of an OESU binary stream.
+///
+/// Each `parse_*` method handles one record type from the main dispatch loop,
+/// keeping the loop body a clean one-line-per-arm dispatcher.
+#[derive(Default)]
+struct CellBuilder {
+    name: String,
+    native_scale: u32,
+    publish_date: String,
+    edition: u16,
+    update_date: String,
+    update_number: u16,
+    senc_create_date: String,
+    sounding_datum: String,
+    ref_lat: f64,
+    ref_lon: f64,
+    bounds: [f64; 4],
+    raw_features: Vec<RawFeature>,
+    raw_covr: Vec<LineString>,
+    raw_nocovr: Vec<LineString>,
+    text_descriptions: HashMap<String, String>,
+    vet: HashMap<u32, EdgeEntry>,
+    vct: HashMap<u32, NodeEntry>,
+    current: Option<RawFeature>,
+}
+
+#[allow(clippy::cast_possible_truncation)] // Cursor positions and counts bounded by payload_len (≤ u32)
+impl CellBuilder {
+    /// `CELL_EXTENT_RECORD` (100): 8 × f64 corner coordinates.
+    #[allow(clippy::similar_names)] // sw/nw/ne/se are domain vocabulary
+    fn parse_cell_extent(&mut self, p: &mut Cursor<&[u8]>, payload_len: usize) -> Result<()> {
+        if payload_len < 64 {
+            tracing::warn!(payload_len, "CELL_EXTENT_RECORD too short, skipping");
+            return Ok(());
+        }
+        let sw_lat = read_f64(p)?;
+        let sw_lon = read_f64(p)?;
+        let nw_lat = read_f64(p)?;
+        let nw_lon = read_f64(p)?;
+        let ne_lat = read_f64(p)?;
+        let ne_lon = read_f64(p)?;
+        let se_lat = read_f64(p)?;
+        let se_lon = read_f64(p)?;
+
+        let s_lat = sw_lat.min(se_lat);
+        let n_lat = nw_lat.max(ne_lat);
+        let w_lon = sw_lon.min(nw_lon);
+        let e_lon = ne_lon.max(se_lon);
+
+        self.ref_lat = f64::midpoint(n_lat, s_lat);
+        self.ref_lon = f64::midpoint(e_lon, w_lon);
+        self.bounds = [w_lon, s_lat, e_lon, n_lat];
+        Ok(())
+    }
+
+    /// `CELL_TXTDSC_INFO_FILE_RECORD` (101): embedded text-description file.
+    fn parse_txtdsc(&mut self, p: &mut Cursor<&[u8]>, payload_len: usize) {
+        if payload_len < 8 {
+            tracing::warn!(payload_len, "CELL_TXTDSC_INFO_FILE_RECORD too short");
+            return;
+        }
+        let (Ok(name_len), Ok(_content_len)) = (read_u32(p), read_u32(p)) else {
+            return;
+        };
+        let name_len = name_len as usize;
+        let fname = read_cstring(p, name_len).unwrap_or_default();
+        let consumed = 8 + name_len;
+        if payload_len > consumed && !fname.is_empty() {
+            let content_raw = &p.get_ref()[consumed..];
+            let content = String::from_utf8_lossy(content_raw)
+                .trim_end_matches('\0')
+                .to_owned();
+            if !content.is_empty() {
+                self.text_descriptions.insert(fname, content);
+            }
+        }
+    }
+
+    /// `FEATURE_ID_RECORD` (64): start of a new feature.
+    fn parse_feature_id(&mut self, p: &mut Cursor<&[u8]>, payload_len: usize) -> Result<()> {
+        if let Some(f) = self.current.take() {
+            self.raw_features.push(f);
+        }
+        if payload_len >= 5 {
+            let type_code = read_u16(p)?;
+            let id = read_u16(p)?;
+            let primitive = read_u8(p)?;
+            self.current = Some(RawFeature {
+                type_code,
+                id,
+                primitive,
+                attributes: Vec::new(),
+                raw_geometry: RawGeometry::None,
+            });
+        }
+        Ok(())
+    }
+
+    /// `FEATURE_ATTRIBUTE_RECORD` (65): attribute key-value for the current feature.
+    fn parse_feature_attribute(
+        &mut self,
+        p: &mut Cursor<&[u8]>,
+        payload_len: usize,
+    ) -> Result<()> {
+        if payload_len < 3 {
+            tracing::warn!(payload_len, "FEATURE_ATTRIBUTE_RECORD too short");
+            return Ok(());
+        }
+        let attr_code = read_u16(p)?;
+        let value_type = read_u8(p)?;
+        let value = match value_type {
+            0 => {
+                if payload_len >= 7 {
+                    AttrValue::Int(read_u32(p)?)
+                } else {
+                    tracing::warn!(attr_code, "int attribute payload too short");
+                    return Ok(());
+                }
+            }
+            2 => {
+                if payload_len >= 11 {
+                    AttrValue::Double(read_f64(p)?)
+                } else {
+                    tracing::warn!(attr_code, "double attribute payload too short");
+                    return Ok(());
+                }
+            }
+            4 => {
+                let remaining = payload_len - 3;
+                AttrValue::Str(read_cstring(p, remaining)?)
+            }
+            other => {
+                // Types 1 (int list) and 3 (double list) are also unimplemented in OpenCPN.
+                tracing::warn!(
+                    attr_code,
+                    value_type = other,
+                    "unhandled attribute value type"
+                );
+                return Ok(());
+            }
+        };
+        if let Some(f) = &mut self.current {
+            f.attributes.push(Attribute {
+                code: attr_code,
+                value,
+            });
+        }
+        Ok(())
+    }
+
+    /// `FEATURE_GEOMETRY_RECORD_POINT` (80).
+    fn parse_geometry_point(&mut self, p: &mut Cursor<&[u8]>, payload_len: usize) -> Result<()> {
+        if payload_len < 16 {
+            tracing::warn!(payload_len, "GEOM_POINT too short");
+            return Ok(());
+        }
+        let lat = read_f64(p)?;
+        let lon = read_f64(p)?;
+        if let Some(f) = &mut self.current {
+            f.raw_geometry = RawGeometry::Point(point![x: lon, y: lat]);
+        }
+        Ok(())
+    }
+
+    /// `FEATURE_GEOMETRY_RECORD_LINE` (81): edge-reference line geometry.
+    fn parse_geometry_line(&mut self, p: &mut Cursor<&[u8]>, payload_len: usize) -> Result<()> {
+        if payload_len < 36 {
+            tracing::warn!(payload_len, "GEOM_LINE too short");
+            return Ok(());
+        }
+        // 4×f64 extent (unused), u32 edge_count, then count×4×i32 edge refs
+        let _s = read_f64(p)?;
+        let _n = read_f64(p)?;
+        let _w = read_f64(p)?;
+        let _e = read_f64(p)?;
+        let count = read_u32(p)? as usize;
+        let mut edge_refs = Vec::with_capacity(count);
+        for _ in 0..count {
+            if p.position() as usize + 16 > payload_len {
+                break;
+            }
+            let start_node = read_i32(p)?;
+            let edge_id = read_i32(p)?;
+            let end_node = read_i32(p)?;
+            let dir = read_i32(p)?;
+            edge_refs.push([start_node, edge_id, end_node, dir]);
+        }
+        if let Some(f) = &mut self.current {
+            f.raw_geometry = RawGeometry::Line(edge_refs);
+        }
+        Ok(())
+    }
+
+    /// `FEATURE_GEOMETRY_RECORD_AREA_EXT` (84): extended area with i16 SM coords.
+    fn parse_geometry_area_ext(
+        &mut self,
+        p: &mut Cursor<&[u8]>,
+        payload_len: usize,
+    ) {
+        if payload_len < 52 {
+            tracing::warn!(payload_len, "GEOM_AREA_EXT too short");
+            return;
+        }
+        // Read scale_factor from offset 44: skip 4×f64 extent + 3×u32 counts.
+        let mut hdr_p = Cursor::new(*p.get_ref());
+        for _ in 0..4 {
+            let _ = read_f64(&mut hdr_p);
+        }
+        let _ = read_u32(&mut hdr_p); // contour_count
+        let _ = read_u32(&mut hdr_p); // triprim_count
+        let _ = read_u32(&mut hdr_p); // edge_count
+        let scale_factor = match read_f64(&mut hdr_p) {
+            Ok(sf) => sf,
+            Err(e) => {
+                tracing::warn!("GEOM_AREA_EXT: failed to read scale_factor: {e:#}");
+                return;
+            }
+        };
+        match parse_area_payload(p, payload_len, true, scale_factor, self.ref_lat, self.ref_lon) {
+            Ok(raw) => {
+                if let Some(f) = &mut self.current {
+                    f.raw_geometry = raw;
+                }
+            }
+            Err(e) => tracing::warn!("GEOM_AREA_EXT parse error: {e:#}"),
+        }
+    }
+
+    /// `FEATURE_GEOMETRY_RECORD_MULTIPOINT` (83): sounding point cloud.
+    fn parse_geometry_multipoint(
+        &mut self,
+        p: &mut Cursor<&[u8]>,
+        payload_len: usize,
+    ) -> Result<()> {
+        if payload_len < 36 {
+            tracing::warn!(payload_len, "GEOM_MULTIPOINT too short");
+            return Ok(());
+        }
+        // 4×f64 extent (unused), u32 count, then count×3×f32 (east, north, depth)
+        let _s = read_f64(p)?;
+        let _n = read_f64(p)?;
+        let _w = read_f64(p)?;
+        let _e = read_f64(p)?;
+        let count = read_u32(p)? as usize;
+        let mut pts = Vec::with_capacity(count);
+        for _ in 0..count {
+            if p.position() as usize + 12 > payload_len {
+                break;
+            }
+            let east = read_f32(p)?;
+            let north = read_f32(p)?;
+            let depth = read_f32(p)?;
+            pts.push([east, north, depth]);
+        }
+        if let Some(f) = &mut self.current {
+            f.raw_geometry = RawGeometry::Sounding(pts);
+        }
+        Ok(())
+    }
+
+    /// `VECTOR_EDGE_NODE_TABLE_RECORD` (96): VET with f32 SM coordinates.
+    fn parse_vet(&mut self, p: &mut Cursor<&[u8]>, payload_len: usize) -> Result<()> {
+        if payload_len < 4 {
+            tracing::warn!(payload_len, "VET record too short");
+            return Ok(());
+        }
+        let n_edges = read_u32(p)? as usize;
+        for _ in 0..n_edges {
+            if p.position() as usize + 8 > payload_len {
+                break;
+            }
+            let edge_index = read_u32(p)?;
+            let point_count = read_u32(p)? as usize;
+            let mut points = Vec::with_capacity(point_count);
+            for _ in 0..point_count {
+                if p.position() as usize + 8 > payload_len {
+                    break;
+                }
+                let east = f64::from(read_f32(p)?);
+                let north = f64::from(read_f32(p)?);
+                points.push([east, north]);
+            }
+            self.vet.insert(edge_index, EdgeEntry { points });
+        }
+        Ok(())
+    }
+
+    /// `VECTOR_CONNECTED_NODE_TABLE_RECORD` (97): VCT with f32 SM coordinates.
+    fn parse_vct(&mut self, p: &mut Cursor<&[u8]>, payload_len: usize) -> Result<()> {
+        if payload_len < 4 {
+            tracing::warn!(payload_len, "VCT record too short");
+            return Ok(());
+        }
+        let n_nodes = read_u32(p)? as usize;
+        for _ in 0..n_nodes {
+            if p.position() as usize + 12 > payload_len {
+                break;
+            }
+            let node_index = read_u32(p)?;
+            let east = f64::from(read_f32(p)?);
+            let north = f64::from(read_f32(p)?);
+            self.vct.insert(
+                node_index,
+                NodeEntry {
+                    lon: east,
+                    lat: north,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// `VECTOR_EDGE_NODE_TABLE_EXT_RECORD` (85): VET with i16 scaled SM coordinates.
+    fn parse_vet_ext(&mut self, p: &mut Cursor<&[u8]>, payload_len: usize) -> Result<()> {
+        if payload_len < 12 {
+            tracing::warn!(payload_len, "VET_EXT record too short");
+            return Ok(());
+        }
+        let scale_factor = read_f64(p)?;
+        let n_edges = read_u32(p)? as usize;
+        for _ in 0..n_edges {
+            if p.position() as usize + 8 > payload_len {
+                break;
+            }
+            let edge_index = read_u32(p)?;
+            let point_count = read_u32(p)? as usize;
+            let mut points = Vec::with_capacity(point_count);
+            for _ in 0..point_count {
+                if p.position() as usize + 4 > payload_len {
+                    break;
+                }
+                let east = f64::from(read_i16(p)?) / scale_factor;
+                let north = f64::from(read_i16(p)?) / scale_factor;
+                points.push([east, north]);
+            }
+            self.vet.insert(edge_index, EdgeEntry { points });
+        }
+        Ok(())
+    }
+
+    /// `VECTOR_CONNECTED_NODE_TABLE_EXT_RECORD` (86): VCT with i16 scaled SM coords.
+    fn parse_vct_ext(&mut self, p: &mut Cursor<&[u8]>, payload_len: usize) -> Result<()> {
+        if payload_len < 12 {
+            tracing::warn!(payload_len, "VCT_EXT record too short");
+            return Ok(());
+        }
+        let scale_factor = read_f64(p)?;
+        let n_nodes = read_u32(p)? as usize;
+        for _ in 0..n_nodes {
+            if p.position() as usize + 8 > payload_len {
+                break;
+            }
+            let node_index = read_u32(p)?;
+            let east = f64::from(read_i16(p)?) / scale_factor;
+            let north = f64::from(read_i16(p)?) / scale_factor;
+            self.vct.insert(
+                node_index,
+                NodeEntry {
+                    lon: east,
+                    lat: north,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Push the last in-flight feature (if any) into the accumulator.
+    fn flush_current_feature(&mut self) {
+        if let Some(f) = self.current.take() {
+            self.raw_features.push(f);
+        }
+    }
+}
+
 // ── Reader helpers ───────────────────────────────────────────────────────────
 
 fn read_u8(c: &mut Cursor<&[u8]>) -> Result<u8> {
@@ -226,37 +602,18 @@ fn read_cstring(c: &mut Cursor<&[u8]>, max: usize) -> Result<String> {
 // ── Main entry point ─────────────────────────────────────────────────────────
 
 #[allow(
-    clippy::too_many_lines,          // binary format parser is inherently long
+    clippy::too_many_lines,           // 196 lines (down from 520); post-processing prevents going below 100
     clippy::cast_possible_truncation, // Cursor positions bounded by payload_len (≤ u32)
-    clippy::similar_names,           // sw/nw/ne/se and resolved_vct/resolved_vet are domain vocab
-    clippy::missing_errors_doc,      // private binary parser; error cases in record comments
+    clippy::similar_names,            // resolved_vct/resolved_vet are domain vocab
+    clippy::missing_errors_doc,       // private binary parser; error cases in record comments
 )]
 pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
     // ── Prologue: validate SERVER_STATUS + version ───────────────────────────
     let (data, expire_days_remaining, grace_days_remaining) = strip_server_status(data)?;
     let senc_version = read_senc_version(data)?;
 
-    // ── Accumulator state ────────────────────────────────────────────────────
-    let mut name = String::new();
-    let mut native_scale: u32 = 0;
-    let mut publish_date = String::new();
-    let mut edition: u16 = 0;
-    let mut update_date = String::new();
-    let mut update_number: u16 = 0;
-    let mut senc_create_date = String::new();
-    let mut sounding_datum = String::new();
-    let mut ref_lat = 0.0f64;
-    let mut ref_lon = 0.0f64;
-    let mut bounds = [0.0f64; 4];
-    let mut raw_features: Vec<RawFeature> = Vec::new();
-    let mut raw_covr: Vec<LineString> = Vec::new();
-    let mut raw_nocovr: Vec<LineString> = Vec::new();
-    let mut text_descriptions: HashMap<String, String> = HashMap::new();
-    let mut vet: HashMap<u32, EdgeEntry> = HashMap::new();
-    let mut vct: HashMap<u32, NodeEntry> = HashMap::new();
-
+    let mut b = CellBuilder::default();
     let mut c = Cursor::new(data);
-    let mut current: Option<RawFeature> = None;
 
     loop {
         let mut hdr = [0u8; 6];
@@ -281,401 +638,128 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
         let mut p = Cursor::new(payload_bytes.as_slice());
 
         match rec_type {
-            // ── Header metadata ──────────────────────────────────────────────
+            // ── Header metadata (simple field assignments) ───────────────
             HEADER_SENC_VERSION => { /* already consumed in prologue */ }
-
             HEADER_CELL_NAME => {
-                name = read_cstring(&mut p, payload_len).unwrap_or_default();
+                b.name = read_cstring(&mut p, payload_len).unwrap_or_default();
             }
             HEADER_CELL_PUBLISHDATE => {
-                publish_date = read_cstring(&mut p, payload_len).unwrap_or_default();
+                b.publish_date = read_cstring(&mut p, payload_len).unwrap_or_default();
             }
             HEADER_CELL_EDITION => {
-                edition = read_u16(&mut p).unwrap_or(0);
+                b.edition = read_u16(&mut p).unwrap_or(0);
             }
             HEADER_CELL_UPDATEDATE => {
-                update_date = read_cstring(&mut p, payload_len).unwrap_or_default();
+                b.update_date = read_cstring(&mut p, payload_len).unwrap_or_default();
             }
             HEADER_CELL_UPDATE => {
-                update_number = read_u16(&mut p).unwrap_or(0);
+                b.update_number = read_u16(&mut p).unwrap_or(0);
             }
             HEADER_CELL_NATIVESCALE => {
-                native_scale = read_u32(&mut p).context("reading HEADER_CELL_NATIVESCALE")?;
+                b.native_scale =
+                    read_u32(&mut p).context("reading HEADER_CELL_NATIVESCALE")?;
             }
             HEADER_CELL_SENCCREATEDATE => {
-                senc_create_date = read_cstring(&mut p, payload_len).unwrap_or_default();
+                b.senc_create_date = read_cstring(&mut p, payload_len).unwrap_or_default();
             }
             HEADER_CELL_SOUNDINGDATUM => {
-                sounding_datum = read_cstring(&mut p, payload_len).unwrap_or_default();
+                b.sounding_datum = read_cstring(&mut p, payload_len).unwrap_or_default();
             }
 
-            // ── Cell spatial metadata ────────────────────────────────────────
-            CELL_EXTENT_RECORD => {
-                // 8 × f64: sw_lat, sw_lon, nw_lat, nw_lon, ne_lat, ne_lon, se_lat, se_lon
-                if payload_len >= 64 {
-                    let sw_lat = read_f64(&mut p)?;
-                    let sw_lon = read_f64(&mut p)?;
-                    let nw_lat = read_f64(&mut p)?;
-                    let nw_lon = read_f64(&mut p)?;
-                    let ne_lat = read_f64(&mut p)?;
-                    let ne_lon = read_f64(&mut p)?;
-                    let se_lat = read_f64(&mut p)?;
-                    let se_lon = read_f64(&mut p)?;
-
-                    let s_lat = sw_lat.min(se_lat);
-                    let n_lat = nw_lat.max(ne_lat);
-                    let w_lon = sw_lon.min(nw_lon);
-                    let e_lon = ne_lon.max(se_lon);
-
-                    ref_lat = f64::midpoint(n_lat, s_lat);
-                    ref_lon = f64::midpoint(e_lon, w_lon);
-                    bounds = [w_lon, s_lat, e_lon, n_lat];
-                } else {
-                    tracing::warn!(payload_len, "CELL_EXTENT_RECORD too short, skipping");
-                }
-            }
-
+            // ── Cell spatial / coverage ──────────────────────────────────
+            CELL_EXTENT_RECORD => b.parse_cell_extent(&mut p, payload_len)?,
             CELL_COVR_RECORD => {
                 if let Some(covr) = parse_covr_payload(&mut p, payload_len) {
-                    raw_covr.push(covr);
+                    b.raw_covr.push(covr);
                 } else {
                     tracing::warn!("CELL_COVR_RECORD: could not parse coverage polygon");
                 }
             }
             CELL_NOCOVR_RECORD => {
                 if let Some(covr) = parse_covr_payload(&mut p, payload_len) {
-                    raw_nocovr.push(covr);
+                    b.raw_nocovr.push(covr);
                 } else {
                     tracing::warn!("CELL_NOCOVR_RECORD: could not parse no-coverage polygon");
                 }
             }
+            CELL_TXTDSC_INFO_FILE_RECORD => b.parse_txtdsc(&mut p, payload_len),
 
-            CELL_TXTDSC_INFO_FILE_RECORD => {
-                // Payload: u32 name_len, u32 content_len, <name_len bytes filename>, <content>
-                if payload_len >= 8 {
-                    if let (Ok(name_len), Ok(_content_len)) = (read_u32(&mut p), read_u32(&mut p)) {
-                        let name_len = name_len as usize;
-                        let fname = read_cstring(&mut p, name_len).unwrap_or_default();
-                        // Content starts after the name field (possibly past its null terminator)
-                        let consumed = 8 + name_len;
-                        if payload_len > consumed && !fname.is_empty() {
-                            let content_raw = &payload_bytes[consumed..];
-                            let content = String::from_utf8_lossy(content_raw)
-                                .trim_end_matches('\0')
-                                .to_owned();
-                            if !content.is_empty() {
-                                text_descriptions.insert(fname, content);
-                            }
-                        }
-                    }
-                } else {
-                    tracing::warn!(payload_len, "CELL_TXTDSC_INFO_FILE_RECORD too short");
-                }
-            }
+            // ── Feature records ──────────────────────────────────────────
+            FEATURE_ID_RECORD => b.parse_feature_id(&mut p, payload_len)?,
+            FEATURE_ATTRIBUTE_RECORD => b.parse_feature_attribute(&mut p, payload_len)?,
 
-            // ── Features ─────────────────────────────────────────────────────
-            FEATURE_ID_RECORD => {
-                if let Some(f) = current.take() {
-                    raw_features.push(f);
-                }
-                if payload_len >= 5 {
-                    let type_code = read_u16(&mut p)?;
-                    let id = read_u16(&mut p)?;
-                    let primitive = read_u8(&mut p)?;
-                    current = Some(RawFeature {
-                        type_code,
-                        id,
-                        primitive,
-                        attributes: Vec::new(),
-                        raw_geometry: RawGeometry::None,
-                    });
-                }
-            }
-
-            FEATURE_ATTRIBUTE_RECORD => {
-                if payload_len < 3 {
-                    tracing::warn!(payload_len, "FEATURE_ATTRIBUTE_RECORD too short");
-                    continue;
-                }
-                let attr_code = read_u16(&mut p)?;
-                let value_type = read_u8(&mut p)?;
-                let value = match value_type {
-                    0 => {
-                        if payload_len >= 7 {
-                            AttrValue::Int(read_u32(&mut p)?)
-                        } else {
-                            tracing::warn!(attr_code, "int attribute payload too short");
-                            continue;
-                        }
-                    }
-                    2 => {
-                        if payload_len >= 11 {
-                            AttrValue::Double(read_f64(&mut p)?)
-                        } else {
-                            tracing::warn!(attr_code, "double attribute payload too short");
-                            continue;
-                        }
-                    }
-                    4 => {
-                        let remaining = payload_len - 3;
-                        AttrValue::Str(read_cstring(&mut p, remaining)?)
-                    }
-                    other => {
-                        // Types 1 (int list) and 3 (double list) are also unimplemented in OpenCPN.
-                        tracing::warn!(
-                            attr_code,
-                            value_type = other,
-                            "unhandled attribute value type"
-                        );
-                        continue;
-                    }
-                };
-                if let Some(f) = &mut current {
-                    f.attributes.push(Attribute {
-                        code: attr_code,
-                        value,
-                    });
-                }
-            }
-
-            // ── Feature geometry (standard float coords) ─────────────────────
-            FEATURE_GEOMETRY_RECORD_POINT => {
-                if payload_len >= 16 {
-                    let lat = read_f64(&mut p)?;
-                    let lon = read_f64(&mut p)?;
-                    if let Some(f) = &mut current {
-                        f.raw_geometry = RawGeometry::Point(point![x: lon, y: lat]);
-                    }
-                } else {
-                    tracing::warn!(payload_len, "GEOM_POINT too short");
-                }
-            }
-
-            FEATURE_GEOMETRY_RECORD_LINE => {
-                if payload_len >= 36 {
-                    // 4×f64 extent (unused), u32 edge_count, then count×4×i32 edge refs
-                    let _s = read_f64(&mut p)?;
-                    let _n = read_f64(&mut p)?;
-                    let _w = read_f64(&mut p)?;
-                    let _e = read_f64(&mut p)?;
-                    let count = read_u32(&mut p)? as usize;
-                    let mut edge_refs = Vec::with_capacity(count);
-                    for _ in 0..count {
-                        if p.position() as usize + 16 > payload_len {
-                            break;
-                        }
-                        let start_node = read_i32(&mut p)?;
-                        let edge_id = read_i32(&mut p)?;
-                        let end_node = read_i32(&mut p)?;
-                        let dir = read_i32(&mut p)?;
-                        edge_refs.push([start_node, edge_id, end_node, dir]);
-                    }
-                    if let Some(f) = &mut current {
-                        f.raw_geometry = RawGeometry::Line(edge_refs);
-                    }
-                } else {
-                    tracing::warn!(payload_len, "GEOM_LINE too short");
-                }
-            }
-
+            // ── Feature geometry ─────────────────────────────────────────
+            FEATURE_GEOMETRY_RECORD_POINT => b.parse_geometry_point(&mut p, payload_len)?,
+            FEATURE_GEOMETRY_RECORD_LINE => b.parse_geometry_line(&mut p, payload_len)?,
             FEATURE_GEOMETRY_RECORD_AREA => {
-                match parse_area_payload(&mut p, payload_len, false, 0.0, ref_lat, ref_lon) {
+                match parse_area_payload(
+                    &mut p,
+                    payload_len,
+                    false,
+                    0.0,
+                    b.ref_lat,
+                    b.ref_lon,
+                ) {
                     Ok(raw) => {
-                        if let Some(f) = &mut current {
+                        if let Some(f) = &mut b.current {
                             f.raw_geometry = raw;
                         }
                     }
                     Err(e) => tracing::warn!("GEOM_AREA parse error: {e:#}"),
                 }
             }
-
             FEATURE_GEOMETRY_RECORD_AREA_EXT => {
-                // Header has an extra f64 scale_factor after the standard 44-byte header.
-                // TriPrim bbox and vertices use i16 SM coords divided by scale_factor.
-                // CELL_EXTENT_RECORD always precedes feature geometry in the stream,
-                // so ref_lat/ref_lon are valid here for bbox SM→WGS84 conversion.
-                if payload_len < 52 {
-                    tracing::warn!(payload_len, "GEOM_AREA_EXT too short");
-                    continue;
-                }
-                // Read the scale_factor from the EXT header (at offset 44 in payload)
-                let mut hdr_p = Cursor::new(payload_bytes.as_slice());
-                for _ in 0..4 {
-                    let _ = read_f64(&mut hdr_p);
-                } // skip 4×f64 extent
-                let _ = read_u32(&mut hdr_p); // contour_count
-                let _ = read_u32(&mut hdr_p); // triprim_count
-                let _ = read_u32(&mut hdr_p); // edge_count
-                let scale_factor = match read_f64(&mut hdr_p) {
-                    Ok(sf) => sf,
-                    Err(e) => {
-                        tracing::warn!("GEOM_AREA_EXT: failed to read scale_factor: {e:#}");
-                        continue;
-                    }
-                };
-                match parse_area_payload(&mut p, payload_len, true, scale_factor, ref_lat, ref_lon)
-                {
-                    Ok(raw) => {
-                        if let Some(f) = &mut current {
-                            f.raw_geometry = raw;
-                        }
-                    }
-                    Err(e) => tracing::warn!("GEOM_AREA_EXT parse error: {e:#}"),
-                }
+                b.parse_geometry_area_ext(&mut p, payload_len);
             }
-
             FEATURE_GEOMETRY_RECORD_MULTIPOINT => {
-                if payload_len >= 36 {
-                    // 4×f64 extent (unused), u32 count, then count×3×f32 (east, north, depth)
-                    let _s = read_f64(&mut p)?;
-                    let _n = read_f64(&mut p)?;
-                    let _w = read_f64(&mut p)?;
-                    let _e = read_f64(&mut p)?;
-                    let count = read_u32(&mut p)? as usize;
-                    let mut pts = Vec::with_capacity(count);
-                    for _ in 0..count {
-                        if p.position() as usize + 12 > payload_len {
-                            break;
-                        }
-                        let east = read_f32(&mut p)?;
-                        let north = read_f32(&mut p)?;
-                        let depth = read_f32(&mut p)?;
-                        pts.push([east, north, depth]);
-                    }
-                    if let Some(f) = &mut current {
-                        f.raw_geometry = RawGeometry::Sounding(pts);
-                    }
-                } else {
-                    tracing::warn!(payload_len, "GEOM_MULTIPOINT too short");
-                }
+                b.parse_geometry_multipoint(&mut p, payload_len)?;
             }
 
-            // ── Vector tables (standard f32 coords) ──────────────────────────
-            VECTOR_EDGE_NODE_TABLE_RECORD => {
-                // u32 n_edges; for each: u32 edge_index, u32 point_count, count×2×f32
-                if payload_len < 4 {
-                    tracing::warn!(payload_len, "VET record too short");
-                    continue;
-                }
-                let n_edges = read_u32(&mut p)? as usize;
-                for _ in 0..n_edges {
-                    if p.position() as usize + 8 > payload_len {
-                        break;
-                    }
-                    let edge_index = read_u32(&mut p)?;
-                    let point_count = read_u32(&mut p)? as usize;
-                    let mut points = Vec::with_capacity(point_count);
-                    for _ in 0..point_count {
-                        if p.position() as usize + 8 > payload_len {
-                            break;
-                        }
-                        let east = f64::from(read_f32(&mut p)?);
-                        let north = f64::from(read_f32(&mut p)?);
-                        points.push([east, north]);
-                    }
-                    vet.insert(edge_index, EdgeEntry { points });
-                }
-            }
+            // ── Vector tables ────────────────────────────────────────────
+            VECTOR_EDGE_NODE_TABLE_RECORD => b.parse_vet(&mut p, payload_len)?,
+            VECTOR_CONNECTED_NODE_TABLE_RECORD => b.parse_vct(&mut p, payload_len)?,
+            VECTOR_EDGE_NODE_TABLE_EXT_RECORD => b.parse_vet_ext(&mut p, payload_len)?,
+            VECTOR_CONNECTED_NODE_TABLE_EXT_RECORD => b.parse_vct_ext(&mut p, payload_len)?,
 
-            VECTOR_CONNECTED_NODE_TABLE_RECORD => {
-                // u32 n_nodes; for each: u32 node_index, 2×f32 (east, north)
-                if payload_len < 4 {
-                    tracing::warn!(payload_len, "VCT record too short");
-                    continue;
-                }
-                let n_nodes = read_u32(&mut p)? as usize;
-                for _ in 0..n_nodes {
-                    if p.position() as usize + 12 > payload_len {
-                        break;
-                    }
-                    let node_index = read_u32(&mut p)?;
-                    let east = f64::from(read_f32(&mut p)?);
-                    let north = f64::from(read_f32(&mut p)?);
-                    vct.insert(
-                        node_index,
-                        NodeEntry {
-                            lon: east,
-                            lat: north,
-                        },
-                    );
-                }
-            }
-
-            // ── Vector tables (extended i16 coords) ──────────────────────────
-            VECTOR_EDGE_NODE_TABLE_EXT_RECORD => {
-                // Payload: f64 scale_factor, u32 n_edges;
-                // for each: u32 edge_index, u32 point_count, count×2×i16
-                if payload_len < 12 {
-                    tracing::warn!(payload_len, "VET_EXT record too short");
-                    continue;
-                }
-                let scale_factor = read_f64(&mut p)?;
-                let n_edges = read_u32(&mut p)? as usize;
-                for _ in 0..n_edges {
-                    if p.position() as usize + 8 > payload_len {
-                        break;
-                    }
-                    let edge_index = read_u32(&mut p)?;
-                    let point_count = read_u32(&mut p)? as usize;
-                    let mut points = Vec::with_capacity(point_count);
-                    for _ in 0..point_count {
-                        if p.position() as usize + 4 > payload_len {
-                            break;
-                        }
-                        let east = f64::from(read_i16(&mut p)?) / scale_factor;
-                        let north = f64::from(read_i16(&mut p)?) / scale_factor;
-                        points.push([east, north]);
-                    }
-                    vet.insert(edge_index, EdgeEntry { points });
-                }
-            }
-
-            VECTOR_CONNECTED_NODE_TABLE_EXT_RECORD => {
-                // Payload: f64 scale_factor, u32 n_nodes;
-                // for each: u32 node_index, 2×i16
-                if payload_len < 12 {
-                    tracing::warn!(payload_len, "VCT_EXT record too short");
-                    continue;
-                }
-                let scale_factor = read_f64(&mut p)?;
-                let n_nodes = read_u32(&mut p)? as usize;
-                for _ in 0..n_nodes {
-                    if p.position() as usize + 8 > payload_len {
-                        break;
-                    }
-                    let node_index = read_u32(&mut p)?;
-                    let east = f64::from(read_i16(&mut p)?) / scale_factor;
-                    let north = f64::from(read_i16(&mut p)?) / scale_factor;
-                    vct.insert(
-                        node_index,
-                        NodeEntry {
-                            lon: east,
-                            lat: north,
-                        },
-                    );
-                }
-            }
-
-            // ── Status / unknown ─────────────────────────────────────────────
+            // ── Status / unknown ─────────────────────────────────────────
             SERVER_STATUS_RECORD => {
-                // Consumed in the prologue; unexpected if it appears mid-stream.
                 tracing::warn!("SERVER_STATUS_RECORD (200) appeared mid-stream, skipping");
             }
-
             unknown => {
                 tracing::warn!(rec_type = unknown, rec_len, "unknown record type, skipping");
             }
         }
     }
 
-    if native_scale == 0 {
+    if b.native_scale == 0 {
         bail!("cell {source:?} has no HEADER_CELL_NATIVESCALE record (or scale is zero)");
     }
 
     // Push the last in-flight feature.
-    if let Some(f) = current.take() {
-        raw_features.push(f);
-    }
+    b.flush_current_feature();
+
+    // Destructure the builder so post-processing uses plain locals.
+    #[allow(clippy::unneeded_field_pattern)] // `current` consumed by flush; explicit _ documents intent
+    let CellBuilder {
+        name,
+        native_scale,
+        publish_date,
+        edition,
+        update_date,
+        update_number,
+        senc_create_date,
+        sounding_datum,
+        ref_lat,
+        ref_lon,
+        bounds,
+        raw_features,
+        raw_covr,
+        raw_nocovr,
+        text_descriptions,
+        vet,
+        vct,
+        current: _,
+    } = b;
 
     // ── Resolve SM coords → WGS84 ────────────────────────────────────────────
     let mut resolved_vct: HashMap<u32, Point> = HashMap::with_capacity(vct.len());
