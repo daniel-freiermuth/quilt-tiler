@@ -1496,6 +1496,143 @@ mod tests {
         );
     }
 
+    // ── resolve_geometry Line-variant tests ─────────────────────────────────
+
+    /// A single edge with `edge_rcid = 0` (no intermediate VET points) and
+    /// `dir = 0` (forward) must produce `[start_node, end_node]` — and
+    /// crucially, no closing coordinate (close = false for lines).
+    #[test]
+    fn resolve_geometry_line_single_edge_no_vet() {
+        let edge_refs = vec![[10, 0, 20, 0]];
+        let vct = node_points(&[10, 20]);
+        let vet: HashMap<u32, LineString> = HashMap::new();
+
+        let raw = RawGeometry::Line(edge_refs);
+        let geometry = resolve_geometry(raw, 0.0, 0.0, &vet, &vct);
+        let Geometry::Line(line) = geometry else {
+            panic!("expected Geometry::Line, got {geometry:?}");
+        };
+
+        let coords: Vec<Coord> = line.coords().cloned().collect();
+        assert_eq!(
+            coords,
+            vec![
+                Coord { x: 10.0, y: 10.0 },
+                Coord { x: 20.0, y: 20.0 },
+            ],
+            "single edge → start + end, no closing coord"
+        );
+    }
+
+    /// A single edge whose `edge_rcid` resolves in the VET must produce
+    /// `start_node + edge_coords + end_node` in forward order.
+    #[test]
+    fn resolve_geometry_line_single_edge_with_vet_forward() {
+        let edge_refs = vec![[10, 100, 20, 0]];
+        let vct = node_points(&[10, 20]);
+        let vet: HashMap<u32, LineString> = [(
+            100u32,
+            LineString::new(vec![
+                Coord { x: 12.0, y: 12.0 },
+                Coord { x: 15.0, y: 15.0 },
+                Coord { x: 18.0, y: 18.0 },
+            ]),
+        )]
+        .into();
+
+        let raw = RawGeometry::Line(edge_refs);
+        let geometry = resolve_geometry(raw, 0.0, 0.0, &vet, &vct);
+        let Geometry::Line(line) = geometry else {
+            panic!("expected Geometry::Line, got {geometry:?}");
+        };
+
+        let coords: Vec<Coord> = line.coords().cloned().collect();
+        assert_eq!(
+            coords,
+            vec![
+                Coord { x: 10.0, y: 10.0 },
+                Coord { x: 12.0, y: 12.0 },
+                Coord { x: 15.0, y: 15.0 },
+                Coord { x: 18.0, y: 18.0 },
+                Coord { x: 20.0, y: 20.0 },
+            ],
+            "forward edge: start + VET coords + end"
+        );
+    }
+
+    /// A reversed edge (`dir = 1`) must emit intermediate VET coords in
+    /// reverse order while still using start/end nodes from the edge-ref.
+    #[test]
+    fn resolve_geometry_line_reversed_edge() {
+        let edge_refs = vec![[10, 100, 20, 1]];
+        let vct = node_points(&[10, 20]);
+        let vet: HashMap<u32, LineString> = [(
+            100u32,
+            LineString::new(vec![
+                Coord { x: 12.0, y: 12.0 },
+                Coord { x: 15.0, y: 15.0 },
+                Coord { x: 18.0, y: 18.0 },
+            ]),
+        )]
+        .into();
+
+        let raw = RawGeometry::Line(edge_refs);
+        let geometry = resolve_geometry(raw, 0.0, 0.0, &vet, &vct);
+        let Geometry::Line(line) = geometry else {
+            panic!("expected Geometry::Line, got {geometry:?}");
+        };
+
+        let coords: Vec<Coord> = line.coords().cloned().collect();
+        assert_eq!(
+            coords,
+            vec![
+                Coord { x: 10.0, y: 10.0 },
+                Coord { x: 18.0, y: 18.0 },
+                Coord { x: 15.0, y: 15.0 },
+                Coord { x: 12.0, y: 12.0 },
+                Coord { x: 20.0, y: 20.0 },
+            ],
+            "reversed edge: VET coords appear in reverse order"
+        );
+    }
+
+    /// A multi-edge line must chain start + end nodes with deduplication
+    /// at shared vertices, and must NOT close (no appended first coord).
+    #[test]
+    fn resolve_geometry_line_multi_edge_no_close() {
+        let edge_refs = vec![
+            [10, 0, 20, 0],
+            [20, 0, 30, 0],
+            [30, 0, 40, 0],
+        ];
+        let vct = node_points(&[10, 20, 30, 40]);
+        let vet: HashMap<u32, LineString> = HashMap::new();
+
+        let raw = RawGeometry::Line(edge_refs);
+        let geometry = resolve_geometry(raw, 0.0, 0.0, &vet, &vct);
+        let Geometry::Line(line) = geometry else {
+            panic!("expected Geometry::Line, got {geometry:?}");
+        };
+
+        let coords: Vec<Coord> = line.coords().cloned().collect();
+        assert_eq!(
+            coords,
+            vec![
+                Coord { x: 10.0, y: 10.0 },
+                Coord { x: 20.0, y: 20.0 },
+                Coord { x: 30.0, y: 30.0 },
+                Coord { x: 40.0, y: 40.0 },
+            ],
+            "multi-edge line: deduped chain, first coord NOT appended at end"
+        );
+        // The critical close=false contract: first ≠ last for a non-closed polyline.
+        assert_ne!(
+            coords.first(),
+            coords.last(),
+            "line must NOT be closed (close=false)"
+        );
+    }
+
     // ── decode_covr tests ───────────────────────────────────────────────────
 
     /// Helper: build a closed rectangular `LineString`.
