@@ -1315,4 +1315,154 @@ mod tests {
             PropValue::I64(None)
         );
     }
+
+    // ── S57Accumulator::encode — layer sorting, empty-layer skip ──────────
+
+    /// Build a single-layer `HashMap` content entry for `S57Accumulator::push`.
+    fn layer_content(
+        name: &'static str,
+        features: Vec<Vec<(&str, PropValue)>>,
+    ) -> HashMap<&'static str, Vec<RawFeature>> {
+        let raw: Vec<RawFeature> = features
+            .into_iter()
+            .map(|props| {
+                (
+                    pt().into(),
+                    props
+                        .into_iter()
+                        .map(|(k, v)| (k.to_owned(), v))
+                        .collect(),
+                )
+            })
+            .collect();
+        HashMap::from([(name, raw)])
+    }
+
+    #[test]
+    fn encode_single_layer_produces_non_empty_bytes() {
+        let mut acc = S57Accumulator::empty();
+        acc.push(layer_content(
+            "DEPARE",
+            vec![vec![("DRVAL1", PropValue::F64(Some(1.0)))]],
+        ));
+        let bytes = acc.encode().expect("encode should succeed");
+        assert!(!bytes.is_empty(), "single layer with one feature should produce bytes");
+    }
+
+    #[test]
+    fn encode_all_empty_layers_returns_empty_vec() {
+        let mut acc = S57Accumulator::empty();
+        // Push content maps whose feature vecs are empty — LayerBuf entries
+        // are created but their feature_count stays 0.
+        acc.push(HashMap::from([("DEPARE", Vec::<RawFeature>::new())]));
+        acc.push(HashMap::from([("LNDARE", Vec::<RawFeature>::new())]));
+        let bytes = acc.encode().expect("encode should succeed");
+        assert!(bytes.is_empty(), "all-empty layers should produce no bytes");
+    }
+
+    #[test]
+    fn encode_skips_empty_layers_among_populated_ones() {
+        // Two layers: DEPARE has a feature, LNDARE is empty.
+        let mut acc = S57Accumulator::empty();
+        acc.push(layer_content(
+            "DEPARE",
+            vec![vec![("DRVAL1", PropValue::F64(Some(2.0)))]],
+        ));
+        acc.push(HashMap::from([("LNDARE", Vec::<RawFeature>::new())]));
+
+        // Encode with both layers present (one empty).
+        let bytes_mixed = acc.encode().expect("encode should succeed");
+
+        // Encode with only the populated layer.
+        let mut acc_single = S57Accumulator::empty();
+        acc_single.push(layer_content(
+            "DEPARE",
+            vec![vec![("DRVAL1", PropValue::F64(Some(2.0)))]],
+        ));
+        let bytes_single = acc_single.encode().expect("encode should succeed");
+
+        assert_eq!(
+            bytes_mixed, bytes_single,
+            "empty layers should not contribute bytes"
+        );
+    }
+
+    #[test]
+    fn encode_multi_layer_output_is_deterministic_regardless_of_insertion_order() {
+        // Push layers in alphabetical order: BUOYAG, DEPARE, LNDARE.
+        let mut acc_alpha = S57Accumulator::empty();
+        acc_alpha.push(layer_content(
+            "BUOYAG",
+            vec![vec![("COLOUR", PropValue::Str(Some("1".into())))]],
+        ));
+        acc_alpha.push(layer_content(
+            "DEPARE",
+            vec![vec![("DRVAL1", PropValue::F64(Some(3.0)))]],
+        ));
+        acc_alpha.push(layer_content(
+            "LNDARE",
+            vec![vec![("NATION", PropValue::Str(Some("US".into())))]],
+        ));
+        let bytes_alpha = acc_alpha.encode().expect("encode should succeed");
+
+        // Push layers in reverse order: LNDARE, DEPARE, BUOYAG.
+        let mut acc_rev = S57Accumulator::empty();
+        acc_rev.push(layer_content(
+            "LNDARE",
+            vec![vec![("NATION", PropValue::Str(Some("US".into())))]],
+        ));
+        acc_rev.push(layer_content(
+            "DEPARE",
+            vec![vec![("DRVAL1", PropValue::F64(Some(3.0)))]],
+        ));
+        acc_rev.push(layer_content(
+            "BUOYAG",
+            vec![vec![("COLOUR", PropValue::Str(Some("1".into())))]],
+        ));
+        let bytes_rev = acc_rev.encode().expect("encode should succeed");
+
+        assert_eq!(
+            bytes_alpha, bytes_rev,
+            "layer insertion order must not affect output (sort by name)"
+        );
+    }
+
+    #[test]
+    fn encode_multi_layer_concatenates_in_sorted_name_order() {
+        // Encode each layer individually to get its bytes.
+        let mut acc_b = S57Accumulator::empty();
+        acc_b.push(layer_content(
+            "BUOYAG",
+            vec![vec![("COLOUR", PropValue::Str(Some("3".into())))]],
+        ));
+        let bytes_b = acc_b.encode().expect("encode should succeed");
+
+        let mut acc_d = S57Accumulator::empty();
+        acc_d.push(layer_content(
+            "DEPARE",
+            vec![vec![("DRVAL1", PropValue::F64(Some(5.0)))]],
+        ));
+        let bytes_d = acc_d.encode().expect("encode should succeed");
+
+        // Encode both together (pushed in reverse order to exercise sort).
+        let mut acc_both = S57Accumulator::empty();
+        acc_both.push(layer_content(
+            "DEPARE",
+            vec![vec![("DRVAL1", PropValue::F64(Some(5.0)))]],
+        ));
+        acc_both.push(layer_content(
+            "BUOYAG",
+            vec![vec![("COLOUR", PropValue::Str(Some("3".into())))]],
+        ));
+        let bytes_both = acc_both.encode().expect("encode should succeed");
+
+        // The multi-layer output should be BUOYAG bytes ++ DEPARE bytes
+        // (sorted alphabetically: B before D).
+        let mut expected = bytes_b;
+        expected.extend_from_slice(&bytes_d);
+        assert_eq!(
+            bytes_both, expected,
+            "multi-layer encode should concatenate layers in sorted name order"
+        );
+    }
 }
