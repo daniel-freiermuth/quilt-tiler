@@ -825,6 +825,300 @@ mod tests {
         }
     }
 
+    // ── push_features ─────────────────────────────────────────────────────
+
+    /// Build a minimal `s57::Feature` for `push_features` tests.
+    fn feat(geometry: s57::Geometry, attributes: Vec<s57::Attribute>) -> s57::Feature {
+        s57::Feature {
+            type_code: 1,
+            id: 1,
+            primitive: 0,
+            attributes,
+            geometry,
+        }
+    }
+
+    #[test]
+    fn push_features_none_geometry_produces_nothing() {
+        let tile = test_tile_geom(Point::new(10.0, 55.0), 0.1);
+        let f = feat(s57::Geometry::None, vec![]);
+        let mut out = Vec::new();
+        push_features(&f, &tile, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn push_features_point_projects_to_tile_center() {
+        let center = Point::new(10.0, 55.0);
+        let tile = test_tile_geom(center, 0.1);
+        let f = feat(s57::Geometry::Point(center), vec![]);
+        let mut out = Vec::new();
+        push_features(&f, &tile, &mut out);
+        assert_eq!(out.len(), 1, "exactly one feature expected");
+        let geo::Geometry::Point(p) = &out[0].0 else {
+            panic!("expected Point geometry");
+        };
+        // Center of tile → pixel ~(EXTENT/2, EXTENT/2).  Mercator projection
+        // is non-linear in latitude, so the y-pixel may be off by a few.
+        assert!(
+            (p.x() - 2048).abs() <= 2 && (p.y() - 2048).abs() <= 4,
+            "center point should map to ~(2048,2048), got ({}, {})",
+            p.x(),
+            p.y()
+        );
+    }
+
+    #[test]
+    fn push_features_point_carries_properties() {
+        let center = Point::new(10.0, 55.0);
+        let tile = test_tile_geom(center, 0.1);
+        // code 75 = COLOUR
+        let attrs = vec![s57::Attribute {
+            code: 75,
+            value: s57::AttrValue::Str("3".into()),
+        }];
+        let f = feat(s57::Geometry::Point(center), attrs);
+        let mut out = Vec::new();
+        push_features(&f, &tile, &mut out);
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0]
+                .1
+                .iter()
+                .any(|(k, v)| k == "COLOUR"
+                    && matches!(v, PropValue::Str(Some(s)) if s == "3")),
+            "expected COLOUR=3 in properties, got {:?}",
+            out[0].1
+        );
+    }
+
+    #[test]
+    fn push_features_soundings_filters_outside_tile_and_adds_valdco() {
+        let center = Point::new(10.0, 55.0);
+        let tile = test_tile_geom(center, 0.1);
+        let inside = Point::new(10.0, 55.0);
+        let outside = Point::new(20.0, 55.0); // far outside
+        let soundings = vec![(inside, 12.5), (outside, 99.0)];
+        let f = feat(s57::Geometry::Soundings(soundings), vec![]);
+        let mut out = Vec::new();
+        push_features(&f, &tile, &mut out);
+        assert_eq!(out.len(), 1, "only the inside sounding should survive");
+        // Check VALDCO property
+        let valdco = out[0]
+            .1
+            .iter()
+            .find(|(k, _)| k == "VALDCO")
+            .expect("sounding must carry VALDCO property");
+        assert_eq!(valdco.1, PropValue::F64(Some(12.5)));
+    }
+
+    #[test]
+    fn push_features_soundings_all_outside_produces_nothing() {
+        let center = Point::new(10.0, 55.0);
+        let tile = test_tile_geom(center, 0.1);
+        let outside = Point::new(20.0, 60.0);
+        let f = feat(s57::Geometry::Soundings(vec![(outside, 5.0)]), vec![]);
+        let mut out = Vec::new();
+        push_features(&f, &tile, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn push_features_line_empty_produces_nothing() {
+        let tile = test_tile_geom(Point::new(10.0, 55.0), 0.1);
+        let f = feat(
+            s57::Geometry::Line(LineString::new(vec![])),
+            vec![],
+        );
+        let mut out = Vec::new();
+        push_features(&f, &tile, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn push_features_line_fully_outside_produces_nothing() {
+        let tile = test_tile_geom(Point::new(10.0, 55.0), 0.1);
+        // Line entirely outside the tile bbox
+        let f = feat(
+            s57::Geometry::Line(LineString::from(vec![[20.0, 60.0], [21.0, 60.0]])),
+            vec![],
+        );
+        let mut out = Vec::new();
+        push_features(&f, &tile, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn push_features_line_clips_to_tile() {
+        let center = Point::new(10.0, 55.0);
+        let tile = test_tile_geom(center, 0.1);
+        // Line starts inside, extends far outside to the east
+        let f = feat(
+            s57::Geometry::Line(LineString::from(vec![[10.0, 55.0], [20.0, 55.0]])),
+            vec![],
+        );
+        let mut out = Vec::new();
+        push_features(&f, &tile, &mut out);
+        assert_eq!(out.len(), 1, "clipped line should produce one feature");
+        let geo::Geometry::MultiLineString(mls) = &out[0].0 else {
+            panic!("expected MultiLineString geometry");
+        };
+        assert!(!mls.0.is_empty(), "clipped result must not be empty");
+        // All pixel x-coords should be in [0, EXTENT]
+        for ls in &mls.0 {
+            for c in ls.coords() {
+                assert!(
+                    c.x >= 0 && c.x <= TILE_EXTENT as i32,
+                    "pixel x out of range: {c:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn push_features_area_empty_produces_nothing() {
+        let tile = test_tile_geom(Point::new(10.0, 55.0), 0.1);
+        let f = feat(
+            s57::Geometry::Area(Polygon::new(LineString::new(vec![]), vec![])),
+            vec![],
+        );
+        let mut out = Vec::new();
+        push_features(&f, &tile, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn push_features_area_fully_outside_produces_nothing() {
+        let tile = test_tile_geom(Point::new(10.0, 55.0), 0.1);
+        let f = feat(
+            s57::Geometry::Area(Polygon::new(
+                LineString::from(vec![
+                    [20.0, 60.0],
+                    [21.0, 60.0],
+                    [21.0, 61.0],
+                    [20.0, 61.0],
+                ]),
+                vec![],
+            )),
+            vec![],
+        );
+        let mut out = Vec::new();
+        push_features(&f, &tile, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn push_features_area_clips_to_tile() {
+        let center = Point::new(10.0, 55.0);
+        let tile = test_tile_geom(center, 0.1);
+        // Polygon extends beyond the tile to the east
+        let f = feat(
+            s57::Geometry::Area(Polygon::new(
+                LineString::from(vec![
+                    [9.95, 54.95],
+                    [10.2, 54.95],
+                    [10.2, 55.05],
+                    [9.95, 55.05],
+                ]),
+                vec![],
+            )),
+            vec![],
+        );
+        let mut out = Vec::new();
+        push_features(&f, &tile, &mut out);
+        assert_eq!(out.len(), 1, "clipped polygon should produce one feature");
+        let geo::Geometry::MultiPolygon(mp) = &out[0].0 else {
+            panic!("expected MultiPolygon geometry");
+        };
+        assert!(!mp.0.is_empty(), "clipped result must not be empty");
+        // All pixel coords should be in [0, EXTENT]
+        for poly in &mp.0 {
+            for c in poly.exterior().coords() {
+                assert!(
+                    c.x >= 0 && c.x <= TILE_EXTENT as i32 && c.y >= 0 && c.y <= TILE_EXTENT as i32,
+                    "pixel coord out of range: {c:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn push_features_scamin_below_tile_scale_is_skipped() {
+        let center = Point::new(10.0, 55.0);
+        let mut tile = test_tile_geom(center, 0.1);
+        tile.scale = 100;
+        // SCAMIN = 50 < tile.scale = 100 → feature should be skipped
+        let attrs = vec![s57::Attribute {
+            code: 133, // SCAMIN
+            value: s57::AttrValue::Int(50),
+        }];
+        let f = feat(s57::Geometry::Point(center), attrs);
+        let mut out = Vec::new();
+        push_features(&f, &tile, &mut out);
+        assert!(out.is_empty(), "feature with SCAMIN < tile.scale must be skipped");
+    }
+
+    #[test]
+    fn push_features_scamin_above_tile_scale_passes() {
+        let center = Point::new(10.0, 55.0);
+        let mut tile = test_tile_geom(center, 0.1);
+        tile.scale = 100;
+        // SCAMIN = 200 >= tile.scale = 100 → feature should NOT be skipped
+        let attrs = vec![s57::Attribute {
+            code: 133,
+            value: s57::AttrValue::Int(200),
+        }];
+        let f = feat(s57::Geometry::Point(center), attrs);
+        let mut out = Vec::new();
+        push_features(&f, &tile, &mut out);
+        assert_eq!(out.len(), 1, "feature with SCAMIN >= tile.scale must pass");
+    }
+
+    // ── build_props ───────────────────────────────────────────────────────
+
+    #[test]
+    fn build_props_converts_all_attr_value_variants() {
+        let attrs = vec![
+            s57::Attribute {
+                code: 75,  // COLOUR
+                value: s57::AttrValue::Str("1".into()),
+            },
+            s57::Attribute {
+                code: 178, // VALNMR
+                value: s57::AttrValue::Double(3.5),
+            },
+            s57::Attribute {
+                code: 133, // SCAMIN
+                value: s57::AttrValue::Int(50_000),
+            },
+        ];
+        let props = build_props(&attrs);
+        assert_eq!(props.len(), 3);
+        assert_eq!(props[0].0, "COLOUR");
+        assert_eq!(props[0].1, PropValue::Str(Some("1".into())));
+        assert_eq!(props[1].0, "VALNMR");
+        assert_eq!(props[1].1, PropValue::F64(Some(3.5)));
+        assert_eq!(props[2].0, "SCAMIN");
+        assert_eq!(props[2].1, PropValue::U64(Some(50_000)));
+    }
+
+    #[test]
+    fn build_props_skips_unknown_attribute_codes() {
+        let attrs = vec![
+            s57::Attribute {
+                code: 75, // COLOUR — known
+                value: s57::AttrValue::Str("1".into()),
+            },
+            s57::Attribute {
+                code: 9999, // unknown code
+                value: s57::AttrValue::Int(42),
+            },
+        ];
+        let props = build_props(&attrs);
+        assert_eq!(props.len(), 1, "unknown codes must be filtered out");
+        assert_eq!(props[0].0, "COLOUR");
+    }
+
     // ── light_sectors_to_features: buoy circle suppression ───────────────────
 
     /// A small square tile region centered on `center`, wide enough to
