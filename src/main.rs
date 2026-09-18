@@ -317,3 +317,53 @@ fn run_raster(args: &Args) -> Result<()> {
 
     Ok(())
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: assert `days_to_ymd` returns the expected (year, month, day).
+    fn assert_ymd(days: u64, expected: (u64, u64, u64)) {
+        assert_eq!(
+            days_to_ymd(days),
+            expected,
+            "days_to_ymd({days}) should be {expected:?}"
+        );
+    }
+
+    #[test]
+    fn epoch_day_zero() {
+        // Unix epoch: 1970-01-01
+        assert_ymd(0, (1970, 1, 1));
+    }
+
+    #[test]
+    fn leap_year_feb_29() {
+        // 2024-02-29 (regular leap year)
+        assert_ymd(19782, (2024, 2, 29));
+    }
+
+    #[test]
+    fn century_non_leap_boundary() {
+        // 2100 is divisible by 100 but NOT by 400 → not a leap year.
+        // 2100-03-01 is the first day after the would-be Feb 29.
+        assert_ymd(47541, (2100, 3, 1));
+    }
+
+    #[test]
+    fn quad_century_leap_year() {
+        // 2000 is divisible by 400 → IS a leap year despite the century rule.
+        assert_ymd(11016, (2000, 2, 29));
+    }
+
+    #[test]
+    fn year_end_year_start_transition() {
+        // 2025-12-31 → 2026-01-01 are consecutive days.
+        assert_ymd(20453, (2025, 12, 31));
+        assert_ymd(20454, (2026, 1, 1));
+    }
+
+    #[test]
+    fn known_date_2026_08_29() {
+        assert_ymd(20694, (2026, 8, 29));
+    }
+}
