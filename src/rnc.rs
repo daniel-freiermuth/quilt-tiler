@@ -284,4 +284,44 @@ mod tests {
         let bbox_area = geo::Polygon::from(cell.bbox()).unsigned_area();
         assert!((cell.coverage().unsigned_area() - bbox_area).abs() < 1e-9);
     }
+
+    #[test]
+    fn rejects_zero_width_cell_extent() {
+        // lon0 == lon1 → xmax == xmin in Mercator → degenerate
+        let data = build_rnc(1, 1, (11.0, 57.0, 11.0, 58.0), 3_000_000.0, &[]);
+        let err = RncCell::parse("TEST".to_owned(), data).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("degenerate cell extent"),
+            "expected degenerate-extent error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_height_cell_extent() {
+        // lat0 == lat1 → ymax == ymin in Mercator → degenerate
+        let data = build_rnc(1, 1, (11.0, 57.0, 12.0, 57.0), 3_000_000.0, &[]);
+        let err = RncCell::parse("TEST".to_owned(), data).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("degenerate cell extent"),
+            "expected degenerate-extent error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn rejects_all_zero_cell_extent() {
+        // All coordinates zero → both dimensions degenerate
+        let data = build_rnc(1, 1, (0.0, 0.0, 0.0, 0.0), 3_000_000.0, &[]);
+        let err = RncCell::parse("TEST".to_owned(), data).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("degenerate cell extent"),
+            "expected degenerate-extent error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn accepts_minimal_positive_cell_extent() {
+        // Tiny but strictly positive extent in both dimensions must pass.
+        let data = build_rnc(1, 1, (11.0, 57.0, 11.001, 57.001), 3_000_000.0, &[]);
+        RncCell::parse("TEST".to_owned(), data).expect("minimal positive extent should parse");
+    }
 }
