@@ -596,15 +596,15 @@ mod tests {
         );
     }
 
-    /// The tileserver's Content-Type must match the MIME the MapLibre
+    /// The tileserver's Content-Type must match the MIME the `MapLibre`
     /// ecosystem uses for live tile serving:
     ///
     /// - MLT vector tiles: `application/vnd.maplibre-tile`
-    ///   (same as martin — the official MapLibre tile server — and the
-    ///   Accept header MapLibre GL JS sends for `encoding: 'mlt'` sources).
+    ///   (same as martin — the official `MapLibre` tile server — and the
+    ///   Accept header `MapLibre` GL JS sends for `encoding: 'mlt'` sources).
     /// - Raster (PNG) tiles: `image/png`
     ///
-    /// Note: PMTiles archives declare `application/vnd.maplibre-vector-tile`
+    /// Note: `PMTiles` archives declare `application/vnd.maplibre-vector-tile`
     /// for MLT via `TileType::Mlt.content_type()`.  That longer form is
     /// correct in the archive header; the shorter form is what goes over
     /// HTTP.  Martin does the same and accepts both when parsing.
