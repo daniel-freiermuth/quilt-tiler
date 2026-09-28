@@ -31,6 +31,16 @@
 //! Per the format's own documented tile-extent formula, grid cells are
 //! uniform **in this projection's metres, not in `WGS-84` degrees** — see
 //! [`grid_cell_wgs84_bounds`] and [`locate_grid_cell`].
+#![deny(clippy::indexing_slicing)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use anyhow::{Context, Result, bail};
 use geo::{Area, Coord, LineString, MultiPolygon, Polygon, coord};
@@ -126,9 +136,10 @@ pub fn locate_grid_cell(
 /// Read a little-endian `u32` at byte offset `at`, bounds-checked.
 fn read_u32_le(data: &[u8], at: usize) -> Result<u32> {
     let b = data
-        .get(at..at + 4)
+        .get(at..)
+        .and_then(<[u8]>::first_chunk::<4>)
         .with_context(|| format!("offset {at} out of bounds (file is {} bytes)", data.len()))?;
-    Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    Ok(u32::from_le_bytes(*b))
 }
 
 /// Parsed `.rnc` binary header: grid dimensions and the tile offset table.
@@ -176,13 +187,13 @@ impl RncHeader {
             let at = (16 + i * 4) as usize;
             offsets.push(read_u32_le(data, at)?);
         }
-        for w in offsets.windows(2) {
-            if w[1] < w[0] {
-                bail!("offset table is not monotonically non-decreasing");
-            }
+        if !offsets.is_sorted() {
+            bail!("offset table is not monotonically non-decreasing");
         }
         #[allow(clippy::cast_possible_truncation)] // n_tiles < offsets.len(), checked above
-        let last_tile_end = offsets[n_tiles as usize] as usize;
+        let last_tile_end = *offsets
+            .get(n_tiles as usize)
+            .context("offset table shorter than tile grid")? as usize;
         if last_tile_end > data.len() {
             bail!("offset table points past end of file");
         }
@@ -285,14 +296,12 @@ impl RncFooter {
     /// it doesn't match [`RncFooter`]'s shape.
     pub fn parse(data: &[u8]) -> Result<Self> {
         const MARKER: &[u8] = b"{\"cover\"";
-        let pos = data
+        let footer = data
             .windows(MARKER.len())
-            .enumerate()
-            .rev()
-            .find(|(_, w)| *w == MARKER)
-            .map(|(i, _)| i)
+            .rposition(|w| w == MARKER)
+            .and_then(|pos| data.get(pos..))
             .context("RNC footer marker `{\"cover\"` not found")?;
-        serde_json::from_slice(&data[pos..]).context("failed to parse RNC footer JSON")
+        serde_json::from_slice(footer).context("failed to parse RNC footer JSON")
     }
 
     /// `WGS-84` bounding box, corners normalized so `west <= east` and
@@ -368,8 +377,10 @@ fn cover_to_multipolygon(rings: &[Vec<f64>]) -> Option<MultiPolygon> {
                     coord! { x: lon, y: lat }
                 })
                 .collect();
-            if coords.first() != coords.last() {
-                coords.push(coords[0]);
+            if let Some(&first) = coords.first()
+                && coords.last() != Some(&first)
+            {
+                coords.push(first);
             }
             let poly = Polygon::new(LineString::new(coords), vec![]);
             (poly.unsigned_area() > 0.0).then_some(poly)

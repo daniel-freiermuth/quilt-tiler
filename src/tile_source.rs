@@ -31,7 +31,11 @@ pub trait TileAccumulator: Send {
     fn empty() -> Self;
 
     /// Merge one cell's rendered content into this accumulator.
-    fn push(&mut self, content: Self::Content);
+    ///
+    /// # Errors
+    /// Returns an error if the content cannot be merged (e.g. an encoder
+    /// rejects it).
+    fn push(&mut self, content: Self::Content) -> Result<()>;
 
     /// Finish accumulation and encode to raw tile bytes.
     ///

@@ -5,6 +5,7 @@
 //! and a matching `style.json` on demand — same quilting/coverage logic as
 //! the batch `quilt-tiler` binary ([`quilt_tiler::tiles::render_tile`]), just
 //! computed per request instead of written to a `PMTiles` archive.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -237,7 +238,7 @@ impl AppState {
 
     /// Build the `style.json` body, embedding `tile_url` as the source's
     /// tile template.
-    fn style_json(&self, tile_url: &str) -> String {
+    fn style_json(&self, tile_url: &str) -> Result<String> {
         match &self.sources {
             Sources::Vector {
                 min_zoom, max_zoom, ..
@@ -273,7 +274,13 @@ async fn style_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -
         state.base_url(&headers),
         state.build_id
     );
-    let body = state.style_json(&tile_url);
+    let body = match state.style_json(&tile_url) {
+        Ok(body) => body,
+        Err(e) => {
+            error!(error = %e, "style.json build failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
     let etag = etag_for(body.as_bytes());
     if let Some(resp) = not_modified(
         headers.get(header::IF_NONE_MATCH),

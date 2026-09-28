@@ -4,6 +4,7 @@
 //! Consumed by the batch `PMTiles` writer (`src/main.rs`) and the live tile
 //! server (`src/bin/tileserver.rs`) — both build on the same
 //! [`tile_source::TileSource`] implementations and [`tiles::render_tile`].
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod bbox;
 pub mod lattice;

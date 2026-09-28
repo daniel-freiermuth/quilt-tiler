@@ -23,20 +23,21 @@ const STYLE_JSON: &str = include_str!("style.json");
 ///   `http://localhost:3000/chart/{z}/{x}/{y}`.  Embedded in `sources.enc`.
 /// * `min_zoom` / `max_zoom` — zoom range for the tile source.
 ///
-/// # Panics
-/// Panics if the embedded `style.json` is malformed (compile-time guarantee).
-#[must_use]
+/// # Errors
+/// Returns an error if the embedded `style.json` is malformed or the built
+/// style cannot be serialised.
 pub fn build_style(
     safety_depth: f64,
     shoal_depth: f64,
     tile_url: &str,
     min_zoom: u8,
     max_zoom: u8,
-) -> String {
+) -> anyhow::Result<String> {
+    use anyhow::Context;
     use serde_json::{Value, json};
 
     let mut style: Value =
-        serde_json::from_str(STYLE_JSON).expect("embedded style.json is valid JSON");
+        serde_json::from_str(STYLE_JSON).context("embedded style.json is not valid JSON")?;
 
     // --- generated depth layers -------------------------------------------
 
@@ -92,7 +93,7 @@ pub fn build_style(
     // --- rebuild layers array in place ------------------------------------
     let old_layers = style["layers"]
         .as_array()
-        .expect("style.json layers is an array")
+        .context("embedded style.json `layers` is not an array")?
         .clone();
 
     let mut new_layers: Vec<Value> = Vec::with_capacity(old_layers.len() + 1);
@@ -130,7 +131,7 @@ pub fn build_style(
         }
     });
 
-    serde_json::to_string_pretty(&style).expect("style serialisation cannot fail")
+    serde_json::to_string_pretty(&style).context("serialising vector style")
 }
 
 /// Build a minimal `MapLibre` GL raster style for a PNG tile source.
@@ -142,11 +143,10 @@ pub fn build_style(
 /// * `tile_url` — full PNG tile URL template, e.g.
 ///   `http://localhost:3000/chart/{z}/{x}/{y}`.
 /// * `min_zoom` / `max_zoom` — zoom range for the tile source.
-/// # Panics
-/// Panics if `serde_json` fails to serialise the style (cannot happen — the
-/// value is built entirely from this function's own literals and inputs).
-#[must_use]
-pub fn build_raster_style(tile_url: &str, min_zoom: u8, max_zoom: u8) -> String {
+/// # Errors
+/// Returns an error if `serde_json` fails to serialise the style.
+pub fn build_raster_style(tile_url: &str, min_zoom: u8, max_zoom: u8) -> anyhow::Result<String> {
+    use anyhow::Context;
     use serde_json::json;
 
     let style = json!({
@@ -169,7 +169,7 @@ pub fn build_raster_style(tile_url: &str, min_zoom: u8, max_zoom: u8) -> String 
         ]
     });
 
-    serde_json::to_string_pretty(&style).expect("style serialisation cannot fail")
+    serde_json::to_string_pretty(&style).context("serialising raster style")
 }
 
 #[cfg(test)]
@@ -188,13 +188,10 @@ mod tests {
 
     #[test]
     fn cardinal_buoy_body_and_topmark_are_separate_layers_with_topmark_on_top() {
-        let style: Value = serde_json::from_str(&build_style(
-            5.0,
-            10.0,
-            "http://localhost/{z}/{x}/{y}",
-            6,
-            18,
-        ))
+        let style: Value = serde_json::from_str(
+            &build_style(5.0, 10.0, "http://localhost/{z}/{x}/{y}", 6, 18)
+                .expect("build_style succeeds"),
+        )
         .expect("build_style output is valid JSON");
 
         let layers = style["layers"].as_array().expect("layers is an array");
