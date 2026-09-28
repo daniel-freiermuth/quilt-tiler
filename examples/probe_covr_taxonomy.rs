@@ -1,9 +1,10 @@
-//! Scans every .oesu file's raw COVR/NOCOVR records and classifies every
+//! Scans every `.oesu` file's raw COVR/NOCOVR records and classifies every
 //! intersecting (COVR exterior, NOCOVR ring) pair by:
-//!   - overlap_fraction = intersection_area(ext, nocovr) / ext_area
-//!   - is_rect = nocovr's own area / its bbox area (1.0 = perfect rectangle)
-//!   - shared_vertex_frac = fraction of nocovr's vertices that coincide
+//!   - `overlap_fraction` = `intersection_area(ext, nocovr) / ext_area`
+//!   - `is_rect` = nocovr's own area / its bbox area (1.0 = perfect rectangle)
+//!   - `shared_vertex_frac` = fraction of nocovr's vertices that coincide
 //!     (within 1e-4 deg) with an ext vertex (high = traces ext's boundary)
+//!
 //! to characterize the actual distribution of COVR/NOCOVR relationships in
 //! this corpus, rather than generalizing from 2 examples. Also flags any
 //! cell/exterior that sees a *mix* of the 0%/100% patterns.
@@ -69,12 +70,12 @@ fn bbox_area(ring: &LineString) -> f64 {
     let xs: Vec<f64> = ring.coords().map(|c| c.x).collect();
     let ys: Vec<f64> = ring.coords().map(|c| c.y).collect();
     let (xmin, xmax) = (
-        xs.iter().cloned().fold(f64::INFINITY, f64::min),
-        xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        xs.iter().copied().fold(f64::INFINITY, f64::min),
+        xs.iter().copied().fold(f64::NEG_INFINITY, f64::max),
     );
     let (ymin, ymax) = (
-        ys.iter().cloned().fold(f64::INFINITY, f64::min),
-        ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        ys.iter().copied().fold(f64::INFINITY, f64::min),
+        ys.iter().copied().fold(f64::NEG_INFINITY, f64::max),
     );
     (xmax - xmin) * (ymax - ymin)
 }
@@ -92,7 +93,9 @@ fn shared_vertex_frac(a: &LineString, b: &LineString) -> f64 {
             }
         }
     }
-    f64::from(shared) / a.0.len() as f64
+    #[allow(clippy::cast_precision_loss)] // ring vertex counts are far below 2^52
+    let len = a.0.len() as f64;
+    f64::from(shared) / len
 }
 
 fn stats(label: &str, v: &[(f64, f64, f64)]) {
@@ -100,6 +103,7 @@ fn stats(label: &str, v: &[(f64, f64, f64)]) {
         println!("{label}: (none)");
         return;
     }
+    #[allow(clippy::cast_precision_loss)] // pair counts are far below 2^52
     let n = v.len() as f64;
     let (mut frac_min, mut frac_max, mut rect_min, mut rect_max, mut svf_min, mut svf_max) = (
         f64::INFINITY,
@@ -144,7 +148,8 @@ fn stats(label: &str, v: &[(f64, f64, f64)]) {
     );
 }
 
-fn main() {
+#[allow(clippy::too_many_lines)] // linear one-off diagnostic report
+fn main() -> std::io::Result<()> {
     let dir = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "/mnt/fedora/home/daniel/segeln/oesenc-export/exported".into());
@@ -162,15 +167,13 @@ fn main() {
     let mut mixed_within_ext = 0u32;
     let mut mixed_across_exts = 0u32;
 
-    for entry in std::fs::read_dir(&dir).expect("read_dir") {
-        let entry = entry.expect("entry");
-        let path = entry.path();
+    for entry in std::fs::read_dir(&dir)? {
+        let path = entry?.path();
         if path.extension().and_then(|e| e.to_str()) != Some("oesu") {
             continue;
         }
-        let data = match std::fs::read(&path) {
-            Ok(d) => d,
-            Err(_) => continue,
+        let Ok(data) = std::fs::read(&path) else {
+            continue;
         };
         let Some(raw) = raw_rings(&data) else {
             continue;
@@ -290,4 +293,5 @@ fn main() {
             "  {path}  COVR[{ei}]/NOCOVR[{ni}]  overlap_frac={frac:.6}  nocovr_is_rect={rect:.4}  shared_vertex_frac={svf:.4}"
         );
     }
+    Ok(())
 }

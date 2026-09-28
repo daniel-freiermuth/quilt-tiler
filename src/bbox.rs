@@ -175,6 +175,9 @@ impl From<Bbox> for Polygon {
 }
 
 #[cfg(test)]
+// Exact equality is intended: join/meet/minus only select or copy literal
+// coordinates (min/max), no arithmetic that could introduce rounding.
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
 

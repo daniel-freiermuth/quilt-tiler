@@ -974,7 +974,7 @@ mod tests {
         for ls in &mls.0 {
             for c in ls.coords() {
                 assert!(
-                    c.x >= 0 && c.x <= TILE_EXTENT as i32,
+                    c.x >= 0 && c.x <= TILE_EXTENT.cast_signed(),
                     "pixel x out of range: {c:?}"
                 );
             }
@@ -1041,7 +1041,10 @@ mod tests {
         for poly in &mp.0 {
             for c in poly.exterior().coords() {
                 assert!(
-                    c.x >= 0 && c.x <= TILE_EXTENT as i32 && c.y >= 0 && c.y <= TILE_EXTENT as i32,
+                    c.x >= 0
+                        && c.x <= TILE_EXTENT.cast_signed()
+                        && c.y >= 0
+                        && c.y <= TILE_EXTENT.cast_signed(),
                     "pixel coord out of range: {c:?}"
                 );
             }
@@ -1179,7 +1182,7 @@ mod tests {
         }];
         light_sectors_to_features(center, &attrs, &tile, true, &mut layers);
         assert!(
-            layers.get("LIGHTS_SECTOR").is_none_or(|v| v.is_empty()),
+            layers.get("LIGHTS_SECTOR").is_none_or(Vec::is_empty),
             "buoy-mounted all-round light must not draw a synthetic range circle"
         );
         let flare = layers
