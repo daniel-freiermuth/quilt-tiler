@@ -174,7 +174,7 @@ impl TileAccumulator for RasterAccumulator {
         }
     }
 
-    fn push(&mut self, content: Self::Content) {
+    fn push(&mut self, content: Self::Content) -> Result<()> {
         for (dst, src) in self
             .canvas
             .as_chunks_mut::<4>()
@@ -187,6 +187,7 @@ impl TileAccumulator for RasterAccumulator {
                 self.any_opaque = true;
             }
         }
+        Ok(())
     }
 
     /// Composite contributions (already spatially disjoint) onto one canvas
@@ -330,8 +331,8 @@ mod tests {
         }
         let bytes = {
             let mut acc = RasterAccumulator::empty();
-            acc.push(left);
-            acc.push(right);
+            acc.push(left).expect("push succeeds");
+            acc.push(right).expect("push succeeds");
             acc.encode().expect("encode succeeds")
         };
         assert!(!bytes.is_empty());
@@ -440,7 +441,7 @@ mod tests {
         let blank = vec![0u8; (TILE_PX * TILE_PX * 4) as usize];
         let bytes = {
             let mut acc = RasterAccumulator::empty();
-            acc.push(blank);
+            acc.push(blank).expect("push succeeds");
             acc.encode().expect("encode succeeds")
         };
         assert!(bytes.is_empty());

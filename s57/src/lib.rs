@@ -2,6 +2,16 @@
 //!
 //! Shared types produced by chart parsers (OESU, native S-57, …) and
 //! consumed by tile writers and other chart processing tools.
+#![deny(clippy::indexing_slicing)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 mod edition_date;
 

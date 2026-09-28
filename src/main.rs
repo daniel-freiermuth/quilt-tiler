@@ -4,6 +4,7 @@
 //! Parses all input `.oesu` files in parallel, then writes MVT tiles directly
 //! into a `PMTiles` v3 archive alongside `<stem>.style.json` and
 //! `<stem>.metadata.json`.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 use quilt_tiler::{loader, rnc, style, tiles};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -231,7 +232,7 @@ fn run_vector(args: &Args) -> Result<()> {
         &tile_url,
         min_zoom,
         out_max_zoom,
-    );
+    )?;
     std::fs::write(&style_path, &style_json)
         .with_context(|| format!("writing style to {}", style_path.display()))?;
     info!(path = %style_path.display(), "style written");
@@ -292,7 +293,7 @@ fn run_raster(args: &Args) -> Result<()> {
         .style_output
         .clone()
         .unwrap_or_else(|| args.output.with_extension("style.json"));
-    let style_json = style::build_raster_style(&tile_url, min_zoom, out_max_zoom);
+    let style_json = style::build_raster_style(&tile_url, min_zoom, out_max_zoom)?;
     std::fs::write(&style_path, &style_json)
         .with_context(|| format!("writing style to {}", style_path.display()))?;
     info!(path = %style_path.display(), "style written");

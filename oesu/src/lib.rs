@@ -11,6 +11,16 @@
 //!
 //! Raster charts use the `.oernc` extension and BSB binary format; passing
 //! one to this parser is detected and rejected with a clear error.
+#![deny(clippy::indexing_slicing)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 mod georef;
 
@@ -358,8 +368,10 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
                         let fname = read_cstring(&mut p, name_len).unwrap_or_default();
                         // Content starts after the name field (possibly past its null terminator)
                         let consumed = 8 + name_len;
-                        if payload_len > consumed && !fname.is_empty() {
-                            let content_raw = &payload_bytes[consumed..];
+                        if payload_len > consumed
+                            && !fname.is_empty()
+                            && let Some(content_raw) = payload_bytes.get(consumed..)
+                        {
                             let content = String::from_utf8_lossy(content_raw)
                                 .trim_end_matches('\0')
                                 .to_owned();
@@ -853,9 +865,9 @@ fn decode_covr(source: &str, covr: &[LineString], no_covr: &[LineString]) -> Mul
         .map(|(i, ring)| Polygon::new(normalise("NOCOVR", i, ring), vec![]))
         .collect();
 
-    for i in 0..exteriors.len() {
-        for j in (i + 1)..exteriors.len() {
-            if exteriors[i].intersects(&exteriors[j]) {
+    for (i, a) in exteriors.iter().enumerate() {
+        for (j, b) in exteriors.iter().enumerate().skip(i + 1) {
+            if a.intersects(b) {
                 tracing::warn!(source, i, j, "overlapping COVR exteriors");
             }
         }
@@ -922,8 +934,9 @@ fn strip_server_status(data: &[u8]) -> Result<(&[u8], u16, u16)> {
         );
     }
 
-    let rec_type = u16::from_le_bytes([data[0], data[1]]);
-    let rec_len = u32::from_le_bytes([data[2], data[3], data[4], data[5]]) as usize;
+    let mut header = Cursor::new(data);
+    let rec_type = read_u16(&mut header)?;
+    let rec_len = read_u32(&mut header)? as usize;
 
     if rec_type != SERVER_STATUS_RECORD {
         // Not a SENC file: check for BSB raster chart signature.
@@ -949,17 +962,20 @@ fn strip_server_status(data: &[u8]) -> Result<(&[u8], u16, u16)> {
             6 + PAYLOAD
         );
     }
-    if data.len() < rec_len {
+    let Some(rest) = data.get(rec_len..) else {
         bail!("file truncated inside SERVER_STATUS_RECORD");
-    }
+    };
 
-    let pl = &data[6..6 + PAYLOAD];
-    let server_status = u16::from_le_bytes([pl[0], pl[1]]);
-    let decrypt_status = u16::from_le_bytes([pl[2], pl[3]]);
-    let expire_status = u16::from_le_bytes([pl[4], pl[5]]);
-    let expire_days = u16::from_le_bytes([pl[6], pl[7]]);
-    let grace_allowed = u16::from_le_bytes([pl[8], pl[9]]);
-    let grace_days = u16::from_le_bytes([pl[10], pl[11]]);
+    let mut pl = Cursor::new(
+        data.get(6..6 + PAYLOAD)
+            .context("SERVER_STATUS_RECORD payload out of bounds")?,
+    );
+    let server_status = read_u16(&mut pl)?;
+    let decrypt_status = read_u16(&mut pl)?;
+    let expire_status = read_u16(&mut pl)?;
+    let expire_days = read_u16(&mut pl)?;
+    let grace_allowed = read_u16(&mut pl)?;
+    let grace_days = read_u16(&mut pl)?;
 
     tracing::debug!(
         server_status,
@@ -985,7 +1001,7 @@ fn strip_server_status(data: &[u8]) -> Result<(&[u8], u16, u16)> {
         );
     }
 
-    Ok((&data[rec_len..], expire_days, grace_days))
+    Ok((rest, expire_days, grace_days))
 }
 
 /// Read and range-check the SENC version from `HEADER_SENC_VERSION` (record 1).
@@ -996,8 +1012,9 @@ fn read_senc_version(data: &[u8]) -> Result<u16> {
         bail!("file too short to contain a SENC version record");
     }
 
-    let rec_type = u16::from_le_bytes([data[0], data[1]]);
-    let rec_len = u32::from_le_bytes([data[2], data[3], data[4], data[5]]);
+    let mut c = Cursor::new(data);
+    let rec_type = read_u16(&mut c)?;
+    let rec_len = read_u32(&mut c)?;
 
     if rec_type != HEADER_SENC_VERSION {
         if data.starts_with(b"!BSB") || data.starts_with(b"BSB/") {
@@ -1015,7 +1032,7 @@ fn read_senc_version(data: &[u8]) -> Result<u16> {
         bail!("HEADER_SENC_VERSION record too short ({rec_len} bytes, need 8)");
     }
 
-    let version = u16::from_le_bytes([data[6], data[7]]);
+    let version = read_u16(&mut c)?;
 
     if version == 1024 {
         bail!(
@@ -1243,28 +1260,15 @@ fn resolve_geometry(
                 return Geometry::None;
             }
 
-            let total_edges = edge_refs.len();
-            let mut rings: Vec<LineString> = Vec::new();
-            let mut ring_start = 0usize;
-            let mut prev_end = edge_refs[0][0];
-
-            for i in 0..total_edges {
-                let [start_node, _edge, end_node, _dir] = edge_refs[i];
-                let is_last = i + 1 == edge_refs.len();
-
-                if prev_end != start_node && i > ring_start {
-                    rings.push(build_ring(&edge_refs[ring_start..i], vet, vct, true));
-                    ring_start = i;
-                }
-
-                prev_end = end_node;
-
-                if is_last {
-                    rings.push(build_ring(&edge_refs[ring_start..=i], vet, vct, true));
-                }
-            }
-
-            Geometry::Area(Polygon::new(rings[0].clone(), rings[1..].to_vec()))
+            // A new ring starts wherever an edge does not begin at the node
+            // where the previous edge ended.
+            let mut rings = edge_refs
+                .chunk_by(|&[_, _, prev_end, _], &[start_node, _, _, _]| prev_end == start_node)
+                .map(|ring| build_ring(ring, vet, vct, true));
+            let Some(exterior) = rings.next() else {
+                return Geometry::None;
+            };
+            Geometry::Area(Polygon::new(exterior, rings.collect()))
         }
     }
 }
@@ -1310,11 +1314,12 @@ fn build_ring(
         coords.push(point.into());
     }
 
-    if close && coords.len() >= 2 {
-        let first = coords[0];
-        if coords.last() != Some(&first) {
-            coords.push(first);
-        }
+    if close
+        && coords.len() >= 2
+        && let Some(&first) = coords.first()
+        && coords.last() != Some(&first)
+    {
+        coords.push(first);
     }
 
     LineString::new(coords)
@@ -1340,7 +1345,7 @@ mod tests {
     fn node_points(node_ids: &[i32]) -> HashMap<u32, Point> {
         node_ids
             .iter()
-            .map(|&n| (n as u32, point!(x: f64::from(n), y: f64::from(n))))
+            .map(|&n| (n.cast_unsigned(), point!(x: f64::from(n), y: f64::from(n))))
             .collect()
     }
 

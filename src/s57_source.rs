@@ -9,6 +9,7 @@
 //! serialises each layer as MLT.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 use anyhow::{Context, Result};
 use geo::{
@@ -52,46 +53,48 @@ pub struct LayerBuf {
 }
 
 impl LayerBuf {
-    fn new(name: &str) -> Self {
-        Self {
+    fn new(name: &str) -> Result<Self> {
+        Ok(Self {
             builder: TileLayer::builder(name, TILE_EXTENT)
-                .expect("non-empty S-57 acronym and non-zero extent"),
+                .with_context(|| format!("creating MLT layer builder for {name}"))?,
             keys: HashMap::new(),
             count: 0,
-        }
+        })
     }
 
     /// Push one pixel-space feature.  New property names are registered on the
     /// fly; existing features get a typed null via `add_property`'s back-fill.
-    fn push(&mut self, geom: geo::Geometry<i32>, props: Vec<(String, PropValue)>) {
+    ///
+    /// # Errors
+    /// Returns an error if the MLT builder rejects a property or feature —
+    /// i.e. the layer schema has become inconsistent.
+    fn push(&mut self, geom: geo::Geometry<i32>, props: Vec<(String, PropValue)>) -> Result<()> {
         // One pass: get-or-register each column, collecting (key, kind, value).
-        // Both fields are borrowed separately so the or_insert_with closure can
-        // call builder.add_property while entry() holds the map borrow.
-        let keyed_props: Vec<(PropertyKey, PropKind, PropValue)> = {
-            let keys = &mut self.keys;
-            let builder = &mut self.builder;
-            props
-                .into_iter()
-                .map(|(name, val)| {
-                    let (key, kind) = *keys.entry(name.clone()).or_insert_with(|| {
-                        let kind = PropKind::from(&val);
-                        let key = builder
-                            .add_property(&name, kind)
-                            .expect("name is new — or_insert_with only runs when absent");
-                        (key, kind)
-                    });
-                    (key, kind, val)
-                })
-                .collect()
-        };
+        let mut keyed_props: Vec<(PropertyKey, PropKind, PropValue)> =
+            Vec::with_capacity(props.len());
+        for (name, val) in props {
+            let (key, kind) = match self.keys.entry(name) {
+                Entry::Occupied(e) => *e.get(),
+                Entry::Vacant(e) => {
+                    let kind = PropKind::from(&val);
+                    let key = self
+                        .builder
+                        .add_property(e.key(), kind)
+                        .with_context(|| format!("registering MLT property {}", e.key()))?;
+                    *e.insert((key, kind))
+                }
+            };
+            keyed_props.push((key, kind, val));
+        }
 
         let mut feat = self.builder.feature(geom);
         for (key, kind, val) in keyed_props {
             feat.property(key, coerce(val, kind))
-                .expect("key from our builder, coerce ensures kind matches");
+                .context("setting MLT feature property")?;
         }
-        feat.finish().expect("schema is consistent by construction");
+        feat.finish().context("finishing MLT feature")?;
         self.count += 1;
+        Ok(())
     }
 
     #[must_use]
@@ -237,13 +240,17 @@ impl TileAccumulator for S57Accumulator {
         Self(HashMap::new())
     }
 
-    fn push(&mut self, content: Self::Content) {
+    fn push(&mut self, content: Self::Content) -> Result<()> {
         for (name, feats) in content {
-            let buf = self.0.entry(name).or_insert_with(|| LayerBuf::new(name));
+            let buf = match self.0.entry(name) {
+                Entry::Occupied(e) => e.into_mut(),
+                Entry::Vacant(e) => e.insert(LayerBuf::new(name)?),
+            };
             for (geom, props) in feats {
-                buf.push(geom, props);
+                buf.push(geom, props)?;
             }
         }
+        Ok(())
     }
 
     fn encode(self) -> Result<Vec<u8>> {
@@ -551,8 +558,11 @@ fn light_sectors_to_features(
     let r_m = valnmr.mul_add(50.0, 200.0_f64).min(600.0_f64);
 
     #[allow(clippy::float_cmp)] // exact equality: same bearing = no sector
-    let has_sectors = matches!((&sectr1, &sectr2), (Some(s1), Some(s2)) if s1 != s2);
-    if !has_sectors && on_lateral_cardinal_buoy {
+    let sectors = match (sectr1, sectr2) {
+        (Some(s1), Some(s2)) if s1 != s2 => Some([s1, s2]),
+        _ => None,
+    };
+    if sectors.is_none() && on_lateral_cardinal_buoy {
         // Plain all-round buoy light: skip the synthetic "no sector" full
         // circle (clutter — it conveys no real sector information here),
         // and draw a small tilted flare icon instead so the buoy's light
@@ -566,11 +576,7 @@ fn light_sectors_to_features(
         );
         return;
     }
-    let (from_brg, to_brg_raw) = if has_sectors {
-        (sectr1.unwrap(), sectr2.unwrap())
-    } else {
-        (0.0, 360.0)
-    };
+    let [from_brg, to_brg_raw] = sectors.unwrap_or([0.0, 360.0]);
     let to_brg = if to_brg_raw <= from_brg {
         to_brg_raw + 360.0
     } else {
@@ -606,8 +612,8 @@ fn light_sectors_to_features(
     };
 
     push_line(arc, "arc");
-    if has_sectors {
-        for brg in [sectr1.unwrap(), sectr2.unwrap()] {
+    if let Some(boundaries) = sectors {
+        for brg in boundaries {
             push_line(
                 LineString(vec![
                     center.into(),
@@ -1342,14 +1348,13 @@ mod tests {
     /// Shorthand: build a `LayerBuf`, push the given feature property lists,
     /// finish, and return the resulting `TileLayer` for assertions.
     fn push_all(rows: Vec<Vec<(&str, PropValue)>>) -> TileLayer {
-        let mut buf = LayerBuf::new("test");
+        let mut buf = LayerBuf::new("test").expect("valid layer name");
         for row in rows {
             buf.push(
                 pt(),
-                row.into_iter()
-                    .map(|(k, v)| (k.to_owned(), v))
-                    .collect(),
-            );
+                row.into_iter().map(|(k, v)| (k.to_owned(), v)).collect(),
+            )
+            .expect("push succeeds");
         }
         buf.finish()
     }
@@ -1537,11 +1542,11 @@ mod tests {
 
     #[test]
     fn push_feature_count_tracks_correctly() {
-        let mut buf = LayerBuf::new("fc");
+        let mut buf = LayerBuf::new("fc").expect("valid layer name");
         assert_eq!(buf.feature_count(), 0);
-        buf.push(pt(), vec![]);
+        buf.push(pt(), vec![]).expect("push succeeds");
         assert_eq!(buf.feature_count(), 1);
-        buf.push(pt(), vec![]);
+        buf.push(pt(), vec![]).expect("push succeeds");
         assert_eq!(buf.feature_count(), 2);
     }
 
@@ -1621,7 +1626,7 @@ mod tests {
             .into_iter()
             .map(|props| {
                 (
-                    pt().into(),
+                    pt(),
                     props
                         .into_iter()
                         .map(|(k, v)| (k.to_owned(), v))
@@ -1638,7 +1643,8 @@ mod tests {
         acc.push(layer_content(
             "DEPARE",
             vec![vec![("DRVAL1", PropValue::F64(Some(1.0)))]],
-        ));
+        ))
+        .expect("push succeeds");
         let bytes = acc.encode().expect("encode should succeed");
         assert!(!bytes.is_empty(), "single layer with one feature should produce bytes");
     }
@@ -1648,8 +1654,10 @@ mod tests {
         let mut acc = S57Accumulator::empty();
         // Push content maps whose feature vecs are empty — LayerBuf entries
         // are created but their feature_count stays 0.
-        acc.push(HashMap::from([("DEPARE", Vec::<RawFeature>::new())]));
-        acc.push(HashMap::from([("LNDARE", Vec::<RawFeature>::new())]));
+        acc.push(HashMap::from([("DEPARE", Vec::<RawFeature>::new())]))
+            .expect("push succeeds");
+        acc.push(HashMap::from([("LNDARE", Vec::<RawFeature>::new())]))
+            .expect("push succeeds");
         let bytes = acc.encode().expect("encode should succeed");
         assert!(bytes.is_empty(), "all-empty layers should produce no bytes");
     }
@@ -1661,18 +1669,22 @@ mod tests {
         acc.push(layer_content(
             "DEPARE",
             vec![vec![("DRVAL1", PropValue::F64(Some(2.0)))]],
-        ));
-        acc.push(HashMap::from([("LNDARE", Vec::<RawFeature>::new())]));
+        ))
+        .expect("push succeeds");
+        acc.push(HashMap::from([("LNDARE", Vec::<RawFeature>::new())]))
+            .expect("push succeeds");
 
         // Encode with both layers present (one empty).
         let bytes_mixed = acc.encode().expect("encode should succeed");
 
         // Encode with only the populated layer.
         let mut acc_single = S57Accumulator::empty();
-        acc_single.push(layer_content(
-            "DEPARE",
-            vec![vec![("DRVAL1", PropValue::F64(Some(2.0)))]],
-        ));
+        acc_single
+            .push(layer_content(
+                "DEPARE",
+                vec![vec![("DRVAL1", PropValue::F64(Some(2.0)))]],
+            ))
+            .expect("push succeeds");
         let bytes_single = acc_single.encode().expect("encode should succeed");
 
         assert_eq!(
@@ -1685,34 +1697,46 @@ mod tests {
     fn encode_multi_layer_output_is_deterministic_regardless_of_insertion_order() {
         // Push layers in alphabetical order: BUOYAG, DEPARE, LNDARE.
         let mut acc_alpha = S57Accumulator::empty();
-        acc_alpha.push(layer_content(
-            "BUOYAG",
-            vec![vec![("COLOUR", PropValue::Str(Some("1".into())))]],
-        ));
-        acc_alpha.push(layer_content(
-            "DEPARE",
-            vec![vec![("DRVAL1", PropValue::F64(Some(3.0)))]],
-        ));
-        acc_alpha.push(layer_content(
-            "LNDARE",
-            vec![vec![("NATION", PropValue::Str(Some("US".into())))]],
-        ));
+        acc_alpha
+            .push(layer_content(
+                "BUOYAG",
+                vec![vec![("COLOUR", PropValue::Str(Some("1".into())))]],
+            ))
+            .expect("push succeeds");
+        acc_alpha
+            .push(layer_content(
+                "DEPARE",
+                vec![vec![("DRVAL1", PropValue::F64(Some(3.0)))]],
+            ))
+            .expect("push succeeds");
+        acc_alpha
+            .push(layer_content(
+                "LNDARE",
+                vec![vec![("NATION", PropValue::Str(Some("US".into())))]],
+            ))
+            .expect("push succeeds");
         let bytes_alpha = acc_alpha.encode().expect("encode should succeed");
 
         // Push layers in reverse order: LNDARE, DEPARE, BUOYAG.
         let mut acc_rev = S57Accumulator::empty();
-        acc_rev.push(layer_content(
-            "LNDARE",
-            vec![vec![("NATION", PropValue::Str(Some("US".into())))]],
-        ));
-        acc_rev.push(layer_content(
-            "DEPARE",
-            vec![vec![("DRVAL1", PropValue::F64(Some(3.0)))]],
-        ));
-        acc_rev.push(layer_content(
-            "BUOYAG",
-            vec![vec![("COLOUR", PropValue::Str(Some("1".into())))]],
-        ));
+        acc_rev
+            .push(layer_content(
+                "LNDARE",
+                vec![vec![("NATION", PropValue::Str(Some("US".into())))]],
+            ))
+            .expect("push succeeds");
+        acc_rev
+            .push(layer_content(
+                "DEPARE",
+                vec![vec![("DRVAL1", PropValue::F64(Some(3.0)))]],
+            ))
+            .expect("push succeeds");
+        acc_rev
+            .push(layer_content(
+                "BUOYAG",
+                vec![vec![("COLOUR", PropValue::Str(Some("1".into())))]],
+            ))
+            .expect("push succeeds");
         let bytes_rev = acc_rev.encode().expect("encode should succeed");
 
         assert_eq!(
@@ -1725,29 +1749,37 @@ mod tests {
     fn encode_multi_layer_concatenates_in_sorted_name_order() {
         // Encode each layer individually to get its bytes.
         let mut acc_b = S57Accumulator::empty();
-        acc_b.push(layer_content(
-            "BUOYAG",
-            vec![vec![("COLOUR", PropValue::Str(Some("3".into())))]],
-        ));
+        acc_b
+            .push(layer_content(
+                "BUOYAG",
+                vec![vec![("COLOUR", PropValue::Str(Some("3".into())))]],
+            ))
+            .expect("push succeeds");
         let bytes_b = acc_b.encode().expect("encode should succeed");
 
         let mut acc_d = S57Accumulator::empty();
-        acc_d.push(layer_content(
-            "DEPARE",
-            vec![vec![("DRVAL1", PropValue::F64(Some(5.0)))]],
-        ));
+        acc_d
+            .push(layer_content(
+                "DEPARE",
+                vec![vec![("DRVAL1", PropValue::F64(Some(5.0)))]],
+            ))
+            .expect("push succeeds");
         let bytes_d = acc_d.encode().expect("encode should succeed");
 
         // Encode both together (pushed in reverse order to exercise sort).
         let mut acc_both = S57Accumulator::empty();
-        acc_both.push(layer_content(
-            "DEPARE",
-            vec![vec![("DRVAL1", PropValue::F64(Some(5.0)))]],
-        ));
-        acc_both.push(layer_content(
-            "BUOYAG",
-            vec![vec![("COLOUR", PropValue::Str(Some("3".into())))]],
-        ));
+        acc_both
+            .push(layer_content(
+                "DEPARE",
+                vec![vec![("DRVAL1", PropValue::F64(Some(5.0)))]],
+            ))
+            .expect("push succeeds");
+        acc_both
+            .push(layer_content(
+                "BUOYAG",
+                vec![vec![("COLOUR", PropValue::Str(Some("3".into())))]],
+            ))
+            .expect("push succeeds");
         let bytes_both = acc_both.encode().expect("encode should succeed");
 
         // The multi-layer output should be BUOYAG bytes ++ DEPARE bytes
