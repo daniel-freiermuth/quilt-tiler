@@ -2115,4 +2115,99 @@ mod tests {
         feed(&mut b, &payload.0, CellBuilder::parse_vct_ext).unwrap();
         assert_eq!(vct_coords(&b), [(7, [1.5, -2.5]), (9, [3.0, 4.0])]);
     }
+
+    // ── parse_file record loop ───────────────────────────────────────────
+
+    /// A record header whose declared `rec_len` may disagree with what follows.
+    fn record_header(rec_type: u16, rec_len: u32) -> Bytes {
+        Bytes::default().u16(rec_type).u32(rec_len)
+    }
+
+    /// A complete native-scale record, for appending after a terminator.
+    fn scale_record(scale: u32) -> Bytes {
+        record_header(HEADER_CELL_NATIVESCALE, 6 + 4).u32(scale)
+    }
+
+    fn parse_err(data: &[u8]) -> String {
+        match parse_file("test.oesu".to_owned(), data) {
+            Ok(cell) => panic!("expected parse error, got cell {:?}", cell.name),
+            Err(e) => format!("{e:#}"),
+        }
+    }
+
+    #[test]
+    fn parse_file_missing_native_scale_is_rejected() {
+        let data = senc_stream(vec![(HEADER_CELL_NAME, Bytes::default().raw(b"TEST01\0"))]);
+        let err = parse_err(&data);
+        assert!(err.contains("has no HEADER_CELL_NATIVESCALE"), "{err}");
+    }
+
+    #[test]
+    fn parse_file_zero_native_scale_is_rejected() {
+        let data = senc_stream(vec![(HEADER_CELL_NATIVESCALE, Bytes::default().u32(0))]);
+        let err = parse_err(&data);
+        assert!(err.contains("has no HEADER_CELL_NATIVESCALE"), "{err}");
+    }
+
+    /// A self-consistent record too short for the u32 scale must error, not
+    /// silently default to 0.
+    #[test]
+    fn parse_file_short_native_scale_payload_is_rejected() {
+        let data = senc_stream(vec![(
+            HEADER_CELL_NATIVESCALE,
+            Bytes::default().u16(10_000),
+        )]);
+        let err = parse_err(&data);
+        assert!(err.contains("reading HEADER_CELL_NATIVESCALE"), "{err}");
+    }
+
+    #[test]
+    fn parse_file_record_longer_than_stream_is_rejected() {
+        let mut data = senc_stream(vec![(
+            HEADER_CELL_NATIVESCALE,
+            Bytes::default().u32(22_000),
+        )]);
+        // Declares a 4-byte payload but only 2 bytes follow.
+        data.extend(record_header(HEADER_CELL_EDITION, 6 + 4).u16(1).0);
+        let err = parse_err(&data);
+        let expected = format!("reading payload of record type {HEADER_CELL_EDITION}");
+        assert!(err.contains(&expected), "{err}");
+    }
+
+    #[test]
+    fn parse_file_zero_terminator_stops_parsing() {
+        let mut data = senc_stream(vec![(
+            HEADER_CELL_NATIVESCALE,
+            Bytes::default().u32(22_000),
+        )]);
+        data.extend(record_header(0, 0).0);
+        data.extend(scale_record(99_999).0);
+        let cell = parse_file("test.oesu".to_owned(), &data).unwrap();
+        assert_eq!(cell.native_scale, 22_000, "records after 0/0 are ignored");
+    }
+
+    #[test]
+    fn parse_file_short_nonzero_record_stops_parsing() {
+        let mut data = senc_stream(vec![(
+            HEADER_CELL_NATIVESCALE,
+            Bytes::default().u32(22_000),
+        )]);
+        data.extend(record_header(HEADER_CELL_NATIVESCALE, 3).0);
+        data.extend(scale_record(99_999).0);
+        let cell = parse_file("test.oesu".to_owned(), &data).unwrap();
+        assert_eq!(
+            cell.native_scale, 22_000,
+            "records after rec_len < 6 are ignored"
+        );
+    }
+
+    /// Stopping early must not bypass the post-loop native-scale guard.
+    #[test]
+    fn parse_file_terminator_before_native_scale_is_rejected() {
+        let mut data = senc_stream(vec![]);
+        data.extend(record_header(0, 0).0);
+        data.extend(scale_record(22_000).0);
+        let err = parse_err(&data);
+        assert!(err.contains("has no HEADER_CELL_NATIVESCALE"), "{err}");
+    }
 }
