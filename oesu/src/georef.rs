@@ -194,4 +194,46 @@ mod tests {
             c.y
         );
     }
+
+    // ── contract: OpenCPN `fromSM()` reference values ──────────────────
+
+    #[test]
+    fn matches_opencpn_from_sm_reference_values() {
+        // Expected values computed with OpenCPN model/src/georef.cpp `fromSM()`,
+        // which scales by `z = WGS84_semimajor_axis_meters * mercator_k0`
+        // (mercator_k0 = 0.9996). `fromSM_Plugin` forwards to it, and the
+        // o-charts_pi OESU decoder (Osenc.cpp) uses `fromSM_Plugin`.
+        let cases: &[(f64, f64, f64, f64, f64, f64)] = &[
+            // (east, north, ref_lat, ref_lon, expected_lon, expected_lat)
+            (
+                100_000.0,
+                100_000.0,
+                0.0,
+                0.0,
+                0.898_674_754_021_129_8,
+                0.898_637_908_525_775_3,
+            ),
+            (
+                50_000.0,
+                -30_000.0,
+                57.7,
+                11.8,
+                12.249_337_377_010_566,
+                57.555_650_589_547_95,
+            ),
+        ];
+        for &(east, north, ref_lat, ref_lon, expected_lon, expected_lat) in cases {
+            let c = from_sm(east, north, ref_lat, ref_lon);
+            assert!(
+                (c.x - expected_lon).abs() < 1e-9,
+                "({east},{north}) ref ({ref_lat},{ref_lon}): lon {}, expected {expected_lon}",
+                c.x
+            );
+            assert!(
+                (c.y - expected_lat).abs() < 1e-9,
+                "({east},{north}) ref ({ref_lat},{ref_lon}): lat {}, expected {expected_lat}",
+                c.y
+            );
+        }
+    }
 }
