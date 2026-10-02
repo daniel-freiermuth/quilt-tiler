@@ -31,7 +31,11 @@ pub trait TileAccumulator: Send {
     fn empty() -> Self;
 
     /// Merge one cell's rendered content into this accumulator.
-    fn push(&mut self, content: Self::Content);
+    ///
+    /// # Errors
+    /// Returns an error if the content cannot be merged (e.g. the encoder
+    /// rejects a layer, property, or feature).
+    fn push(&mut self, content: Self::Content) -> Result<()>;
 
     /// Finish accumulation and encode to raw tile bytes.
     ///
@@ -69,7 +73,6 @@ pub trait TileSource: Sync {
     type Tiebreaker: Ord;
 
     /// Source identifier for this item (debug/diagnostic use by callers).
-    #[allow(dead_code)] // consumed by debug logging in a follow-up commit
     fn source(&self) -> String;
 
     /// Geographic coverage of this item.

@@ -178,7 +178,8 @@ pub fn zoom_range_and_bounds<S: TileSource>(
 /// [`write_pmtiles`]'s batch loop and a live tile server.
 ///
 /// # Errors
-/// Returns an error if [`TileSource::encode`] fails for this tile's contents.
+/// Returns an error if merging a cell's content into the tile accumulator
+/// fails, or if [`TileAccumulator::encode`] fails for this tile's contents.
 pub fn render_tile<S: TileSource>(
     items: &[S],
     z: u8,
@@ -241,7 +242,8 @@ pub fn render_tile<S: TileSource>(
                 merc: tile_merc,
                 scale: tile_scale,
             };
-            acc.push(items[i].render(&item_tile));
+            acc.push(items[i].render(&item_tile))
+                .with_context(|| format!("tile {z}/{col}/{row}: merging {}", items[i].source()))?;
             uncovered = uncovered.minus(&contrib);
             if uncovered.area() == 0.0 {
                 break;
