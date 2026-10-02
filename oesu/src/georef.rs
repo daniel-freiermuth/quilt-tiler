@@ -7,15 +7,18 @@ use geo::{Coord, coord};
 /// Returns the WGS84 coordinate as `Coord { x: longitude, y: latitude }`.
 pub fn from_sm(east: f64, north: f64, ref_lat: f64, ref_lon: f64) -> Coord {
     const WGS84_A: f64 = 6_378_137.0;
+    // `OpenCPN`'s `mercator_k0`; `fromSM()` scales by `z = WGS84_A * mercator_k0`.
+    const MERCATOR_K0: f64 = 0.9996;
+    const Z: f64 = WGS84_A * MERCATOR_K0;
     use std::f64::consts::PI;
 
-    let lon = east / WGS84_A.to_radians() + ref_lon;
+    let lon = east / Z.to_radians() + ref_lon;
 
     let lat_r = ref_lat.to_radians();
     // Inverse Mercator: undo the log(tan()) forward projection
     let lat = 2.0f64
         .mul_add(
-            ((north / WGS84_A) + (PI / 4.0 + lat_r / 2.0).tan().ln())
+            ((north / Z) + (PI / 4.0 + lat_r / 2.0).tan().ln())
                 .exp()
                 .atan(),
             -(PI / 2.0),
@@ -30,17 +33,19 @@ mod tests {
     use super::*;
     use std::f64::consts::PI;
 
-    const WGS84_A: f64 = 6_378_137.0;
+    /// `OpenCPN`'s Simple Mercator scale: `WGS84_semimajor_axis_meters * mercator_k0`.
+    const Z: f64 = 6_378_137.0 * 0.9996;
 
     /// Forward Simple Mercator projection (WGS-84 → easting/northing in metres),
-    /// inverse of `from_sm`.  Used only as a test helper for round-trip checks.
+    /// matching `OpenCPN`'s `toSM()`; inverse of `from_sm`.  Used only as a test
+    /// helper for round-trip checks.
     fn to_sm(lon: f64, lat: f64, ref_lat: f64, ref_lon: f64) -> (f64, f64) {
-        let east = (lon - ref_lon) * WGS84_A.to_radians();
+        let east = (lon - ref_lon) * Z.to_radians();
 
         let lat_r = lat.to_radians();
         let ref_lat_r = ref_lat.to_radians();
-        let north = WGS84_A
-            * ((PI / 4.0 + lat_r / 2.0).tan().ln() - (PI / 4.0 + ref_lat_r / 2.0).tan().ln());
+        let north =
+            Z * ((PI / 4.0 + lat_r / 2.0).tan().ln() - (PI / 4.0 + ref_lat_r / 2.0).tan().ln());
 
         (east, north)
     }
