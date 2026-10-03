@@ -453,7 +453,7 @@ fn bearing_offset(coord: Coord, bearing_deg: f64, dist_m: f64) -> Coord {
     let d_lat = dist_m / 111_320.0;
     let d_lon = dist_m / (111_320.0 * coord.y.to_radians().cos());
     let math_rad = (90.0 - bearing_deg).to_radians();
-    coord![x: coord.x + d_lon * math_rad.cos(), y: coord.y + d_lat * math_rad.sin()]
+    coord![x: d_lon.mul_add(math_rad.cos(), coord.x), y: d_lat.mul_add(math_rad.sin(), coord.y)]
 }
 
 /// `true` for lateral and cardinal buoys: their lights are plain all-round
@@ -590,7 +590,7 @@ fn light_sectors_to_features(
         (0..=steps)
             .map(|i| {
                 #[allow(clippy::cast_precision_loss)] // steps ≤ ~120
-                let brg = from_brg + span * (i as f64 / steps as f64);
+                let brg = f64::mul_add(span, i as f64 / steps as f64, from_brg);
                 bearing_offset(center.into(), brg, r_m)
             })
             .collect(),
@@ -850,7 +850,7 @@ mod tests {
         let f = feat(s57::Geometry::None, vec![]);
         let mut out = Vec::new();
         push_features(&f, &tile, &mut out);
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [RawFeature; 0]);
     }
 
     #[test]
@@ -925,7 +925,7 @@ mod tests {
         let f = feat(s57::Geometry::Soundings(vec![(outside, 5.0)]), vec![]);
         let mut out = Vec::new();
         push_features(&f, &tile, &mut out);
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [RawFeature; 0]);
     }
 
     #[test]
@@ -934,7 +934,7 @@ mod tests {
         let f = feat(s57::Geometry::Line(LineString::new(vec![])), vec![]);
         let mut out = Vec::new();
         push_features(&f, &tile, &mut out);
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [RawFeature; 0]);
     }
 
     #[test]
@@ -947,7 +947,7 @@ mod tests {
         );
         let mut out = Vec::new();
         push_features(&f, &tile, &mut out);
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [RawFeature; 0]);
     }
 
     #[test]
@@ -986,7 +986,7 @@ mod tests {
         );
         let mut out = Vec::new();
         push_features(&f, &tile, &mut out);
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [RawFeature; 0]);
     }
 
     #[test]
@@ -1001,7 +1001,7 @@ mod tests {
         );
         let mut out = Vec::new();
         push_features(&f, &tile, &mut out);
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [RawFeature; 0]);
     }
 
     #[test]
@@ -1471,8 +1471,8 @@ mod tests {
         let layer = push_all(vec![vec![]]);
 
         assert_eq!(layer.feature_count(), 1);
-        assert!(layer.property_names().is_empty());
-        assert!(layer.features()[0].properties().is_empty());
+        assert_eq!(layer.property_names(), [] as [String; 0]);
+        assert_eq!(layer.features()[0].properties(), [] as [PropValue; 0]);
     }
 
     #[test]

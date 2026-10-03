@@ -88,7 +88,7 @@ mod tests {
     #[test]
     fn bottom_returns_empty_multipolygon() {
         let b = MultiPolygon::bottom();
-        assert!(b.0.is_empty());
+        assert_eq!(b.0, [] as [geo::Polygon; 0]);
         assert!(b.area().abs() < f64::EPSILON);
     }
 
