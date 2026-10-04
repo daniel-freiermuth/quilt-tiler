@@ -222,17 +222,21 @@ mod tests {
         out
     }
 
+    /// Build a minimal valid `.rnc` buffer whose grid tile `n = row * cols +
+    /// col` is a solid `colors[n]` PNG.
     #[allow(clippy::cast_possible_truncation)] // test PNG sizes are tiny constants
-    fn build_rnc(cols: u32, rows: u32, bbox: Bbox, color: [u8; 4], scale: f64) -> Vec<u8> {
-        let png = solid_png(8, 8, color);
+    fn build_rnc(cols: u32, rows: u32, bbox: Bbox, colors: &[[u8; 4]], scale: f64) -> Vec<u8> {
         let n_tiles = cols * rows;
+        assert_eq!(colors.len(), n_tiles as usize, "one colour per grid tile");
+        let pngs: Vec<Vec<u8>> = colors.iter().map(|&c| solid_png(8, 8, c)).collect();
         let n_offsets = n_tiles + 2;
         let table_start = 16u32;
         let blobs_start = table_start + n_offsets * 4;
 
         let mut offsets = Vec::with_capacity(n_offsets as usize);
-        for i in 0..=n_tiles {
-            offsets.push(blobs_start + i * png.len() as u32);
+        offsets.push(blobs_start);
+        for png in &pngs {
+            offsets.push(offsets.last().expect("at least one offset") + png.len() as u32);
         }
         offsets.push(*offsets.last().expect("at least one offset"));
 
@@ -242,8 +246,8 @@ mod tests {
         for o in &offsets {
             buf.extend_from_slice(&o.to_le_bytes());
         }
-        for _ in 0..n_tiles {
-            buf.extend_from_slice(&png);
+        for png in &pngs {
+            buf.extend_from_slice(png);
         }
         let footer = serde_json::json!({
             "cover": [],
@@ -273,7 +277,7 @@ mod tests {
             east: 12.0,
             north: 58.0,
         };
-        let data = build_rnc(1, 1, bbox, [200, 30, 30, 255], 3_000_000.0);
+        let data = build_rnc(1, 1, bbox, &[[200, 30, 30, 255]], 3_000_000.0);
         let cell = RncCell::parse("TEST".to_owned(), data).expect("valid .rnc parses");
 
         let (w_m, s_m) = martin_tile_utils::wgs84_to_webmercator(bbox.west, bbox.south);
@@ -313,6 +317,61 @@ mod tests {
             0,
             "pixel outside contribution should be transparent"
         );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)] // test grid has < 256 tiles
+    fn render_maps_each_grid_subtile_to_its_geographic_position() {
+        let bbox = Bbox {
+            west: 11.0,
+            south: 57.0,
+            east: 12.0,
+            north: 58.0,
+        };
+        // 3 cols x 2 rows, every subtile a distinct colour. Non-square so a
+        // cols/rows mix-up in `n = row * cols + col` is also caught.
+        let (cols, rows) = (3u32, 2u32);
+        let color = |n: u32| [n as u8 * 40, 100, 200, 255];
+        let colors: Vec<[u8; 4]> = (0..cols * rows).map(color).collect();
+        let data = build_rnc(cols, rows, bbox, &colors, 3_000_000.0);
+        let cell = RncCell::parse("TEST".to_owned(), data).expect("valid .rnc parses");
+
+        let (w_m, s_m) = martin_tile_utils::wgs84_to_webmercator(bbox.west, bbox.south);
+        let (e_m, n_m) = martin_tile_utils::wgs84_to_webmercator(bbox.east, bbox.north);
+        let merc = Bbox {
+            west: w_m,
+            south: s_m,
+            east: e_m,
+            north: n_m,
+        };
+        let out = TileSource::render(&cell, &make_tile(merc, bbox, 3_000_000));
+
+        // Expected layout is stated geographically, independent of
+        // `locate_grid_cell`: columns run west→east and split longitude
+        // evenly; row 0 is the NORTH row (the format's `ymin` is the north
+        // edge). The north/south split sits near 57.5°N, so 57.8°N / 57.2°N
+        // are unambiguously in rows 0 / 1.
+        for (row, lat) in [(0, 57.8), (1, 57.2)] {
+            for col in 0..cols {
+                let lon = bbox.west + (f64::from(col) + 0.5) / f64::from(cols);
+                assert_eq!(
+                    pixel_at(&out, merc, lon, lat),
+                    color(row * cols + col),
+                    "subtile (col {col}, row {row}) at ({lon}, {lat})"
+                );
+            }
+        }
+    }
+
+    /// RGBA of the rendered pixel at `(lon, lat)` in a tile spanning `merc`
+    /// (Web-Mercator metres); top-left origin, north-up.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn pixel_at(out: &[u8], merc: Bbox, lon: f64, lat: f64) -> [u8; 4] {
+        let (x_m, y_m) = martin_tile_utils::wgs84_to_webmercator(lon, lat);
+        let px = (((x_m - merc.west) / (merc.east - merc.west)) * f64::from(TILE_PX)) as u32;
+        let py = (((merc.north - y_m) / (merc.north - merc.south)) * f64::from(TILE_PX)) as u32;
+        let idx = ((py.min(TILE_PX - 1) * TILE_PX + px.min(TILE_PX - 1)) * 4) as usize;
+        out[idx..idx + 4].try_into().expect("4-byte RGBA slice")
     }
 
     #[test]
@@ -411,16 +470,7 @@ mod tests {
         };
 
         let out = TileSource::render(&cell, &tile);
-
-        // Pixel index for a given (lon, lat), top-left origin, north-up.
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let pixel_alpha = |lon: f64, lat: f64| -> u8 {
-            let (x_m, y_m) = martin_tile_utils::wgs84_to_webmercator(lon, lat);
-            let px = (((x_m - merc.west) / (merc.east - merc.west)) * f64::from(TILE_PX)) as u32;
-            let py = (((merc.north - y_m) / (merc.north - merc.south)) * f64::from(TILE_PX)) as u32;
-            let idx = ((py.min(TILE_PX - 1) * TILE_PX + px.min(TILE_PX - 1)) * 4) as usize;
-            out[idx + 3]
-        };
+        let pixel_alpha = |lon: f64, lat: f64| -> u8 { pixel_at(&out, merc, lon, lat)[3] };
 
         // Inside the triangle (near its centroid).
         assert_eq!(
