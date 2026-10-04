@@ -1335,6 +1335,207 @@ mod tests {
         );
     }
 
+    // ── light_sectors_to_features: arc geometry (span, wraparound, radius) ──
+
+    /// ±0.025° at 55°N still contains the longest radial (2 × 600 m ≈ 1200 m
+    /// vs ≈ 1600 m east/west half-width) while keeping pixels ≲ 1.4 m on the
+    /// ground, so bearings/radii can be measured to ~1°/~4 m.
+    const GEOM_MARGIN_DEG: f64 = 0.025;
+    const BEARING_TOL_DEG: f64 = 1.0;
+    const RADIUS_TOL_M: f64 = 4.0;
+
+    /// Compass bearing (0° = north, clockwise, in `[0, 360)`) and ground
+    /// distance in metres of pixel `px` from `center`.  Undoes both the
+    /// tile's anisotropic pixel scale (equal degree spans in lon/lat) and the
+    /// Mercator 1/cos(lat) stretch, independently of `bearing_offset`.
+    fn polar_from_center(tile: &TileGeom, center: Point, px: Coord<i32>) -> (f64, f64) {
+        let c = to_px(center.into(), tile.merc);
+        let ground_per_merc = center.y().to_radians().cos();
+        let m_per_px_x = (tile.merc.east - tile.merc.west) / EXTENT * ground_per_merc;
+        let m_per_px_y = (tile.merc.north - tile.merc.south) / EXTENT * ground_per_merc;
+        let east = f64::from(px.x - c.x) * m_per_px_x;
+        let north = f64::from(c.y - px.y) * m_per_px_y; // pixel y grows southward
+        (
+            east.atan2(north).to_degrees().rem_euclid(360.0),
+            east.hypot(north),
+        )
+    }
+
+    /// Signed clockwise turn from bearing `a` to bearing `b`, in `(-180, 180]`.
+    fn clockwise_delta(a: f64, b: f64) -> f64 {
+        180.0 - (a - b + 180.0).rem_euclid(360.0)
+    }
+
+    fn assert_bearing_near(actual: f64, expected: f64, what: &str) {
+        assert!(
+            clockwise_delta(expected, actual).abs() <= BEARING_TOL_DEG,
+            "{what}: bearing {actual:.2}° not within {BEARING_TOL_DEG}° of {expected}°"
+        );
+    }
+
+    fn light_attrs(
+        sectr1: Option<f64>,
+        sectr2: Option<f64>,
+        valnmr: Option<f64>,
+    ) -> Vec<s57::Attribute> {
+        [(136, sectr1), (137, sectr2), (178, valnmr)]
+            .into_iter()
+            .filter_map(|(code, v)| {
+                v.map(|v| s57::Attribute {
+                    code,
+                    value: s57::AttrValue::Double(v),
+                })
+            })
+            .collect()
+    }
+
+    /// Polar coordinates of rendered light-sector geometry: every arc vertex
+    /// in drawing order, and each radial's outer tip in emission order.
+    struct SectorPolar {
+        arc: Vec<(f64, f64)>,
+        radial_tips: Vec<(f64, f64)>,
+    }
+
+    impl SectorPolar {
+        /// Total clockwise sweep of the arc, summed vertex to vertex.
+        fn arc_span(&self) -> f64 {
+            self.arc
+                .windows(2)
+                .map(|w| clockwise_delta(w[0].0, w[1].0))
+                .sum()
+        }
+    }
+
+    fn render_sector_polar(
+        center: Point,
+        tile: &TileGeom,
+        attrs: &[s57::Attribute],
+    ) -> SectorPolar {
+        let mut layers = HashMap::new();
+        light_sectors_to_features(center, attrs, tile, false, &mut layers);
+        let feats = layers
+            .remove("LIGHTS_SECTOR")
+            .expect("light must emit sector features");
+        let line_of = |f: &RawFeature| -> Vec<Coord<i32>> {
+            let geo::Geometry::LineString(ls) = &f.0 else {
+                panic!("sector feature must be a LineString, got {:?}", f.0);
+            };
+            ls.0.clone()
+        };
+        let arcs: Vec<_> = feats.iter().filter(|f| kind_of(f) == Some("arc")).collect();
+        assert_eq!(arcs.len(), 1, "arc must be one unclipped stroke");
+        SectorPolar {
+            arc: line_of(arcs[0])
+                .into_iter()
+                .map(|c| polar_from_center(tile, center, c))
+                .collect(),
+            radial_tips: feats
+                .iter()
+                .filter(|f| kind_of(f) == Some("radial"))
+                .map(|f| {
+                    let pts = line_of(f);
+                    assert_eq!(pts.len(), 2, "radial is a single center→tip segment");
+                    polar_from_center(tile, center, pts[1])
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn light_sector_arc_sweeps_clockwise_from_sectr1_to_sectr2_across_north() {
+        let center = Point::new(10.0, 55.0);
+        let tile = test_tile_geom(center, GEOM_MARGIN_DEG);
+        // (SECTR1, SECTR2, drawn start, drawn end, clockwise span)
+        let cases = [
+            // flips to 350→10: must sweep 20° through north, not the 340° complement
+            (170.0, 190.0, 350.0, 10.0, 20.0),
+            // raw from > to: span is still clockwise SECTR1→SECTR2
+            (300.0, 60.0, 120.0, 240.0, 120.0),
+            // raw from > to *and* flipped from > to: wide sector across north
+            (100.0, 20.0, 280.0, 200.0, 280.0),
+            // no wraparound anywhere
+            (10.0, 90.0, 190.0, 270.0, 80.0),
+        ];
+        for (s1, s2, start, end, span) in cases {
+            let what = format!("SECTR1={s1} SECTR2={s2}");
+            let polar = render_sector_polar(center, &tile, &light_attrs(Some(s1), Some(s2), None));
+            let (first, last) = (polar.arc[0], polar.arc[polar.arc.len() - 1]);
+            assert_bearing_near(first.0, start, &format!("{what}: arc start"));
+            assert_bearing_near(last.0, end, &format!("{what}: arc end"));
+            assert!(
+                (polar.arc_span() - span).abs() <= BEARING_TOL_DEG,
+                "{what}: arc sweeps {:.2}°, expected {span}°",
+                polar.arc_span()
+            );
+            assert_eq!(polar.radial_tips.len(), 2, "{what}: two boundary radials");
+            // Arc endpoints coincide with the boundary radials (SECTR1 first).
+            assert_bearing_near(
+                polar.radial_tips[0].0,
+                first.0,
+                &format!("{what}: SECTR1 radial"),
+            );
+            assert_bearing_near(
+                polar.radial_tips[1].0,
+                last.0,
+                &format!("{what}: SECTR2 radial"),
+            );
+        }
+    }
+
+    #[test]
+    fn light_without_two_distinct_sector_limits_draws_full_circle_without_radials() {
+        let center = Point::new(10.0, 55.0);
+        let tile = test_tile_geom(center, GEOM_MARGIN_DEG);
+        for (s1, s2) in [
+            (Some(45.0), Some(45.0)),
+            (Some(45.0), None),
+            (None, Some(45.0)),
+            (None, None),
+        ] {
+            let polar = render_sector_polar(center, &tile, &light_attrs(s1, s2, None));
+            assert!(
+                (polar.arc_span() - 360.0).abs() <= BEARING_TOL_DEG,
+                "SECTR1={s1:?} SECTR2={s2:?}: expected full 360° circle, swept {:.2}°",
+                polar.arc_span()
+            );
+            assert!(
+                polar.radial_tips.is_empty(),
+                "SECTR1={s1:?} SECTR2={s2:?}: all-round light must not draw radials"
+            );
+        }
+    }
+
+    #[test]
+    fn light_sector_radius_is_200m_plus_50m_per_valnmr_capped_at_600m() {
+        let center = Point::new(10.0, 55.0);
+        let tile = test_tile_geom(center, GEOM_MARGIN_DEG);
+        // (VALNMR, arc radius in metres); radials extend to twice the radius.
+        let cases = [
+            (None, 350.0), // default nominal range 3 NM
+            (Some(5.0), 450.0),
+            (Some(8.0), 600.0),  // exactly at the cap
+            (Some(20.0), 600.0), // 1200 m uncapped
+        ];
+        for (valnmr, r_m) in cases {
+            let polar =
+                render_sector_polar(center, &tile, &light_attrs(Some(10.0), Some(90.0), valnmr));
+            for (brg, dist) in &polar.arc {
+                assert!(
+                    (dist - r_m).abs() <= RADIUS_TOL_M,
+                    "VALNMR={valnmr:?}: arc vertex at {brg:.1}° is {dist:.1} m out, expected {r_m} m"
+                );
+            }
+            assert_eq!(polar.radial_tips.len(), 2);
+            for (brg, dist) in &polar.radial_tips {
+                assert!(
+                    (dist - 2.0 * r_m).abs() <= RADIUS_TOL_M,
+                    "VALNMR={valnmr:?}: radial at {brg:.1}° is {dist:.1} m long, expected {} m",
+                    2.0 * r_m
+                );
+            }
+        }
+    }
+
     #[test]
     fn light_colour_hex_white_renders_as_yellow() {
         assert_eq!(light_colour_hex("1"), "#ccaa00");
