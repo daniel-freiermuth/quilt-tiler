@@ -464,6 +464,38 @@ mod tests {
     }
 
     #[test]
+    fn header_tile_range_indexes_row_major_across_rows() {
+        // 3 cols x 2 rows; tile n = row * cols + col is n + 1 bytes long, so
+        // every tile has a distinct range and a row/col mix-up is visible.
+        let (cols, rows) = (3u32, 2u32);
+        let blobs_start = 16 + (cols * rows + 2) * 4;
+        let mut offsets = vec![blobs_start];
+        for len in 1..=cols * rows {
+            offsets.push(offsets.last().unwrap() + len);
+        }
+        offsets.push(*offsets.last().unwrap()); // trailing sentinel
+        let mut data = vec![0u8; 8];
+        data.extend_from_slice(&cols.to_le_bytes());
+        data.extend_from_slice(&rows.to_le_bytes());
+        for o in &offsets {
+            data.extend_from_slice(&o.to_le_bytes());
+        }
+        data.resize(*offsets.last().unwrap() as usize, 0);
+        let header = RncHeader::parse(&data).expect("valid header parses");
+
+        // Row 0.
+        assert_eq!(header.tile_range(0, 0), Some((48, 49)));
+        assert_eq!(header.tile_range(2, 0), Some((51, 54)));
+        // Row 1 starts at n = cols, not n = rows or n = 1.
+        assert_eq!(header.tile_range(0, 1), Some((54, 58)));
+        assert_eq!(header.tile_range(1, 1), Some((58, 63)));
+        assert_eq!(header.tile_range(2, 1), Some((63, 69)));
+        // Out of range on either axis.
+        assert_eq!(header.tile_range(3, 0), None);
+        assert_eq!(header.tile_range(0, 2), None);
+    }
+
+    #[test]
     fn header_rejects_truncated_table() {
         let data = vec![0u8; 10];
         let err = RncHeader::parse(&data).unwrap_err();
