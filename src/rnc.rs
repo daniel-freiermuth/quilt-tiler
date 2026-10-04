@@ -269,7 +269,7 @@ mod tests {
         [n as u8 * 10, 100, 200, 255]
     }
 
-    /// A 3-col x 2-row cell whose tile `n` is solid [`tile_color`]`(n)`.
+    /// A 3-col x 2-row cell whose tile `n` is solid `tile_color(n)`.
     fn distinct_3x2_cell() -> RncCell {
         let (cols, rows) = (3, 2);
         let pngs: Vec<Vec<u8>> = (0..cols * rows)
@@ -301,7 +301,9 @@ mod tests {
     fn subtile_image_rejects_index_past_grid() {
         let cell = distinct_3x2_cell();
         for n in [6, 7, u32::MAX] {
-            let err = cell.subtile_image(n).expect_err("index past grid must error");
+            let err = cell
+                .subtile_image(n)
+                .expect_err("index past grid must error");
             assert!(
                 format!("{err:#}").contains("tile index out of bounds"),
                 "n = {n}: {err:#}"
