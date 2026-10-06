@@ -53,9 +53,10 @@ impl RncCell {
     ///
     /// # Errors
     /// Returns an error if the header or footer can't be parsed (truncated
-    /// or corrupt `.rnc` file).
+    /// or corrupt `.rnc` file), the extent is degenerate, or the footer
+    /// `scale` isn't a valid `1:N` denominator (`N ≥ 1`; also rejects NaN).
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    // native_scale's cast is clamped immediately beforehand.
+    // native_scale's cast is range-checked and clamped immediately beforehand.
     pub fn parse(name: String, data: Vec<u8>) -> Result<Self> {
         let header = RncHeader::parse(&data).context("parsing .rnc header")?;
         let footer = RncFooter::parse(&data).context("parsing .rnc footer")?;
@@ -73,7 +74,12 @@ impl RncCell {
         }
 
         let coverage = footer.coverage();
-        let native_scale = footer.scale.round().clamp(1.0, f64::from(u32::MAX)) as u32;
+        // `zoom_from_scale` requires native_scale ≥ 1: anything smaller would
+        // map to zoom 22 and drag the whole run's zoom ceiling with it.
+        if footer.scale.is_nan() || footer.scale < 1.0 {
+            bail!("invalid footer scale {}: must be ≥ 1", footer.scale);
+        }
+        let native_scale = footer.scale.round().min(f64::from(u32::MAX)) as u32;
         let edition_date = EditionDate::from_ddmmyyyy(&footer.edate);
 
         Ok(Self {
@@ -251,6 +257,37 @@ mod tests {
     fn rejects_truncated_header() {
         let err = RncCell::parse("TEST".to_owned(), vec![0u8; 10]).unwrap_err();
         assert!(format!("{err:#}").contains("offset"));
+    }
+
+    /// Footer scales that aren't a valid `1:N` denominator (`N ≥ 1`) must be
+    /// rejected at parse time: `zoom_from_scale` treats them as 1:1 → zoom
+    /// 22, which would drag the whole run's zoom ceiling to 22.
+    #[test]
+    fn rejects_scale_below_one() {
+        for scale in [0.0, -50_000.0, 0.4, 0.7] {
+            let data = build_rnc(1, 1, (11.0, 57.0, 12.0, 58.0), scale, &[]);
+            let err = RncCell::parse("TEST".to_owned(), data)
+                .expect_err(&format!("scale {scale} must be rejected"));
+            assert!(
+                format!("{err:#}").contains("scale"),
+                "error for scale {scale} should name the scale: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_scale_of_exactly_one() {
+        let data = build_rnc(1, 1, (11.0, 57.0, 12.0, 58.0), 1.0, &[]);
+        let cell = RncCell::parse("TEST".to_owned(), data).expect("1:1 is a valid scale");
+        assert_eq!(cell.native_scale(), 1);
+    }
+
+    #[test]
+    fn scale_above_u32_max_saturates_instead_of_wrapping() {
+        let data = build_rnc(1, 1, (11.0, 57.0, 12.0, 58.0), 1e12, &[]);
+        let cell = RncCell::parse("TEST".to_owned(), data).expect("valid .rnc parses");
+        assert_eq!(cell.native_scale(), u32::MAX);
+        assert_eq!(crate::zoom::zoom_from_scale(cell.native_scale(), 0.0), 0);
     }
 
     #[test]

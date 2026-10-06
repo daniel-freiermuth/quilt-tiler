@@ -442,4 +442,40 @@ mod tests {
             "tiles must be written in ascending TileId order"
         );
     }
+
+    /// One `.rnc` with a zero footer scale in a batch must be skipped by the
+    /// loader rather than accepted as 1:1 — otherwise its zoom 22 becomes the
+    /// whole archive's `zoom_ceil`.
+    #[test]
+    fn scale_zero_rnc_does_not_raise_zoom_ceiling() {
+        let bbox = Bbox {
+            west: 10.0,
+            south: 56.0,
+            east: 11.0,
+            north: 57.0,
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "quilt-tiler-scale-zero-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("creating temp dir");
+        let good = dir.join("GOOD.rnc");
+        let bad = dir.join("BAD.rnc");
+        std::fs::write(
+            &good,
+            build_rnc(bbox, [0, 0, 255, 255], 3_000_000.0, "01/01/2026"),
+        )
+        .expect("writing GOOD.rnc");
+        std::fs::write(&bad, build_rnc(bbox, [255, 0, 0, 255], 0.0, "01/01/2026"))
+            .expect("writing BAD.rnc");
+
+        let cells = crate::loader::load_rnc_cells(&[&good, &bad], 0.0);
+        std::fs::remove_dir_all(&dir).expect("removing temp dir");
+
+        let names: Vec<&str> = cells.iter().map(RncCell::name).collect();
+        assert_eq!(names, ["GOOD"], "scale-0 cell must be skipped");
+        let (_, zoom_ceil, _) = zoom_range_and_bounds(&cells, None, 0.0).expect("non-empty items");
+        assert_eq!(zoom_ceil, zoom_from_scale(3_000_000, 0.0));
+    }
 }
