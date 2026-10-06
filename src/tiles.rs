@@ -13,7 +13,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
 use martin_tile_utils::{bbox_to_xyz, wgs84_to_webmercator, xyz_to_bbox};
-use pmtiles::{PmTilesWriter, TileCoord};
+use pmtiles::{PmTilesWriter, TileCoord, TileId};
 use rayon::prelude::*;
 use tracing::info;
 
@@ -87,7 +87,7 @@ pub fn write_pmtiles<S: TileSource>(
                     return Ok(None);
                 };
                 let coord = TileCoord::new(z, col, row).context("invalid tile coord")?;
-                Ok(Some((tile_id(z, col, row), coord, bytes)))
+                Ok(Some((TileId::from(coord).value(), coord, bytes)))
             })
             .collect::<Result<Vec<_>>>()?
             .into_iter()
@@ -284,39 +284,6 @@ fn build_metadata() -> String {
         "vector_layers": []
     })
     .to_string()
-}
-
-// ── PMTiles tile ID (Hilbert curve) ───────────────────────────────────────────
-
-/// Compute the `PMTiles` v3 `TileID` for `(z, x, y)`.
-///
-/// `TileID = (4^z − 1) / 3 + hilbert_xy_to_d(2^z, x, y)`
-fn tile_id(z: u8, x: u32, y: u32) -> u64 {
-    if z == 0 {
-        return 0;
-    }
-    let base = (4u64.pow(u32::from(z)) - 1) / 3;
-    base + hilbert_xy_to_d(1u64 << z, u64::from(x), u64::from(y))
-}
-
-#[allow(clippy::many_single_char_names)] // n, x, y, d, s are standard Hilbert variables
-fn hilbert_xy_to_d(n: u64, mut x: u64, mut y: u64) -> u64 {
-    let mut d = 0u64;
-    let mut s = n / 2;
-    while s > 0 {
-        let rx = u64::from((x & s) > 0);
-        let ry = u64::from((y & s) > 0);
-        d += s * s * ((3 * rx) ^ ry);
-        if ry == 0 {
-            if rx == 1 {
-                x = (n - 1) - x;
-                y = (n - 1) - y;
-            }
-            std::mem::swap(&mut x, &mut y);
-        }
-        s /= 2;
-    }
-    d
 }
 
 #[cfg(test)]
