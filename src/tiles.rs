@@ -443,6 +443,164 @@ mod tests {
         );
     }
 
+    /// Per-process, per-test archive path under the system temp dir.
+    fn temp_archive_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("quilt-tiler-{}-{tag}.pmtiles", std::process::id()))
+    }
+
+    fn parse_cell(name: &str, bbox: Bbox, color: [u8; 4]) -> RncCell {
+        RncCell::parse(
+            name.to_owned(),
+            build_rnc(bbox, color, 3_000_000.0, "01/01/2026"),
+        )
+        .expect("cell parses")
+    }
+
+    /// Re-open a written archive with the `PMTiles` reader: the header must
+    /// advertise the source's tile type, the returned zoom range and the
+    /// items' combined bounds, and every `(z, x, y)` in that range must hold
+    /// exactly what [`render_tile`] produces there — present where covered,
+    /// absent in the gap between two disjoint cells, nothing extra.
+    #[tokio::test]
+    async fn write_pmtiles_archive_round_trips_through_reader() {
+        // Disjoint cells with different footprints: the gap leaves uncovered
+        // tiles inside the overall bbox, and the non-square extent makes a
+        // swapped col/row derivation land tiles at the wrong (x, y).
+        let west = Bbox {
+            west: 0.0,
+            south: 50.0,
+            east: 1.0,
+            north: 54.0,
+        };
+        let east = Bbox {
+            west: 6.0,
+            south: 50.0,
+            east: 7.0,
+            north: 51.0,
+        };
+        let items = [
+            parse_cell("WEST", west, [200, 30, 30, 255]),
+            parse_cell("EAST", east, [30, 30, 200, 255]),
+        ];
+        let path = temp_archive_path("write_pmtiles_round_trip");
+
+        let written = write_pmtiles(&items, &path, None, 0.0);
+        let reader = pmtiles::AsyncPmTilesReader::new_with_path(&path).await;
+        let (zoom_floor, zoom_ceil) = written.expect("write_pmtiles succeeds");
+        let reader = reader.expect("archive re-opens with the PMTiles reader");
+        let header = reader.get_header();
+
+        let (expected_floor, expected_ceil, overall) =
+            zoom_range_and_bounds(&items, None, 0.0).expect("zoom range resolves");
+        assert_eq!((zoom_floor, zoom_ceil), (expected_floor, expected_ceil));
+        assert!(zoom_floor < zoom_ceil, "fixture must span several zooms");
+        assert_eq!((header.min_zoom, header.max_zoom), (zoom_floor, zoom_ceil));
+        assert_eq!(header.tile_type, pmtiles::TileType::Png);
+        assert_eq!(header.tile_type, RncCell::tile_type());
+        let bounds = [
+            header.min_longitude,
+            header.min_latitude,
+            header.max_longitude,
+            header.max_latitude,
+        ];
+        let expected_bounds = [overall.west, overall.south, overall.east, overall.north];
+        assert!(
+            bounds
+                .iter()
+                .zip(expected_bounds)
+                .all(|(got, want)| (got - want).abs() < 1e-6),
+            "header bounds {bounds:?} must be (west, south, east, north) {expected_bounds:?}"
+        );
+
+        let mut present = 0u64;
+        let mut absent = 0u64;
+        for z in zoom_floor..=zoom_ceil {
+            let (col_lo, row_lo, col_hi, row_hi) =
+                bbox_to_xyz(overall.west, overall.south, overall.east, overall.north, z);
+            for row in row_lo..=row_hi {
+                for col in col_lo..=col_hi {
+                    let expected = render_tile(&items, z, col, row, 0.0).expect("render_tile");
+                    let coord = TileCoord::new(z, col, row).expect("valid tile coord");
+                    let stored = reader
+                        .get_tile_decompressed(coord)
+                        .await
+                        .expect("reading tile from archive");
+                    assert_eq!(
+                        stored.as_deref(),
+                        expected.as_deref(),
+                        "archive tile ({z}, {col}, {row}) must match render_tile"
+                    );
+                    if expected.is_some() {
+                        present += 1;
+                    } else {
+                        absent += 1;
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+
+        assert!(absent > 0, "fixture must leave uncovered tiles in the bbox");
+        assert_eq!(
+            header.n_addressed_tiles().map_or(0, u64::from),
+            present,
+            "archive must hold exactly the rendered tiles, nothing outside the zoom/bbox range"
+        );
+    }
+
+    /// A `max_zoom` cap below the data's zoom floor must fail before any
+    /// output file is created.
+    #[test]
+    fn write_pmtiles_max_zoom_below_floor_errors_without_creating_output() {
+        let bbox = Bbox {
+            west: 10.0,
+            south: 56.0,
+            east: 11.0,
+            north: 57.0,
+        };
+        let items = [parse_cell("CELL", bbox, [30, 200, 30, 255])];
+        let (zoom_floor, _, _) =
+            zoom_range_and_bounds(&items, None, 0.0).expect("zoom range resolves");
+        assert!(zoom_floor > 0, "fixture needs a non-zero zoom floor");
+        let path = temp_archive_path("write_pmtiles_max_zoom_below_floor");
+        let _ = std::fs::remove_file(&path);
+
+        let result = write_pmtiles(&items, &path, Some(zoom_floor - 1), 0.0);
+        let created = path.exists();
+        let _ = std::fs::remove_file(&path);
+
+        let err = result.expect_err("max_zoom below the zoom floor must fail");
+        assert!(
+            err.to_string().contains("below the data's minimum zoom"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !created,
+            "no output file may be created on a zoom-range error"
+        );
+    }
+
+    /// An output path that cannot be created must surface as an error naming
+    /// that path, not a panic or a silently missing archive.
+    #[test]
+    fn write_pmtiles_unwritable_output_names_path_in_error() {
+        let bbox = Bbox {
+            west: 10.0,
+            south: 56.0,
+            east: 11.0,
+            north: 57.0,
+        };
+        let items = [parse_cell("CELL", bbox, [30, 200, 30, 255])];
+        let path = std::env::temp_dir()
+            .join(format!("quilt-tiler-{}-missing-dir", std::process::id()))
+            .join("out.pmtiles");
+
+        let err = write_pmtiles(&items, &path, None, 0.0)
+            .expect_err("writing into a missing directory must fail");
+
+        assert_eq!(err.to_string(), format!("creating {}", path.display()));
+    }
+
     /// One `.rnc` with a zero footer scale in a batch must be skipped by the
     /// loader rather than accepted as 1:1 — otherwise its zoom 22 becomes the
     /// whole archive's `zoom_ceil`.
