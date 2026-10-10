@@ -126,10 +126,14 @@ pub fn locate_grid_cell(
     let (x, y) = wgs84_to_rnc_merc(lon, lat);
     let u = ((x - xmin) / (xmax - xmin)).clamp(0.0, 0.999_999_9);
     let v = ((y - ymin) / (ymax - ymin)).clamp(0.0, 0.999_999_9);
-    let col = (u * f64::from(cols)).floor() as u32;
-    let row = (v * f64::from(rows)).floor() as u32;
-    let fx = u * f64::from(cols) - f64::from(col);
-    let fy = v * f64::from(rows) - f64::from(row);
+    // Derive cell index and in-cell fraction from the same product, so
+    // `fx`/`fy` stay in [0, 1). A fused `mul_add` would round differently
+    // from `floor` and can go slightly negative at cell edges.
+    let (sx, sy) = (u * f64::from(cols), v * f64::from(rows));
+    let col = sx.floor() as u32;
+    let row = sy.floor() as u32;
+    let fx = sx - sx.floor();
+    let fy = sy - sy.floor();
     (col, row, fx, fy)
 }
 

@@ -335,7 +335,6 @@ mod tests {
             acc.push(right).expect("push succeeds");
             acc.encode().expect("encode succeeds")
         };
-        assert!(!bytes.is_empty());
         let img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
             .expect("re-decodes")
             .to_rgba8();
@@ -444,6 +443,6 @@ mod tests {
             acc.push(blank).expect("push succeeds");
             acc.encode().expect("encode succeeds")
         };
-        assert!(bytes.is_empty());
+        assert_eq!(bytes, &[] as &[u8]);
     }
 }
