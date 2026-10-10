@@ -395,4 +395,51 @@ mod tests {
             "empty items must bail, but got Ok with ±Infinity bbox"
         );
     }
+
+    /// `write_pmtiles` must hand tiles to the writer in ascending `TileId`
+    /// order — that is what lets the archive be flagged `clustered`, which
+    /// readers rely on — and the archive header must advertise the same zoom
+    /// range the function returns.
+    #[test]
+    fn write_pmtiles_writes_clustered_archive_with_returned_zoom_range() {
+        let bbox = Bbox {
+            west: 8.0,
+            south: 54.0,
+            east: 12.0,
+            north: 58.0,
+        };
+        let items = [RncCell::parse(
+            "CELL".to_owned(),
+            build_rnc(bbox, [30, 200, 30, 255], 3_000_000.0, "01/01/2026"),
+        )
+        .expect("cell parses")];
+        let path = std::env::temp_dir().join(format!(
+            "quilt-tiler-{}-write_pmtiles_clustered.pmtiles",
+            std::process::id()
+        ));
+
+        let written = write_pmtiles(&items, &path, None, 0.0);
+        let archive = std::fs::read(&path);
+        let _ = std::fs::remove_file(&path);
+        let zooms = written.expect("write_pmtiles succeeds");
+        let header = pmtiles::Header::try_from_bytes(bytes::Bytes::from(
+            archive.expect("archive was written"),
+        ))
+        .expect("archive has a valid PMTiles v3 header");
+
+        let (zoom_floor, zoom_ceil, _) =
+            zoom_range_and_bounds(&items, None, 0.0).expect("zoom range resolves");
+        assert_eq!(zooms, (zoom_floor, zoom_ceil));
+        assert_eq!((header.min_zoom, header.max_zoom), zooms);
+        // Fixture sanity: a 2×2 block or larger at some zoom, so a write
+        // order that ignores the Hilbert curve would be detectable.
+        assert!(
+            header.n_addressed_tiles().map_or(0, u64::from) > 4,
+            "fixture must span several tiles per zoom"
+        );
+        assert!(
+            header.clustered(),
+            "tiles must be written in ascending TileId order"
+        );
+    }
 }
