@@ -39,8 +39,8 @@ mod tests {
 
         let lat_r = lat.to_radians();
         let ref_lat_r = ref_lat.to_radians();
-        let north =
-            WGS84_A * ((PI / 4.0 + lat_r / 2.0).tan().ln() - (PI / 4.0 + ref_lat_r / 2.0).tan().ln());
+        let north = WGS84_A
+            * ((PI / 4.0 + lat_r / 2.0).tan().ln() - (PI / 4.0 + ref_lat_r / 2.0).tan().ln());
 
         (east, north)
     }
@@ -156,11 +156,11 @@ mod tests {
     fn round_trip_various_locations() {
         let cases: &[(f64, f64, f64, f64)] = &[
             // (target_lon, target_lat, ref_lon, ref_lat)
-            (11.8, 57.7, 11.0, 57.0),   // Gothenburg
+            (11.8, 57.7, 11.0, 57.0),       // Gothenburg
             (-179.0, -60.0, -178.0, -59.0), // southern hemisphere near date line
-            (0.0, 0.0, 1.0, 1.0),        // near equator
-            (179.0, 80.0, 178.0, 79.0),  // Arctic
-            (-73.9, 40.7, -74.0, 40.5),  // New York
+            (0.0, 0.0, 1.0, 1.0),           // near equator
+            (179.0, 80.0, 178.0, 79.0),     // Arctic
+            (-73.9, 40.7, -74.0, 40.5),     // New York
         ];
         for &(target_lon, target_lat, ref_lon, ref_lat) in cases {
             let (east, north) = to_sm(target_lon, target_lat, ref_lat, ref_lon);
