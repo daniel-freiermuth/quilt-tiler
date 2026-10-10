@@ -233,6 +233,27 @@ mod tests {
         assert!(!bbox_a().is_bottom());
     }
 
+    #[test]
+    fn point_bbox_is_not_bottom() {
+        // Zero width and zero height: a single sounding or light is still a
+        // real extent, only an inverted one is ⊥.
+        assert!(!Bbox::point(11.5, 57.5).is_bottom());
+    }
+
+    // ── of ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn of_empty_iterator_is_none() {
+        assert!(Bbox::of(std::iter::empty()).is_none());
+    }
+
+    #[test]
+    fn of_encloses_all_points_regardless_of_order() {
+        let b = Bbox::of([(3.0, -1.0), (-2.0, 4.0), (1.0, 2.0)].into_iter())
+            .expect("non-empty iterator yields a bbox");
+        assert_eq!((b.west, b.south, b.east, b.north), (-2.0, -1.0, 3.0, 4.0));
+    }
+
     // ── join ────────────────────────────────────────────────────────
 
     #[test]
