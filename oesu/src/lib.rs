@@ -2032,6 +2032,69 @@ mod tests {
         assert_eq!(edge_refs, &[[1, 2, 3, 0]]);
     }
 
+    /// Regression test for the PR #1 off-by-one: skipping five f64s instead
+    /// of four read `scale_factor` from offset 52 rather than 44. `TriPrim`
+    /// vertices are the only output that depends on it.
+    #[test]
+    fn geometry_area_ext_divides_triprim_vertices_by_the_scale_factor_at_offset_44() {
+        let mut b = builder_with_feature();
+        // extent, contour/triprim/edge counts, scale_factor, vertex_counts[0],
+        // one GL_TRIANGLES TriPrim (type, nvert, 4×i16 bbox, 3×2 i16 vertices),
+        // one edge ref.
+        let payload = Bytes::default()
+            .extent()
+            .u32(1)
+            .u32(1)
+            .u32(1)
+            .f64(100.0)
+            .u32(3)
+            .u8(4)
+            .u32(3)
+            .i16(-300)
+            .i16(100)
+            .i16(-25)
+            .i16(400)
+            .i16(100)
+            .i16(200)
+            .i16(-300)
+            .i16(400)
+            .i16(50)
+            .i16(-25)
+            .i32(1)
+            .i32(2)
+            .i32(3)
+            .i32(0);
+        feed(&mut b, &payload.0, CellBuilder::parse_geometry_area_ext);
+        let geometry = &current_feature(&b).raw_geometry;
+        let RawGeometry::Area {
+            _vertex_counts: vertex_counts,
+            _tri_prims: tri_prims,
+            edge_refs,
+            ..
+        } = geometry
+        else {
+            panic!("expected an area, got {geometry:?}");
+        };
+        assert_eq!(vertex_counts, &[3]);
+        assert_eq!(edge_refs, &[[1, 2, 3, 0]]);
+        let [
+            RawTriPrim {
+                _prim_type: prim_type,
+                _vertices: vertices,
+                ..
+            },
+        ] = tri_prims.as_slice()
+        else {
+            panic!("expected one TriPrim, got {tri_prims:?}");
+        };
+        assert_eq!(*prim_type, 4);
+        assert_eq!(
+            vertices,
+            &[[1.0, 2.0], [-3.0, 4.0], [0.5, -0.25]],
+            "i16 vertices must be divided by the header scale_factor (100)"
+        );
+    }
+
     #[test]
     fn vet_keeps_the_edges_and_points_the_payload_holds() {
         // One edge whose single point ends exactly at the payload end.
