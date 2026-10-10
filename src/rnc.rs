@@ -182,24 +182,40 @@ mod tests {
 
     /// Build a minimal valid `.rnc` buffer with a `cols`×`rows` grid of
     /// identical solid-colour PNGs and the given footer fields.
-    #[allow(clippy::cast_possible_truncation)] // test PNG sizes are tiny constants
     fn build_rnc(
         cols: u32,
         rows: u32,
-        (lon0, lat0, lon1, lat1): (f64, f64, f64, f64),
+        bbox: (f64, f64, f64, f64),
         scale: f64,
         cover: &[Vec<f64>],
     ) -> Vec<u8> {
         let png = solid_png(4, 4, [255, 0, 0, 255]);
+        let pngs = vec![png; (cols * rows) as usize];
+        build_rnc_tiles(cols, rows, &pngs, bbox, scale, cover)
+    }
+
+    /// Build a minimal valid `.rnc` buffer whose grid tile `n = row * cols +
+    /// col` is `pngs[n]`, with the given footer fields.
+    #[allow(clippy::cast_possible_truncation)] // test PNG sizes are tiny constants
+    fn build_rnc_tiles(
+        cols: u32,
+        rows: u32,
+        pngs: &[Vec<u8>],
+        (lon0, lat0, lon1, lat1): (f64, f64, f64, f64),
+        scale: f64,
+        cover: &[Vec<f64>],
+    ) -> Vec<u8> {
         let n_tiles = cols * rows;
+        assert_eq!(pngs.len(), n_tiles as usize, "one PNG per grid tile");
         let n_offsets = n_tiles + 2;
         let table_start = 16u32;
         let table_bytes = n_offsets * 4;
         let blobs_start = table_start + table_bytes;
 
         let mut offsets = Vec::with_capacity(n_offsets as usize);
-        for i in 0..=n_tiles {
-            offsets.push(blobs_start + i * png.len() as u32);
+        offsets.push(blobs_start);
+        for png in pngs {
+            offsets.push(offsets.last().expect("at least one offset") + png.len() as u32);
         }
         // Trailing sentinel slot (semantics unused by the reader).
         offsets.push(*offsets.last().expect("at least one offset"));
@@ -210,8 +226,8 @@ mod tests {
         for o in &offsets {
             buf.extend_from_slice(&o.to_le_bytes());
         }
-        for _ in 0..n_tiles {
-            buf.extend_from_slice(&png);
+        for png in pngs {
+            buf.extend_from_slice(png);
         }
         let footer = serde_json::json!({
             "cover": cover,
@@ -245,6 +261,54 @@ mod tests {
         // Cached path returns the same data.
         let img2 = cell.subtile_image(0).expect("cached subtile");
         assert_eq!(img2.get_pixel(0, 0).0, [255, 0, 0, 255]);
+    }
+
+    /// Distinct colour for grid tile `n` (red channel encodes `n`).
+    #[allow(clippy::cast_possible_truncation)] // test grids have < 256 tiles
+    fn tile_color(n: u32) -> [u8; 4] {
+        [n as u8 * 10, 100, 200, 255]
+    }
+
+    /// A 3-col x 2-row cell whose tile `n` is solid `tile_color(n)`.
+    fn distinct_3x2_cell() -> RncCell {
+        let (cols, rows) = (3, 2);
+        let pngs: Vec<Vec<u8>> = (0..cols * rows)
+            .map(|n| solid_png(4, 4, tile_color(n)))
+            .collect();
+        let data = build_rnc_tiles(
+            cols,
+            rows,
+            &pngs,
+            (11.0, 57.0, 12.0, 58.0),
+            3_000_000.0,
+            &[],
+        );
+        RncCell::parse("TEST".to_owned(), data).expect("valid .rnc parses")
+    }
+
+    #[test]
+    fn subtile_image_indexes_row_major_across_rows() {
+        let cell = distinct_3x2_cell();
+        // n = row * cols + col: every index, including row 1 (n >= cols),
+        // must return its own blob — not a transposed or neighbouring one.
+        for n in 0..6 {
+            let img = cell.subtile_image(n).expect("subtile decodes");
+            assert_eq!(img.get_pixel(0, 0).0, tile_color(n), "subtile {n}");
+        }
+    }
+
+    #[test]
+    fn subtile_image_rejects_index_past_grid() {
+        let cell = distinct_3x2_cell();
+        for n in [6, 7, u32::MAX] {
+            let err = cell
+                .subtile_image(n)
+                .expect_err("index past grid must error");
+            assert!(
+                format!("{err:#}").contains("tile index out of bounds"),
+                "n = {n}: {err:#}"
+            );
+        }
     }
 
     #[test]
