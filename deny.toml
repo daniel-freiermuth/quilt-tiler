@@ -12,6 +12,7 @@ ignore = [
     # bincode 1.x is unmaintained. Pulled in only transitively via
     # mlt-core -> probabilistic-collections; no maintained release of
     # either drops it yet. Retire when mlt-core stops depending on it.
+    # Upstream plan: docs/MODERNIZATION-mlt-core-probabilistic-collections.md
     { id = "RUSTSEC-2025-0141", reason = "transitive via mlt-core; no upstream fix" },
 ]
 
