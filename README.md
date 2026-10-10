@@ -13,3 +13,16 @@ and an accompanying style.json + Signal K metadata.json.
 ```
 quilt-tiler -o chart.pmtiles <input-charts>          # vector: .oesu/.osenc cells
 quilt-tiler -o chart.pmtiles <cells>/*.rnc            # raster: rnc cells
+```
+
+## Development
+
+```
+just check                 # fmt, clippy -D warnings, nextest, cargo-deny, cargo-machete — same as CI
+just mutants src/bbox.rs   # mutation-test one file
+just mutants-diff          # mutants introduced since github/master, incl. uncommitted changes
+```
+
+Pull requests must pass the "Mutation coverage of the diff" check: every mutant the diff
+introduces has to be caught by a test. See `.cargo/mutants.toml` for what a surviving mutant
+means and how to run the audit locally.

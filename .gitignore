@@ -1,2 +1,4 @@
 /target
 out/**
+/mutants.out
+/mutants.out.old
