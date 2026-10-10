@@ -1,0 +1,181 @@
+name: Mutants
+
+# Its own workflow, not a job inside CI: a long list of surviving mutants
+# needs a run, a log, and a history of its own to be readable.
+#
+# A GATE: a mutant the diff introduces that the suite does not catch fails
+# the run. A survivor means the suite cannot tell the new code from a
+# broken version of it, so the PR either adds the missing test or removes
+# the code nothing depends on. The single check to require for merging is
+# "Mutation coverage of the diff" (the `gate` job below).
+
+# PR-only: the scope is the PR's diff against its base branch, which a
+# push event does not have (github.base_ref is empty there).
+on:
+  pull_request:
+
+# Deliberately NOT sharing CI's concurrency group: a mutation run takes far
+# longer than the rest of CI, and being cancelled by every CI push would
+# keep it from ever finishing. It still cancels its own older runs.
+concurrency:
+  group: mutants-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Plan ──────────────────────────────────────────────────────
+  # Tests the mutants a change introduces, not the whole tree. Scope is
+  # "lines in the diff" plus, for any function the diff touches, the mutant
+  # that replaces the whole function body -- so a one-line change inside a
+  # large function audits the whole function, which is the point.
+  #
+  # A gate must test every mutant of the diff on every push, so a large
+  # diff is split into shards that run in parallel, each small enough to
+  # finish inside its time cap.
+  plan:
+    name: Plan mutation shards
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+      shard_count: ${{ steps.plan.outputs.shard_count }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
+        with:
+          tool: cargo-mutants@27.1.0
+
+      - name: List the mutants this PR introduces
+        id: plan
+        env:
+          # Mutants per shard. Every mutant rebuilds and tests the whole
+          # workspace (test_workspace in .cargo/mutants.toml); 30 leaves
+          # headroom under the shard's 35-minute cap at -j 2.
+          MAX_MUTANTS: "30"
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git diff --no-color "origin/$BASE_REF"...HEAD > /tmp/pr.diff
+
+          # Check the exit status: a failed --list is otherwise
+          # indistinguishable from an empty one, and the gate would pass on
+          # a count of 0 having tested nothing.
+          if ! cargo mutants --workspace --in-diff /tmp/pr.diff --list > /tmp/mutants.list; then
+            echo "::error::cargo mutants --list failed; see the output above."
+            exit 1
+          fi
+          count=$(wc -l < /tmp/mutants.list)
+          shards=$(( (count + MAX_MUTANTS - 1) / MAX_MUTANTS ))
+          echo "diff introduces $count mutants: $shards shard(s) of at most $MAX_MUTANTS"
+          if [ "$count" -eq 0 ]; then
+            echo "::notice::No mutable code in this diff."
+          fi
+          # JSON array of zero-based shard indexes, [] for no mutants.
+          echo "shards=[$(seq -s, 0 $(( shards - 1 )))]" >> "$GITHUB_OUTPUT"
+          echo "shard_count=$shards" >> "$GITHUB_OUTPUT"
+
+  # ── Shards ────────────────────────────────────────────────────
+  mutants:
+    name: Mutants shard ${{ matrix.shard }}
+    needs: plan
+    if: needs.plan.outputs.shards != '[]'
+    runs-on: ubuntu-latest
+    # Above the step's own 35-minute cap: a job timeout cancels the run,
+    # and the step must be the one to report what happened.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+
+      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
+        with:
+          tool: cargo-nextest@0.9.145,cargo-mutants@27.1.0
+
+      - name: Mutants introduced by this PR
+        # Classify cargo-mutants' exit code (mutants.rs/exit-codes) instead
+        # of letting any failure pass:
+        #   0    every mutant caught -> pass
+        #   2    surviving mutants   -> fail, the point of the gate
+        #   3    mutant timeouts     -> fail: not shown to be caught
+        #   124  the 35-minute cap   -> fail: part of the shard is untested
+        #   1, 4 usage error / baseline failed -> fail: nothing was tested
+        #
+        # --minimum-test-timeout guards against load: the auto timeout is
+        # derived from one sub-second baseline run.
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ needs.plan.outputs.shard_count }}
+        run: |
+          git diff --no-color "origin/$BASE_REF"...HEAD > /tmp/pr.diff
+          set +e
+          timeout 35m cargo mutants --workspace \
+            --in-diff /tmp/pr.diff -j 2 --colors never \
+            --minimum-test-timeout 120 \
+            --shard "$SHARD/$SHARDS"
+          rc=$?
+          set -e
+          case "$rc" in
+            0) echo "::notice::every mutant in shard $SHARD was caught." ;;
+            2) echo "::error::surviving mutants: add the missing tests, or"\
+                    "remove the code nothing notices. See MISSED above." ;;
+            3) echo "::error::mutants timed out; see TIMEOUT above." ;;
+            124) echo "::error::hit the 35m cap; part of shard $SHARD is untested." ;;
+            4) echo "::error::baseline failed -- the suite is red before any"\
+                    "mutation, so NOTHING was tested." ;;
+            *) echo "::error::cargo mutants exited $rc (usage or internal"\
+                    "error); nothing was tested." ;;
+          esac
+          exit "$rc"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: mutants.out/
+
+  # ── Gate ──────────────────────────────────────────────────────
+  # One stable check name to require for merging, whatever the shard
+  # count. Runs even when the matrix was skipped (no mutants) or a shard
+  # failed; passes only if the plan succeeded and every shard did.
+  gate:
+    name: Mutation coverage of the diff
+    needs: [plan, mutants]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every mutant of the diff is caught
+        env:
+          PLAN: ${{ needs.plan.result }}
+          SHARDS: ${{ needs.mutants.result }}
+        run: |
+          echo "plan: $PLAN, shards: $SHARDS"
+          if [ "$PLAN" != success ]; then
+            echo "::error::planning the mutation run failed."
+            exit 1
+          fi
+          # `skipped` only when the plan found no mutants.
+          case "$SHARDS" in
+            success|skipped) exit 0 ;;
+            *) echo "::error::a mutation shard did not pass."; exit 1 ;;
+          esac

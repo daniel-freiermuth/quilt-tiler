@@ -1,0 +1,31 @@
+# cargo-mutants configuration — https://mutants.rs/
+#
+# A surviving (MISSED) mutant means the test suite cannot tell the mutated
+# code from the real code: either a test is missing, or the code is
+# redundant and should be deleted. Prefer the latter over a test that
+# merely pins the redundancy.
+#
+# Entry points (justfile):
+#   just mutants src/bbox.rs     focused audit of one file
+#   just mutants-diff            only the mutants the current branch adds
+#   just mutants-all             whole workspace (~1300 mutants, hours)
+#
+# `--workspace` is passed by the recipes, not set here: cargo-mutants has
+# no config key for it, and without it only the root package is mutated.
+#
+# Each parallel job copies the tree and builds its own `target/` (~1 GB)
+# under $TMPDIR. If /tmp is a small tmpfs the builds die with ENOSPC and
+# every mutant is reported "unviable" — a run that reads as clean but
+# tested nothing. Point TMPDIR at a real disk in that case.
+
+test_tool = "nextest"
+
+# Root-crate tests exercise oesu/s57/rnc-format code (decoding, coverage,
+# quilting), so a mutant in a member crate must face the whole suite.
+test_workspace = true
+
+# The suite runs in well under a second; the auto timeout derived from that
+# is too tight under -j load, so give caught-but-slow mutants headroom while
+# still killing mutants that loop forever.
+timeout_multiplier = 3.0
+minimum_test_timeout = 20

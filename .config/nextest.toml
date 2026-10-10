@@ -1,0 +1,18 @@
+[profile.default]
+# Pure in-memory tests: a test that runs for a minute is hung, not slow.
+slow-timeout = { period = "10s", terminate-after = 6 }
+
+# Flakes are bugs. There is no network or shared state to justify a retry.
+retries = 0
+
+failure-output = "immediate-final"
+status-level = "fail"
+
+# CI wants every failure in one run, not just the first.
+[profile.ci]
+slow-timeout = { period = "30s", terminate-after = 4 }
+retries = 0
+fail-fast = false
+failure-output = "immediate-final"
+status-level = "fail"
+final-status-level = "slow"
