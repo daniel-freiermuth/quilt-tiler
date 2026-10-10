@@ -1297,6 +1297,35 @@ mod tests {
     }
 
     #[test]
+    fn bearing_offset_is_clockwise_from_north_in_metres() {
+        let origin = coord! { x: 10.0, y: 55.0 };
+        let metres_per_deg_lat = 111_320.0;
+        let metres_per_deg_lon = metres_per_deg_lat * 55.0_f64.to_radians().cos();
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+
+        let north = bearing_offset(origin, 0.0, 1000.0);
+        assert!(
+            close(north.x, 10.0),
+            "0° must not move east/west: {north:?}"
+        );
+        assert!(
+            close(north.y, 55.0 + 1000.0 / metres_per_deg_lat),
+            "{north:?}"
+        );
+
+        // Clockwise: 90° is east, not west.
+        let east = bearing_offset(origin, 90.0, 1000.0);
+        assert!(
+            close(east.x, 10.0 + 1000.0 / metres_per_deg_lon),
+            "{east:?}"
+        );
+        assert!(
+            close(east.y, 55.0),
+            "90° must not move north/south: {east:?}"
+        );
+    }
+
+    #[test]
     fn buoy_light_with_real_sector_still_emits_arc_and_radials() {
         let center = Point::new(10.0, 55.0);
         let tile = test_tile_geom(center, 0.1);
