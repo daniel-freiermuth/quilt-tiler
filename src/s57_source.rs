@@ -891,8 +891,7 @@ mod tests {
             out[0]
                 .1
                 .iter()
-                .any(|(k, v)| k == "COLOUR"
-                    && matches!(v, PropValue::Str(Some(s)) if s == "3")),
+                .any(|(k, v)| k == "COLOUR" && matches!(v, PropValue::Str(Some(s)) if s == "3")),
             "expected COLOUR=3 in properties, got {:?}",
             out[0].1
         );
@@ -932,10 +931,7 @@ mod tests {
     #[test]
     fn push_features_line_empty_produces_nothing() {
         let tile = test_tile_geom(Point::new(10.0, 55.0), 0.1);
-        let f = feat(
-            s57::Geometry::Line(LineString::new(vec![])),
-            vec![],
-        );
+        let f = feat(s57::Geometry::Line(LineString::new(vec![])), vec![]);
         let mut out = Vec::new();
         push_features(&f, &tile, &mut out);
         assert!(out.is_empty());
@@ -998,12 +994,7 @@ mod tests {
         let tile = test_tile_geom(Point::new(10.0, 55.0), 0.1);
         let f = feat(
             s57::Geometry::Area(Polygon::new(
-                LineString::from(vec![
-                    [20.0, 60.0],
-                    [21.0, 60.0],
-                    [21.0, 61.0],
-                    [20.0, 61.0],
-                ]),
+                LineString::from(vec![[20.0, 60.0], [21.0, 60.0], [21.0, 61.0], [20.0, 61.0]]),
                 vec![],
             )),
             vec![],
@@ -1064,7 +1055,10 @@ mod tests {
         let f = feat(s57::Geometry::Point(center), attrs);
         let mut out = Vec::new();
         push_features(&f, &tile, &mut out);
-        assert!(out.is_empty(), "feature with SCAMIN < tile.scale must be skipped");
+        assert!(
+            out.is_empty(),
+            "feature with SCAMIN < tile.scale must be skipped"
+        );
     }
 
     #[test]
@@ -1089,7 +1083,7 @@ mod tests {
     fn build_props_converts_all_attr_value_variants() {
         let attrs = vec![
             s57::Attribute {
-                code: 75,  // COLOUR
+                code: 75, // COLOUR
                 value: s57::AttrValue::Str("1".into()),
             },
             s57::Attribute {
@@ -1395,7 +1389,11 @@ mod tests {
         // Feature 0 was pushed before "b" existed → back-filled with Str(None).
         let f0 = layer.features()[0].properties();
         assert_eq!(f0[0], PropValue::I64(Some(1)));
-        assert_eq!(f0[1], PropValue::Str(None), "back-fill must be a typed null");
+        assert_eq!(
+            f0[1],
+            PropValue::Str(None),
+            "back-fill must be a typed null"
+        );
 
         // Feature 1 has both columns populated.
         let f1 = layer.features()[1].properties();
@@ -1481,10 +1479,7 @@ mod tests {
     fn push_feature_with_no_props_after_one_with_props_still_backfills() {
         // Feature 0 has "a"; feature 1 has nothing → "a" column exists,
         // feature 1 gets a null for "a" via the builder.
-        let layer = push_all(vec![
-            vec![("a", PropValue::U64(Some(42)))],
-            vec![],
-        ]);
+        let layer = push_all(vec![vec![("a", PropValue::U64(Some(42)))], vec![]]);
 
         assert_eq!(layer.feature_count(), 2);
         let f1 = layer.features()[1].properties();
@@ -1630,10 +1625,7 @@ mod tests {
             .map(|props| {
                 (
                     pt(),
-                    props
-                        .into_iter()
-                        .map(|(k, v)| (k.to_owned(), v))
-                        .collect(),
+                    props.into_iter().map(|(k, v)| (k.to_owned(), v)).collect(),
                 )
             })
             .collect();
@@ -1649,7 +1641,10 @@ mod tests {
         ))
         .expect("push succeeds");
         let bytes = acc.encode().expect("encode should succeed");
-        assert!(!bytes.is_empty(), "single layer with one feature should produce bytes");
+        assert!(
+            !bytes.is_empty(),
+            "single layer with one feature should produce bytes"
+        );
     }
 
     #[test]
