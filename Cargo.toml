@@ -31,6 +31,10 @@ tower-http = { version = "0.7.0", features = ["cors"] }
 moka = { version = "0.12.16", features = ["sync"] }
 bytes = "1.12.0"
 
+[dev-dependencies]
+# Tests re-open written archives with the file reader (needs an async backend feature).
+pmtiles         = { version = "0.23", default-features = false, features = ["write", "mmap-async-tokio"] }
+
 [workspace.lints.rust]
 unsafe_code     = "forbid"
 unused_must_use = "deny"
