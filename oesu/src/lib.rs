@@ -356,7 +356,7 @@ impl CellBuilder {
         let _w = read_f64(p)?;
         let _e = read_f64(p)?;
         let count = read_u32(p)? as usize;
-        let mut edge_refs = Vec::with_capacity(count);
+        let mut edge_refs = Vec::new();
         for _ in 0..count {
             if p.position() as usize + 16 > payload_len {
                 break;
@@ -422,7 +422,7 @@ impl CellBuilder {
         let _w = read_f64(p)?;
         let _e = read_f64(p)?;
         let count = read_u32(p)? as usize;
-        let mut pts = Vec::with_capacity(count);
+        let mut pts = Vec::new();
         for _ in 0..count {
             if p.position() as usize + 12 > payload_len {
                 break;
@@ -451,7 +451,7 @@ impl CellBuilder {
             }
             let edge_index = read_u32(p)?;
             let point_count = read_u32(p)? as usize;
-            let mut points = Vec::with_capacity(point_count);
+            let mut points = Vec::new();
             for _ in 0..point_count {
                 if p.position() as usize + 8 > payload_len {
                     break;
@@ -496,6 +496,10 @@ impl CellBuilder {
             tracing::warn!(payload_len, "VET_EXT record too short");
             return Ok(());
         };
+        if !is_valid_scale_factor(scale_factor) {
+            tracing::warn!(scale_factor, "VET_EXT invalid scale_factor, skipping");
+            return Ok(());
+        }
         let n_edges = n_edges as usize;
         for _ in 0..n_edges {
             if p.position() as usize + 8 > payload_len {
@@ -503,7 +507,7 @@ impl CellBuilder {
             }
             let edge_index = read_u32(p)?;
             let point_count = read_u32(p)? as usize;
-            let mut points = Vec::with_capacity(point_count);
+            let mut points = Vec::new();
             for _ in 0..point_count {
                 if p.position() as usize + 4 > payload_len {
                     break;
@@ -523,6 +527,10 @@ impl CellBuilder {
             tracing::warn!(payload_len, "VCT_EXT record too short");
             return Ok(());
         };
+        if !is_valid_scale_factor(scale_factor) {
+            tracing::warn!(scale_factor, "VCT_EXT invalid scale_factor, skipping");
+            return Ok(());
+        }
         let n_nodes = n_nodes as usize;
         for _ in 0..n_nodes {
             if p.position() as usize + 8 > payload_len {
@@ -597,6 +605,12 @@ fn read_cstring(c: &mut Cursor<&[u8]>, max: usize) -> Result<String> {
         buf.push(b);
     }
     Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// An EXT record's i16 → SM divisor must be a positive finite number;
+/// anything else produces infinite/NaN (or mirrored) coordinates.
+fn is_valid_scale_factor(scale_factor: f64) -> bool {
+    scale_factor.is_finite() && scale_factor > 0.0
 }
 
 // ── Main entry point ─────────────────────────────────────────────────────────
@@ -2209,5 +2223,155 @@ mod tests {
         data.extend(scale_record(22_000).0);
         let err = parse_err(&data);
         assert!(err.contains("has no HEADER_CELL_NATIVESCALE"), "{err}");
+    }
+
+    /// End to end: EXT tables divide i16 coords by `scale_factor`, and a LINE
+    /// walking node 1 → edge 10 → node 2 resolves into nodes framing the
+    /// edge points.
+    #[test]
+    fn parse_file_resolves_ext_tables_into_line_coords() {
+        let nodes = Bytes::default()
+            .f64(4.0)
+            .u32(2)
+            .u32(1)
+            .i16(400)
+            .i16(-800)
+            .u32(2)
+            .i16(1200)
+            .i16(40);
+        let edges = Bytes::default()
+            .f64(4.0)
+            .u32(1)
+            .u32(10)
+            .u32(2)
+            .i16(600)
+            .i16(-400)
+            .i16(1000)
+            .i16(0);
+        let line = Bytes::default()
+            .extent()
+            .u32(1)
+            .i32(1)
+            .i32(10)
+            .i32(2)
+            .i32(0);
+        let data = senc_stream(vec![
+            (HEADER_CELL_NATIVESCALE, Bytes::default().u32(50_000)),
+            (VECTOR_CONNECTED_NODE_TABLE_EXT_RECORD, nodes),
+            (VECTOR_EDGE_NODE_TABLE_EXT_RECORD, edges),
+            (FEATURE_ID_RECORD, Bytes::default().u16(42).u16(1).u8(1)),
+            (FEATURE_GEOMETRY_RECORD_LINE, line),
+        ]);
+        let cell = parse_file("test.oesu".to_owned(), &data).unwrap();
+        let [feature] = cell.features.as_slice() else {
+            panic!("expected one feature, got {:?}", cell.features);
+        };
+        let Geometry::Line(line) = &feature.geometry else {
+            panic!("expected a line, got {:?}", feature.geometry);
+        };
+        let sm = |east, north| crate::georef::from_sm(east, north, 0.0, 0.0);
+        assert_eq!(
+            line.0,
+            [
+                sm(100.0, -200.0),
+                sm(150.0, -100.0),
+                sm(250.0, 0.0),
+                sm(300.0, 10.0),
+            ]
+        );
+    }
+
+    /// A zero, negative or non-finite divisor would turn every coordinate
+    /// into NaN/inf (or mirror it), so the whole EXT table is skipped.
+    #[test]
+    fn vet_ext_and_vct_ext_skip_invalid_scale_factor() {
+        for scale in [0.0, -2.0, f64::NAN, f64::INFINITY] {
+            let mut b = CellBuilder::default();
+            let edges = Bytes::default()
+                .f64(scale)
+                .u32(1)
+                .u32(7)
+                .u32(1)
+                .i16(15)
+                .i16(-25);
+            let nodes = Bytes::default().f64(scale).u32(1).u32(7).i16(15).i16(-25);
+            feed(&mut b, &edges.0, CellBuilder::parse_vet_ext).unwrap();
+            feed(&mut b, &nodes.0, CellBuilder::parse_vct_ext).unwrap();
+            assert_eq!(vet_points(&b), [], "scale_factor {scale}");
+            assert_eq!(vct_coords(&b), [], "scale_factor {scale}");
+        }
+    }
+
+    /// A `u32::MAX` entry count must not be trusted for pre-allocation: the
+    /// parsers keep what the payload holds instead of aborting the process
+    /// on a tens-of-GiB allocation.
+    #[test]
+    fn huge_entry_counts_keep_what_the_payload_holds() {
+        let mut b = builder_with_feature();
+        let line = Bytes::default()
+            .extent()
+            .u32(u32::MAX)
+            .i32(1)
+            .i32(2)
+            .i32(3)
+            .i32(0);
+        feed(&mut b, &line.0, CellBuilder::parse_geometry_line).unwrap();
+        let geometry = &current_feature(&b).raw_geometry;
+        assert!(
+            matches!(geometry, RawGeometry::Line(refs) if refs == &[[1, 2, 3, 0]]),
+            "{geometry:?}"
+        );
+
+        let multipoint = Bytes::default()
+            .extent()
+            .u32(u32::MAX)
+            .f32(1.5)
+            .f32(-2.5)
+            .f32(3.25);
+        feed(
+            &mut b,
+            &multipoint.0,
+            CellBuilder::parse_geometry_multipoint,
+        )
+        .unwrap();
+        let geometry = &current_feature(&b).raw_geometry;
+        assert!(
+            matches!(geometry, RawGeometry::Sounding(pts) if pts == &[[1.5, -2.5, 3.25]]),
+            "{geometry:?}"
+        );
+
+        let mut b = CellBuilder::default();
+        let vet = Bytes::default()
+            .u32(1)
+            .u32(7)
+            .u32(u32::MAX)
+            .f32(1.5)
+            .f32(-2.5);
+        feed(&mut b, &vet.0, CellBuilder::parse_vet).unwrap();
+        assert_eq!(vet_points(&b), [(7, vec![[1.5, -2.5]])]);
+
+        let mut b = CellBuilder::default();
+        let vet_ext = Bytes::default()
+            .f64(10.0)
+            .u32(1)
+            .u32(7)
+            .u32(u32::MAX)
+            .i16(15)
+            .i16(-25);
+        feed(&mut b, &vet_ext.0, CellBuilder::parse_vet_ext).unwrap();
+        assert_eq!(vet_points(&b), [(7, vec![[1.5, -2.5]])]);
+    }
+
+    #[test]
+    fn duplicate_vet_and_vct_indices_keep_the_last_record() {
+        let mut b = CellBuilder::default();
+        for v in [1.0, 9.0] {
+            let edges = Bytes::default().u32(1).u32(7).u32(1).f32(v).f32(v);
+            let nodes = Bytes::default().u32(1).u32(7).f32(v).f32(v);
+            feed(&mut b, &edges.0, CellBuilder::parse_vet).unwrap();
+            feed(&mut b, &nodes.0, CellBuilder::parse_vct).unwrap();
+        }
+        assert_eq!(vet_points(&b), [(7, vec![[9.0, 9.0]])]);
+        assert_eq!(vct_coords(&b), [(7, [9.0, 9.0])]);
     }
 }
