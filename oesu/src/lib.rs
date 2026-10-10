@@ -243,18 +243,14 @@ impl CellBuilder {
 
     /// `CELL_TXTDSC_INFO_FILE_RECORD` (101): embedded text-description file.
     fn parse_txtdsc(&mut self, p: &mut Cursor<&[u8]>, payload_len: usize) {
-        if payload_len < 8 {
-            tracing::warn!(payload_len, "CELL_TXTDSC_INFO_FILE_RECORD too short");
-            return;
-        }
         let (Ok(name_len), Ok(_content_len)) = (read_u32(p), read_u32(p)) else {
+            tracing::warn!(payload_len, "CELL_TXTDSC_INFO_FILE_RECORD too short");
             return;
         };
         let name_len = name_len as usize;
         let fname = read_cstring(p, name_len).unwrap_or_default();
         let consumed = 8 + name_len;
-        if payload_len > consumed
-            && !fname.is_empty()
+        if !fname.is_empty()
             && let Some(content_raw) = p.get_ref().get(consumed..)
         {
             let content = String::from_utf8_lossy(content_raw)
@@ -379,11 +375,9 @@ impl CellBuilder {
 
     /// `FEATURE_GEOMETRY_RECORD_AREA_EXT` (84): extended area with i16 SM coords.
     fn parse_geometry_area_ext(&mut self, p: &mut Cursor<&[u8]>, payload_len: usize) {
-        if payload_len < 52 {
-            tracing::warn!(payload_len, "GEOM_AREA_EXT too short");
-            return;
-        }
         // Read scale_factor from offset 44: skip 4×f64 extent + 3×u32 counts.
+        // It is the last header field, so failing to read it means the
+        // payload is shorter than the 52-byte EXT header.
         let mut hdr_p = Cursor::new(*p.get_ref());
         for _ in 0..4 {
             let _ = read_f64(&mut hdr_p);
@@ -391,12 +385,9 @@ impl CellBuilder {
         let _ = read_u32(&mut hdr_p); // contour_count
         let _ = read_u32(&mut hdr_p); // triprim_count
         let _ = read_u32(&mut hdr_p); // edge_count
-        let scale_factor = match read_f64(&mut hdr_p) {
-            Ok(sf) => sf,
-            Err(e) => {
-                tracing::warn!("GEOM_AREA_EXT: failed to read scale_factor: {e:#}");
-                return;
-            }
+        let Ok(scale_factor) = read_f64(&mut hdr_p) else {
+            tracing::warn!(payload_len, "GEOM_AREA_EXT too short");
+            return;
         };
         match parse_area_payload(
             p,
@@ -449,11 +440,11 @@ impl CellBuilder {
 
     /// `VECTOR_EDGE_NODE_TABLE_RECORD` (96): VET with f32 SM coordinates.
     fn parse_vet(&mut self, p: &mut Cursor<&[u8]>, payload_len: usize) -> Result<()> {
-        if payload_len < 4 {
+        let Ok(n_edges) = read_u32(p) else {
             tracing::warn!(payload_len, "VET record too short");
             return Ok(());
-        }
-        let n_edges = read_u32(p)? as usize;
+        };
+        let n_edges = n_edges as usize;
         for _ in 0..n_edges {
             if p.position() as usize + 8 > payload_len {
                 break;
@@ -476,11 +467,11 @@ impl CellBuilder {
 
     /// `VECTOR_CONNECTED_NODE_TABLE_RECORD` (97): VCT with f32 SM coordinates.
     fn parse_vct(&mut self, p: &mut Cursor<&[u8]>, payload_len: usize) -> Result<()> {
-        if payload_len < 4 {
+        let Ok(n_nodes) = read_u32(p) else {
             tracing::warn!(payload_len, "VCT record too short");
             return Ok(());
-        }
-        let n_nodes = read_u32(p)? as usize;
+        };
+        let n_nodes = n_nodes as usize;
         for _ in 0..n_nodes {
             if p.position() as usize + 12 > payload_len {
                 break;
@@ -501,12 +492,11 @@ impl CellBuilder {
 
     /// `VECTOR_EDGE_NODE_TABLE_EXT_RECORD` (85): VET with i16 scaled SM coordinates.
     fn parse_vet_ext(&mut self, p: &mut Cursor<&[u8]>, payload_len: usize) -> Result<()> {
-        if payload_len < 12 {
+        let (Ok(scale_factor), Ok(n_edges)) = (read_f64(p), read_u32(p)) else {
             tracing::warn!(payload_len, "VET_EXT record too short");
             return Ok(());
-        }
-        let scale_factor = read_f64(p)?;
-        let n_edges = read_u32(p)? as usize;
+        };
+        let n_edges = n_edges as usize;
         for _ in 0..n_edges {
             if p.position() as usize + 8 > payload_len {
                 break;
@@ -529,12 +519,11 @@ impl CellBuilder {
 
     /// `VECTOR_CONNECTED_NODE_TABLE_EXT_RECORD` (86): VCT with i16 scaled SM coords.
     fn parse_vct_ext(&mut self, p: &mut Cursor<&[u8]>, payload_len: usize) -> Result<()> {
-        if payload_len < 12 {
+        let (Ok(scale_factor), Ok(n_nodes)) = (read_f64(p), read_u32(p)) else {
             tracing::warn!(payload_len, "VCT_EXT record too short");
             return Ok(());
-        }
-        let scale_factor = read_f64(p)?;
-        let n_nodes = read_u32(p)? as usize;
+        };
+        let n_nodes = n_nodes as usize;
         for _ in 0..n_nodes {
             if p.position() as usize + 8 > payload_len {
                 break;
@@ -1698,5 +1687,432 @@ mod tests {
             (area - 25.0).abs() < 1e-6,
             "COVR area intact when NOCOVR is outside, got {area}"
         );
+    }
+
+    // ── CellBuilder record parsers ───────────────────────────────────────
+
+    /// Little-endian byte builder for synthetic OSENC payloads.
+    #[derive(Default)]
+    struct Bytes(Vec<u8>);
+
+    impl Bytes {
+        fn u8(mut self, v: u8) -> Self {
+            self.0.push(v);
+            self
+        }
+        fn u16(mut self, v: u16) -> Self {
+            self.0.extend(v.to_le_bytes());
+            self
+        }
+        fn i16(mut self, v: i16) -> Self {
+            self.0.extend(v.to_le_bytes());
+            self
+        }
+        fn u32(mut self, v: u32) -> Self {
+            self.0.extend(v.to_le_bytes());
+            self
+        }
+        fn i32(mut self, v: i32) -> Self {
+            self.0.extend(v.to_le_bytes());
+            self
+        }
+        fn f32(mut self, v: f32) -> Self {
+            self.0.extend(v.to_le_bytes());
+            self
+        }
+        fn f64(mut self, v: f64) -> Self {
+            self.0.extend(v.to_le_bytes());
+            self
+        }
+        fn raw(mut self, v: &[u8]) -> Self {
+            self.0.extend_from_slice(v);
+            self
+        }
+        /// The unused 4×f64 extent that line, multipoint and area headers open with.
+        fn extent(self) -> Self {
+            self.f64(0.0).f64(0.0).f64(0.0).f64(0.0)
+        }
+    }
+
+    /// A decrypted SENC stream: the `SERVER_STATUS` + version prologue
+    /// `parse_file` requires, followed by `records`.
+    fn senc_stream(records: Vec<(u16, Bytes)>) -> Vec<u8> {
+        let status = Bytes::default().u16(1).u16(1).u16(1).u16(30).u16(0).u16(0);
+        let version = Bytes::default().u16(201);
+        [
+            (SERVER_STATUS_RECORD, status),
+            (HEADER_SENC_VERSION, version),
+        ]
+        .into_iter()
+        .chain(records)
+        .fold(Bytes::default(), |out, (rec_type, payload)| {
+            let rec_len = u32::try_from(payload.0.len() + 6).unwrap();
+            out.u16(rec_type).u32(rec_len).raw(&payload.0)
+        })
+        .0
+    }
+
+    /// Runs one record parser the way `parse_file` does: a fresh cursor over
+    /// the payload, plus the payload's length.
+    fn feed<R>(
+        b: &mut CellBuilder,
+        payload: &[u8],
+        parse: impl FnOnce(&mut CellBuilder, &mut Cursor<&[u8]>, usize) -> R,
+    ) -> R {
+        parse(b, &mut Cursor::new(payload), payload.len())
+    }
+
+    /// A builder with an open feature for attribute/geometry records to attach to.
+    fn builder_with_feature() -> CellBuilder {
+        CellBuilder {
+            current: Some(RawFeature {
+                type_code: 1,
+                id: 1,
+                primitive: 0,
+                attributes: Vec::new(),
+                raw_geometry: RawGeometry::None,
+            }),
+            ..CellBuilder::default()
+        }
+    }
+
+    fn current_feature(b: &CellBuilder) -> &RawFeature {
+        b.current.as_ref().expect("builder has an open feature")
+    }
+
+    fn vet_points(b: &CellBuilder) -> Vec<(u32, Vec<[f64; 2]>)> {
+        let mut edges: Vec<_> = b.vet.iter().map(|(&k, e)| (k, e.points.clone())).collect();
+        edges.sort_by_key(|&(k, _)| k);
+        edges
+    }
+
+    fn vct_coords(b: &CellBuilder) -> Vec<(u32, [f64; 2])> {
+        let mut nodes: Vec<_> = b.vct.iter().map(|(&k, n)| (k, [n.lon, n.lat])).collect();
+        nodes.sort_by_key(|&(k, _)| k);
+        nodes
+    }
+
+    #[test]
+    fn parse_file_decodes_header_and_keeps_last_feature() {
+        let data = senc_stream(vec![
+            (HEADER_CELL_NATIVESCALE, Bytes::default().u32(50_000)),
+            (HEADER_CELL_NAME, Bytes::default().raw(b"TEST01\0")),
+            (FEATURE_ID_RECORD, Bytes::default().u16(42).u16(7).u8(0)),
+            (
+                FEATURE_GEOMETRY_RECORD_POINT,
+                Bytes::default().f64(54.5).f64(10.25),
+            ),
+        ]);
+        let cell = parse_file("test.oesu".to_owned(), &data).unwrap();
+        assert_eq!(cell.name, "TEST01");
+        assert_eq!(cell.native_scale, 50_000);
+        let [feature] = cell.features.as_slice() else {
+            panic!("expected exactly one feature, got {:?}", cell.features);
+        };
+        assert_eq!((feature.type_code, feature.id), (42, 7));
+        let Geometry::Point(p) = &feature.geometry else {
+            panic!("expected a point, got {:?}", feature.geometry);
+        };
+        assert_eq!((p.x(), p.y()), (10.25, 54.5), "record stores lat, then lon");
+    }
+
+    /// A record shorter than its fixed header is logged and skipped: the cell
+    /// still parses, and the record attaches nothing to the open feature.
+    #[test]
+    fn short_records_are_skipped_without_error() {
+        type Parser = fn(&mut CellBuilder, &mut Cursor<&[u8]>, usize) -> Result<()>;
+        let cases: [(&str, usize, Parser); 11] = [
+            ("CELL_EXTENT", 64, CellBuilder::parse_cell_extent),
+            ("TXTDSC", 8, |b, p, n| {
+                b.parse_txtdsc(p, n);
+                Ok(())
+            }),
+            ("FEATURE_ATTRIBUTE", 3, CellBuilder::parse_feature_attribute),
+            ("GEOM_POINT", 16, CellBuilder::parse_geometry_point),
+            ("GEOM_LINE", 36, CellBuilder::parse_geometry_line),
+            ("GEOM_AREA_EXT", 52, |b, p, n| {
+                b.parse_geometry_area_ext(p, n);
+                Ok(())
+            }),
+            (
+                "GEOM_MULTIPOINT",
+                36,
+                CellBuilder::parse_geometry_multipoint,
+            ),
+            ("VET", 4, CellBuilder::parse_vet),
+            ("VCT", 4, CellBuilder::parse_vct),
+            ("VET_EXT", 12, CellBuilder::parse_vet_ext),
+            ("VCT_EXT", 12, CellBuilder::parse_vct_ext),
+        ];
+        for (name, header_len, parse) in cases {
+            let mut b = builder_with_feature();
+            let result = feed(&mut b, &vec![0; header_len - 1], parse);
+            assert!(result.is_ok(), "{name}: {result:?}");
+            let feature = current_feature(&b);
+            assert!(matches!(feature.raw_geometry, RawGeometry::None), "{name}");
+            assert!(feature.attributes.is_empty(), "{name}");
+            assert!(b.text_descriptions.is_empty(), "{name}");
+            assert!(b.vet.is_empty() && b.vct.is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn cell_extent_takes_outer_bounds_of_corners_and_centres_reference() {
+        let mut b = CellBuilder::default();
+        // (lat, lon) corners in SW, NW, NE, SE order, skewed so that each
+        // bound comes from a different corner.
+        let payload = Bytes::default()
+            .f64(54.0)
+            .f64(10.0)
+            .f64(55.0)
+            .f64(9.5)
+            .f64(55.5)
+            .f64(11.0)
+            .f64(54.5)
+            .f64(12.0);
+        feed(&mut b, &payload.0, CellBuilder::parse_cell_extent).unwrap();
+        assert_eq!(b.bounds, [9.5, 54.0, 12.0, 55.5]);
+        assert_eq!((b.ref_lon, b.ref_lat), (10.75, 54.75));
+    }
+
+    #[test]
+    fn txtdsc_stores_content_under_its_file_name() {
+        let mut b = CellBuilder::default();
+        let payload = Bytes::default()
+            .u32(6)
+            .u32(6)
+            .raw(b"a.txt\0")
+            .raw(b"Hello\0");
+        feed(&mut b, &payload.0, CellBuilder::parse_txtdsc);
+        assert_eq!(
+            b.text_descriptions,
+            HashMap::from([("a.txt".to_owned(), "Hello".to_owned())])
+        );
+    }
+
+    #[test]
+    fn feature_id_closes_previous_feature_and_opens_next() {
+        let mut b = CellBuilder::default();
+        for payload in [
+            Bytes::default().u16(42).u16(7).u8(1),
+            Bytes::default().u16(43).u16(8).u8(2),
+        ] {
+            feed(&mut b, &payload.0, CellBuilder::parse_feature_id).unwrap();
+        }
+        let closed: Vec<_> = b
+            .raw_features
+            .iter()
+            .map(|f| (f.type_code, f.id, f.primitive))
+            .collect();
+        assert_eq!(closed, [(42, 7, 1)]);
+        let open = current_feature(&b);
+        assert_eq!((open.type_code, open.id, open.primitive), (43, 8, 2));
+    }
+
+    #[test]
+    fn short_feature_id_closes_previous_feature_without_opening_one() {
+        let mut b = builder_with_feature();
+        feed(&mut b, &[0; 4], CellBuilder::parse_feature_id).unwrap();
+        assert_eq!(b.raw_features.len(), 1);
+        assert!(b.current.is_none());
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // 0.5 round-trips through f64 bytes exactly
+    fn feature_attribute_decodes_each_value_type_at_its_minimum_length() {
+        let mut b = builder_with_feature();
+        for payload in [
+            Bytes::default().u16(1).u8(0).u32(12),
+            Bytes::default().u16(2).u8(2).f64(0.5),
+            // Unterminated: the string runs to the end of the payload.
+            Bytes::default().u16(3).u8(4).raw(b"BUOY"),
+            Bytes::default().u16(4).u8(4),
+        ] {
+            feed(&mut b, &payload.0, CellBuilder::parse_feature_attribute).unwrap();
+        }
+        let attrs = &current_feature(&b).attributes;
+        let [int, double, string, empty] = attrs.as_slice() else {
+            panic!("expected four attributes, got {attrs:?}");
+        };
+        assert!(
+            matches!(
+                int,
+                Attribute {
+                    code: 1,
+                    value: AttrValue::Int(12)
+                }
+            ),
+            "{int:?}"
+        );
+        assert!(
+            matches!(double, Attribute { code: 2, value: AttrValue::Double(v) } if *v == 0.5),
+            "{double:?}"
+        );
+        assert!(
+            matches!(string, Attribute { code: 3, value: AttrValue::Str(s) } if s == "BUOY"),
+            "{string:?}"
+        );
+        assert!(
+            matches!(empty, Attribute { code: 4, value: AttrValue::Str(s) } if s.is_empty()),
+            "{empty:?}"
+        );
+    }
+
+    /// An entry count larger than the payload holds keeps the entries that
+    /// fit instead of failing the cell; the same holds for the line,
+    /// multipoint and vector-table parsers below.
+    #[test]
+    fn geometry_line_keeps_the_edge_refs_the_payload_holds() {
+        for (payload, expected) in [
+            (
+                Bytes::default()
+                    .extent()
+                    .u32(2)
+                    .i32(10)
+                    .i32(20)
+                    .i32(11)
+                    .i32(1),
+                vec![[10, 20, 11, 1]],
+            ),
+            (Bytes::default().extent().u32(1), vec![]),
+        ] {
+            let mut b = builder_with_feature();
+            feed(&mut b, &payload.0, CellBuilder::parse_geometry_line).unwrap();
+            let geometry = &current_feature(&b).raw_geometry;
+            let RawGeometry::Line(refs) = geometry else {
+                panic!("expected a line, got {geometry:?}");
+            };
+            assert_eq!(refs, &expected);
+        }
+    }
+
+    #[test]
+    fn geometry_multipoint_keeps_the_soundings_the_payload_holds() {
+        for (payload, expected) in [
+            (
+                Bytes::default()
+                    .extent()
+                    .u32(2)
+                    .f32(1.5)
+                    .f32(-2.5)
+                    .f32(3.25),
+                vec![[1.5, -2.5, 3.25]],
+            ),
+            (Bytes::default().extent().u32(1), vec![]),
+        ] {
+            let mut b = builder_with_feature();
+            feed(&mut b, &payload.0, CellBuilder::parse_geometry_multipoint).unwrap();
+            let geometry = &current_feature(&b).raw_geometry;
+            let RawGeometry::Sounding(points) = geometry else {
+                panic!("expected soundings, got {geometry:?}");
+            };
+            assert_eq!(points, &expected);
+        }
+    }
+
+    #[test]
+    fn geometry_area_ext_reads_edge_refs_after_the_52_byte_header() {
+        let mut b = builder_with_feature();
+        // extent, contour/triprim/edge counts, scale_factor, one edge ref.
+        let payload = Bytes::default()
+            .extent()
+            .u32(0)
+            .u32(0)
+            .u32(1)
+            .f64(10.0)
+            .i32(1)
+            .i32(2)
+            .i32(3)
+            .i32(0);
+        feed(&mut b, &payload.0, CellBuilder::parse_geometry_area_ext);
+        let geometry = &current_feature(&b).raw_geometry;
+        let RawGeometry::Area { edge_refs, .. } = geometry else {
+            panic!("expected an area, got {geometry:?}");
+        };
+        assert_eq!(edge_refs, &[[1, 2, 3, 0]]);
+    }
+
+    #[test]
+    fn vet_keeps_the_edges_and_points_the_payload_holds() {
+        // One edge whose single point ends exactly at the payload end.
+        let mut b = CellBuilder::default();
+        let exact = Bytes::default().u32(1).u32(7).u32(1).f32(1.5).f32(-2.5);
+        feed(&mut b, &exact.0, CellBuilder::parse_vet).unwrap();
+        assert_eq!(vet_points(&b), [(7, vec![[1.5, -2.5]])]);
+
+        // Three edges claimed; the second claims two points but the payload
+        // ends after its header.
+        let mut b = CellBuilder::default();
+        let truncated = Bytes::default()
+            .u32(3)
+            .u32(7)
+            .u32(1)
+            .f32(1.5)
+            .f32(-2.5)
+            .u32(9)
+            .u32(2);
+        feed(&mut b, &truncated.0, CellBuilder::parse_vet).unwrap();
+        assert_eq!(vet_points(&b), [(7, vec![[1.5, -2.5]]), (9, vec![])]);
+    }
+
+    #[test]
+    fn vct_keeps_the_nodes_the_payload_holds() {
+        let mut b = CellBuilder::default();
+        let payload = Bytes::default()
+            .u32(3)
+            .u32(7)
+            .f32(1.5)
+            .f32(-2.5)
+            .u32(9)
+            .f32(3.0)
+            .f32(4.0);
+        feed(&mut b, &payload.0, CellBuilder::parse_vct).unwrap();
+        assert_eq!(vct_coords(&b), [(7, [1.5, -2.5]), (9, [3.0, 4.0])]);
+    }
+
+    #[test]
+    fn vet_ext_divides_by_scale_factor_and_keeps_what_the_payload_holds() {
+        // One edge whose single point ends exactly at the payload end.
+        let mut b = CellBuilder::default();
+        let exact = Bytes::default()
+            .f64(10.0)
+            .u32(1)
+            .u32(7)
+            .u32(1)
+            .i16(15)
+            .i16(-25);
+        feed(&mut b, &exact.0, CellBuilder::parse_vet_ext).unwrap();
+        assert_eq!(vet_points(&b), [(7, vec![[1.5, -2.5]])]);
+
+        // Three edges claimed; the second claims two points but the payload
+        // ends after its header.
+        let mut b = CellBuilder::default();
+        let truncated = Bytes::default()
+            .f64(10.0)
+            .u32(3)
+            .u32(7)
+            .u32(1)
+            .i16(15)
+            .i16(-25)
+            .u32(9)
+            .u32(2);
+        feed(&mut b, &truncated.0, CellBuilder::parse_vet_ext).unwrap();
+        assert_eq!(vet_points(&b), [(7, vec![[1.5, -2.5]]), (9, vec![])]);
+    }
+
+    #[test]
+    fn vct_ext_divides_by_scale_factor_and_keeps_what_the_payload_holds() {
+        let mut b = CellBuilder::default();
+        let payload = Bytes::default()
+            .f64(10.0)
+            .u32(3)
+            .u32(7)
+            .i16(15)
+            .i16(-25)
+            .u32(9)
+            .i16(30)
+            .i16(40);
+        feed(&mut b, &payload.0, CellBuilder::parse_vct_ext).unwrap();
+        assert_eq!(vct_coords(&b), [(7, [1.5, -2.5]), (9, [3.0, 4.0])]);
     }
 }
