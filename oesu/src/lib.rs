@@ -1197,7 +1197,7 @@ fn parse_area_payload(
 
     // Per-contour vertex counts (contour_count × u32).
     let n_contours = contour_count as usize;
-    let mut vertex_counts = Vec::with_capacity(n_contours);
+    let mut vertex_counts = Vec::new();
     for k in 0..n_contours {
         anyhow::ensure!(
             p.position() as usize + 4 <= payload_len,
@@ -1207,7 +1207,7 @@ fn parse_area_payload(
     }
 
     // TriPrim chain.
-    let mut tri_prims = Vec::with_capacity(triprim_count);
+    let mut tri_prims = Vec::new();
     for k in 0..triprim_count {
         anyhow::ensure!(
             p.position() as usize + 5 <= payload_len,
