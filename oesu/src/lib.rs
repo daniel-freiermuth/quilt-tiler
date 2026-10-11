@@ -2425,6 +2425,35 @@ mod tests {
         assert_eq!(vet_points(&b), [(7, vec![[1.5, -2.5]])]);
     }
 
+    /// AREA/AREA_EXT headers are untrusted too: a `u32::MAX` contour or
+    /// `TriPrim` count over an empty body is a truncation error, not a
+    /// 16/256 GiB pre-allocation that aborts the process.
+    #[test]
+    fn area_payload_huge_counts_are_truncation_errors() {
+        for ext in [false, true] {
+            for (contours, triprims, expected) in [
+                (u32::MAX, 0, "truncated vertex count array"),
+                (0, u32::MAX, "truncated TriPrim header"),
+            ] {
+                let mut payload = Bytes::default().extent().u32(contours).u32(triprims).u32(0);
+                if ext {
+                    payload = payload.f64(10.0);
+                }
+                let err = parse_area_payload(
+                    &mut Cursor::new(payload.0.as_slice()),
+                    payload.0.len(),
+                    ext,
+                    10.0,
+                    0.0,
+                    0.0,
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(err.contains(expected), "ext={ext}: {err}");
+            }
+        }
+    }
+
     #[test]
     fn duplicate_vet_and_vct_indices_keep_the_last_record() {
         let mut b = CellBuilder::default();
