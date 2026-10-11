@@ -2425,7 +2425,7 @@ mod tests {
         assert_eq!(vet_points(&b), [(7, vec![[1.5, -2.5]])]);
     }
 
-    /// AREA/AREA_EXT headers are untrusted too: a `u32::MAX` contour or
+    /// `AREA`/`AREA_EXT` headers are untrusted too: a `u32::MAX` contour or
     /// `TriPrim` count over an empty body is a truncation error, not a
     /// 16/256 GiB pre-allocation that aborts the process.
     #[test]
