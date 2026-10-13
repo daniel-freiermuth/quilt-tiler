@@ -10,6 +10,21 @@
 
 const STYLE_JSON: &str = include_str!("style.json");
 
+/// Check that `safety_depth` / `shoal_depth` can serve as the DEPARE `step`
+/// stops: `MapLibre` requires literal numeric stops in strictly ascending
+/// order, so both must be finite and `safety_depth < shoal_depth`.
+///
+/// # Errors
+/// Returns an error describing the offending pair otherwise.
+pub fn validate_depths(safety_depth: f64, shoal_depth: f64) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        safety_depth.is_finite() && shoal_depth.is_finite() && safety_depth < shoal_depth,
+        "safety depth ({safety_depth}) and shoal depth ({shoal_depth}) must be finite with \
+         safety depth < shoal depth"
+    );
+    Ok(())
+}
+
 /// Build a `MapLibre` GL style JSON string with configurable depth styling.
 ///
 /// # Parameters
@@ -24,8 +39,9 @@ const STYLE_JSON: &str = include_str!("style.json");
 /// * `min_zoom` / `max_zoom` — zoom range for the tile source.
 ///
 /// # Errors
-/// Returns an error if the embedded `style.json` is malformed or the built
-/// style cannot be serialised.
+/// Returns an error if the depths are rejected by [`validate_depths`], the
+/// embedded `style.json` is malformed, or the built style cannot be
+/// serialised.
 pub fn build_style(
     safety_depth: f64,
     shoal_depth: f64,
@@ -35,6 +51,8 @@ pub fn build_style(
 ) -> anyhow::Result<String> {
     use anyhow::Context;
     use serde_json::{Value, json};
+
+    validate_depths(safety_depth, shoal_depth)?;
 
     let mut style: Value =
         serde_json::from_str(STYLE_JSON).context("embedded style.json is not valid JSON")?;
