@@ -201,6 +201,8 @@ fn output_identity(args: &Args) -> (String, String, String) {
 
 /// Convert decrypted `OESU`/`OSENC` vector cells into an MVT `PMTiles` archive.
 fn run_vector(args: &Args) -> Result<()> {
+    // Fail before the (slow) tile conversion rather than after it.
+    style::validate_depths(args.safety_depth, args.shoal_depth)?;
     let cells: Vec<s57::S57Cell> = loader::load_s57_cells(&args.input, args.zoom_offset);
     let quilt = tiles::Quilt::new(cells, args.zoom_offset, args.sparse);
 
