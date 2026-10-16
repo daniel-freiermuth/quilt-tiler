@@ -2425,6 +2425,18 @@ mod tests {
         assert_eq!(vet_points(&b), [(7, vec![[1.5, -2.5]])]);
     }
 
+    /// COVR/NOCOVR point counts are untrusted too: a `u32::MAX` count must be
+    /// rejected as truncated, not pre-allocated (64 GiB of `Coord`s).
+    #[test]
+    fn huge_covr_count_is_rejected_without_preallocation() {
+        let covr = Bytes::default().u32(u32::MAX).f32(1.5).f32(-2.5);
+        let covr_len = covr.0.len();
+        assert_eq!(
+            parse_covr_payload(&mut Cursor::new(covr.0.as_slice()), covr_len),
+            None
+        );
+    }
+
     /// `AREA`/`AREA_EXT` headers are untrusted too: a `u32::MAX` contour or
     /// `TriPrim` count over an empty body is a truncation error, not a
     /// 16/256 GiB pre-allocation that aborts the process.
