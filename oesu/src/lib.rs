@@ -1141,7 +1141,7 @@ fn parse_covr_payload(p: &mut Cursor<&[u8]>, payload_len: usize) -> Option<LineS
         return None;
     }
     let count = read_u32(p).ok()? as usize;
-    let mut coords = Vec::with_capacity(count);
+    let mut coords = Vec::new();
     for _ in 0..count {
         let lat = read_f32(p).ok()?;
         let lon = read_f32(p).ok()?;
@@ -1830,6 +1830,35 @@ mod tests {
         assert_eq!((p.x(), p.y()), (10.25, 54.5), "record stores lat, then lon");
     }
 
+    /// A COVR record's `(lat, lon)` f32 pairs become the cell's coverage
+    /// ring in `[lon, lat]` WGS84 degrees, with no SM conversion.
+    #[test]
+    fn parse_file_builds_coverage_from_covr_lat_lon_pairs() {
+        let covr = Bytes::default()
+            .u32(4)
+            .f32(54.0)
+            .f32(10.0)
+            .f32(54.0)
+            .f32(11.5)
+            .f32(55.25)
+            .f32(10.0)
+            .f32(54.0)
+            .f32(10.0);
+        let data = senc_stream(vec![
+            (HEADER_CELL_NATIVESCALE, Bytes::default().u32(50_000)),
+            (CELL_COVR_RECORD, covr),
+        ]);
+        let cell = parse_file("test.oesu".to_owned(), &data).unwrap();
+        let [polygon] = cell.coverage.0.as_slice() else {
+            panic!("expected one coverage polygon, got {:?}", cell.coverage);
+        };
+        let ring: Vec<_> = polygon.exterior().coords().map(|c| (c.x, c.y)).collect();
+        assert_eq!(
+            ring,
+            [(10.0, 54.0), (11.5, 54.0), (10.0, 55.25), (10.0, 54.0)]
+        );
+    }
+
     /// A record shorter than its fixed header is logged and skipped: the cell
     /// still parses, and the record attaches nothing to the open feature.
     #[test]
@@ -2423,6 +2452,18 @@ mod tests {
             .i16(-25);
         feed(&mut b, &vet_ext.0, CellBuilder::parse_vet_ext).unwrap();
         assert_eq!(vet_points(&b), [(7, vec![[1.5, -2.5]])]);
+    }
+
+    /// COVR/NOCOVR point counts are untrusted too: a `u32::MAX` count must be
+    /// rejected as truncated, not pre-allocated (64 GiB of `Coord`s).
+    #[test]
+    fn huge_covr_count_is_rejected_without_preallocation() {
+        let covr = Bytes::default().u32(u32::MAX).f32(1.5).f32(-2.5);
+        let covr_len = covr.0.len();
+        assert_eq!(
+            parse_covr_payload(&mut Cursor::new(covr.0.as_slice()), covr_len),
+            None
+        );
     }
 
     /// `AREA`/`AREA_EXT` headers are untrusted too: a `u32::MAX` contour or
