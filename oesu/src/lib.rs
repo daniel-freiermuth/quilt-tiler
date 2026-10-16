@@ -1141,7 +1141,7 @@ fn parse_covr_payload(p: &mut Cursor<&[u8]>, payload_len: usize) -> Option<LineS
         return None;
     }
     let count = read_u32(p).ok()? as usize;
-    let mut coords = Vec::with_capacity(count);
+    let mut coords = Vec::new();
     for _ in 0..count {
         let lat = read_f32(p).ok()?;
         let lon = read_f32(p).ok()?;
