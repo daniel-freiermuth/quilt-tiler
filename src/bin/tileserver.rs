@@ -378,6 +378,8 @@ async fn main() -> Result<()> {
     let raster_count = args.input.iter().filter(|p| loader::is_rnc(p)).count();
     let sources = match raster_count {
         0 => {
+            // Fail at startup rather than serving 500s from `/style.json`.
+            style::validate_depths(args.safety_depth, args.shoal_depth)?;
             let cells = loader::load_s57_cells(&args.input, args.zoom_offset);
             anyhow::ensure!(!cells.is_empty(), "no vector cells parsed from input");
             let (min_zoom, max_zoom, _bounds) =
@@ -513,8 +515,8 @@ mod tests {
             },
             cache: None,
             public_url: Some("http://chart.test".into()),
-            safety_depth: 10.0,
-            shoal_depth: 2.0,
+            safety_depth: 3.0,
+            shoal_depth: 10.0,
             zoom_offset: 0.0,
             build_id: "v-test".to_string(),
         })
