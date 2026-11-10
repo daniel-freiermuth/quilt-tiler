@@ -44,6 +44,10 @@ pub struct RncCell {
     /// equally-zoom-fit tile candidates — not a general identity/ordering
     /// for this type, so `RncCell` deliberately has no `Eq`/`Ord` impl.
     edition_date: EditionDate,
+    /// Pixel width of grid subtile 0, read from its PNG header at parse
+    /// time (subtiles are uniformly sized in practice). `None` if that
+    /// header is unreadable, so callers can't tell the source resolution.
+    subtile_width: Option<u32>,
     /// Lazily-decoded subtile cache, keyed by grid index `row * cols + col`.
     cache: Mutex<HashMap<u32, Arc<RgbaImage>>>,
 }
@@ -81,6 +85,12 @@ impl RncCell {
         }
         let native_scale = footer.scale.round().min(f64::from(u32::MAX)) as u32;
         let edition_date = EditionDate::from_ddmmyyyy(&footer.edate);
+        let subtile_width = header.tile_bytes(&data, 0, 0).and_then(|bytes| {
+            image::ImageReader::with_format(std::io::Cursor::new(bytes), image::ImageFormat::Png)
+                .into_dimensions()
+                .ok()
+                .map(|(width, _)| width)
+        });
 
         Ok(Self {
             name,
@@ -91,6 +101,7 @@ impl RncCell {
             merc,
             native_scale,
             edition_date,
+            subtile_width,
             cache: Mutex::new(HashMap::new()),
         })
     }
@@ -121,6 +132,11 @@ impl RncCell {
 
     pub const fn rows(&self) -> u32 {
         self.header.rows
+    }
+
+    /// Pixel width of grid subtile 0; `None` if its PNG header is unreadable.
+    pub const fn subtile_width(&self) -> Option<u32> {
+        self.subtile_width
     }
 
     /// Cell extent in this format's Mercator metres: `(xmin, ymin, xmax, ymax)`.

@@ -82,6 +82,16 @@ pub trait TileSource: Sync {
     /// Native display scale denominator (e.g. `50_000` for 1:50 000).
     fn native_scale(&self) -> u32;
 
+    /// Finest zoom at which rendering this item still gains detail.  At any
+    /// finer zoom its render is this zoom's render, just magnified — so a
+    /// sparse quilt may leave such tiles out and let the client slice
+    /// (vector) or upscale (raster) the ancestor instead.
+    ///
+    /// Never coarser than the item's native zoom
+    /// (`zoom::zoom_from_scale(native_scale, zoom_offset)`).  Called once per
+    /// item per quilt, so a scan over the item's content is fine.
+    fn detail_zoom(&self, zoom_offset: f64) -> u8;
+
     /// This item's recency/priority ranking — see [`Self::Tiebreaker`].
     fn tiebreak(&self) -> Self::Tiebreaker;
 

@@ -15,6 +15,19 @@ quilt-tiler -o chart.pmtiles <input-charts>          # vector: .oesu/.osenc cell
 quilt-tiler -o chart.pmtiles <cells>/*.rnc            # raster: rnc cells
 ```
 
+### Sparse output
+
+`--sparse` (batch and `tileserver`) leaves out every tile whose charts already show all their detail at a
+coarser zoom — most fine-zoom tiles over areas only coarse charts cover. The client rebuilds those from
+the nearest stored ancestor, so it must treat a missing tile as "use the parent":
+
+- Vector: `MapLibre` GL JS ≥ 6.17, whose experimental `sparse` source flag the generated style sets.
+  Older clients and other renderers show nothing there.
+- Raster: `MapLibre` falls back natively.
+- Missing tiles must arrive as **404**: `tileserver` does; tileserver-gl does via the archive's
+  `sparse` metadata; a `pmtiles://` protocol handler must reject them with a 404 status. martin answers
+  204 (per the MapLibre PR discussion), which disables the fallback.
+
 ## Development
 
 ```
