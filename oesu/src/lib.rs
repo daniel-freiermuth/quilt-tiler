@@ -645,6 +645,12 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
             break;
         }
         let payload_len = (rec_len - 6) as usize;
+        let remaining = data.len().saturating_sub(c.position() as usize);
+        if payload_len > remaining {
+            bail!(
+                "reading payload of record type {rec_type}: declares {payload_len} bytes but only {remaining} remain"
+            );
+        }
 
         let mut payload_bytes = vec![0u8; payload_len];
         c.read_exact(&mut payload_bytes)
@@ -2278,6 +2284,21 @@ mod tests {
         let err = parse_err(&data);
         let expected = format!("reading payload of record type {HEADER_CELL_EDITION}");
         assert!(err.contains(&expected), "{err}");
+    }
+
+    #[test]
+    fn parse_file_huge_rec_len_is_rejected_before_allocating() {
+        let mut data = senc_stream(vec![(
+            HEADER_CELL_NATIVESCALE,
+            Bytes::default().u32(22_000),
+        )]);
+        // rec_len = u32::MAX must be rejected by a remaining-bytes check,
+        // not by a ~4 GiB zeroed allocation followed by a failed read.
+        data.extend(record_header(HEADER_CELL_EDITION, u32::MAX).u16(1).0);
+        let err = parse_err(&data);
+        let expected = format!("reading payload of record type {HEADER_CELL_EDITION}");
+        assert!(err.contains(&expected), "{err}");
+        assert!(err.contains("only 2 remain"), "{err}");
     }
 
     #[test]
