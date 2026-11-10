@@ -3,12 +3,15 @@
 //! For every `(z, col, row)` in the data's zoom range, candidate source items
 //! are selected by coverage overlap, sorted by zoom fit (ties broken by
 //! [`TileSource::tiebreak`] — newer edition wins), then added greedily until
-//! the tile is covered by their combined [`TileSource::Coverage`].
+//! the tile is covered by their combined [`TileSource::Coverage`].  A sparse
+//! [`Quilt`] additionally leaves out tiles a client can rebuild from an
+//! ancestor.
 
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
@@ -28,7 +31,8 @@ type EncodedTile = (u64, TileCoord, Vec<u8>);
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-/// Quilt `quilt`'s items into a `PMTiles` v3 archive at `output`. Returns
+/// Quilt `quilt`'s items into a `PMTiles` v3 archive at `output`, leaving
+/// out [`TileOutcome::Empty`] and [`TileOutcome::Omitted`] tiles. Returns
 /// `(min_zoom, max_zoom)`.
 ///
 /// # Errors
@@ -40,6 +44,7 @@ pub fn write_pmtiles<S: TileSource>(
     max_zoom: Option<u8>,
 ) -> Result<(u8, u8)> {
     let mut tile_bytes: BTreeMap<u64, (TileCoord, Vec<u8>)> = BTreeMap::new();
+    let omitted = AtomicU64::new(0);
 
     let (zoom_floor, zoom_ceil, overall) = quilt.zoom_range_and_bounds(max_zoom)?;
 
@@ -53,7 +58,11 @@ pub fn write_pmtiles<S: TileSource>(
 
     info!(
         count = quilt.items().len(),
-        zoom_floor, zoom_ceil, total_tiles, "encoding tiles",
+        zoom_floor,
+        zoom_ceil,
+        total_tiles,
+        sparse = quilt.is_sparse(),
+        "encoding tiles",
     );
     let pb = ProgressBar::new(total_tiles).with_style(bar_style());
 
@@ -79,8 +88,13 @@ pub fn write_pmtiles<S: TileSource>(
                 #[allow(clippy::cast_possible_truncation)] // idx / width < height ≤ u32::MAX
                 let row = row_lo + (idx / u64::from(width)) as u32;
 
-                let Some(bytes) = quilt.render_tile(z, col, row)? else {
-                    return Ok(None);
+                let bytes = match quilt.render_tile(z, col, row)? {
+                    TileOutcome::Rendered(bytes) => bytes,
+                    TileOutcome::Omitted => {
+                        omitted.fetch_add(1, Ordering::Relaxed);
+                        return Ok(None);
+                    }
+                    TileOutcome::Empty => return Ok(None),
                 };
                 let coord = TileCoord::new(z, col, row).context("invalid tile coord")?;
                 Ok(Some((TileId::from(coord).value(), coord, bytes)))
@@ -93,9 +107,13 @@ pub fn write_pmtiles<S: TileSource>(
             });
     }
     pb.finish_and_clear();
-    info!(encoded = tile_bytes.len(), "tiles encoded");
+    info!(
+        encoded = tile_bytes.len(),
+        omitted = omitted.into_inner(),
+        "tiles encoded"
+    );
 
-    let metadata = build_metadata();
+    let metadata = build_metadata(quilt.is_sparse());
     let file = File::create(output).with_context(|| format!("creating {}", output.display()))?;
     let mut writer = PmTilesWriter::new(S::tile_type())
         .min_zoom(zoom_floor)
@@ -123,44 +141,86 @@ pub fn write_pmtiles<S: TileSource>(
     Ok((zoom_floor, zoom_ceil))
 }
 
+/// What [`Quilt::render_tile`] produced for one tile.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TileOutcome {
+    /// Nothing to draw: no item covers the tile, or the covering items have
+    /// no content in it.
+    Empty,
+    /// Left out of a sparse quilt: the client rebuilds it from its nearest
+    /// stored ancestor (a `MapLibre` `sparse` vector source slices that
+    /// ancestor, a raster source upscales it) — see [`Quilt`]. Also reported
+    /// for a tile only bboxes (not coverage polygons) reach, when all those
+    /// items are too coarse: the ancestor is empty there too, so the client
+    /// still draws nothing.
+    Omitted,
+    /// Encoded tile bytes.
+    Rendered(Vec<u8>),
+}
+
 /// Items to quilt, plus the per-item data every tile needs, computed once.
+///
+/// # Sparse quilts
+///
+/// A sparse quilt omits a tile at zoom `z` when every item contributing to
+/// it has a [`TileSource::detail_zoom`] coarser than `z` — decided from the
+/// bbox candidates alone when they all are, skipping the polygon algebra.
+/// Such a tile equals its nearest stored ancestor clipped to it: let `D` be
+/// the finest detail zoom among its contributors. Any item overlapping the
+/// tile with a native zoom finer than `D` would sort ahead of them and
+/// contribute, so none exists — the candidate order inside the tile is
+/// therefore the same at every zoom from `D` to `z`, and each contributor
+/// renders identically at or above its detail zoom. The ancestor at `D` is
+/// stored (its contributor with detail zoom `D` keeps it), so the nearest
+/// stored ancestor lies in `D..z`. `MapLibre` searches at most 10 levels up;
+/// deeper gaps draw nothing there.
 pub struct Quilt<S> {
     items: Vec<S>,
     /// Per-item data, indexed like `items`.
     meta: Vec<ItemMeta>,
     zoom_offset: f64,
+    sparse: bool,
 }
 
 /// What [`Quilt::render_tile`] needs from an item on every tile, computed
-/// once: [`TileSource::coverage`] clones a whole polygon and the native zoom
-/// takes a `log2`.
+/// once: [`TileSource::coverage`] clones a whole polygon and the zooms take
+/// a `log2` or a feature scan.
 struct ItemMeta {
     bbox: Bbox,
     native_zoom: u8,
+    detail_zoom: u8,
 }
 
 impl<S: TileSource> Quilt<S> {
     /// `zoom_offset` shifts every item's native scale to a zoom level
-    /// (positive = finer, negative = coarser).
+    /// (positive = finer, negative = coarser). `sparse` enables
+    /// [`TileOutcome::Omitted`].
     #[must_use]
-    pub fn new(items: Vec<S>, zoom_offset: f64) -> Self {
+    pub fn new(items: Vec<S>, zoom_offset: f64, sparse: bool) -> Self {
         let meta = items
             .iter()
             .map(|item| ItemMeta {
                 bbox: item.coverage().into(),
                 native_zoom: zoom_from_scale(item.native_scale(), zoom_offset),
+                detail_zoom: item.detail_zoom(zoom_offset),
             })
             .collect();
         Self {
             items,
             meta,
             zoom_offset,
+            sparse,
         }
     }
 
     #[must_use]
     pub fn items(&self) -> &[S] {
         &self.items
+    }
+
+    #[must_use]
+    pub const fn is_sparse(&self) -> bool {
+        self.sparse
     }
 
     /// Compute `(zoom_floor, zoom_ceil, overall_bbox)`: the tile zoom range
@@ -198,15 +258,14 @@ impl<S: TileSource> Quilt<S> {
 
     /// Render one `(z, col, row)` tile from the items' combined coverage.
     ///
-    /// Returns `None` if nothing overlaps it, or [`TileAccumulator::encode`]
-    /// decides to omit it. Pure given `(z, col, row)` — no shared mutable
-    /// state across calls — so it's safe to call concurrently and on demand.
-    /// Backs both [`write_pmtiles`]'s batch loop and a live tile server.
+    /// Pure given `(z, col, row)` — no shared mutable state across calls —
+    /// so it's safe to call concurrently and on demand. Backs both
+    /// [`write_pmtiles`]'s batch loop and a live tile server.
     ///
     /// # Errors
     /// Returns an error if merging or encoding this tile's contents fails
     /// ([`TileAccumulator::push`] / [`TileAccumulator::encode`]).
-    pub fn render_tile(&self, z: u8, col: u32, row: u32) -> Result<Option<Vec<u8>>> {
+    pub fn render_tile(&self, z: u8, col: u32, row: u32) -> Result<TileOutcome> {
         profiling::scope!("tile");
         let items = &self.items;
         let meta = &self.meta;
@@ -222,7 +281,12 @@ impl<S: TileSource> Quilt<S> {
         };
 
         if candidates.is_empty() {
-            return Ok(None);
+            return Ok(TileOutcome::Empty);
+        }
+        // Contributors are a subset of candidates, so this decides the
+        // common open-water case without any polygon algebra.
+        if self.sparse && candidates.iter().all(|&i| meta[i].detail_zoom < z) {
+            return Ok(TileOutcome::Omitted);
         }
 
         {
@@ -262,7 +326,10 @@ impl<S: TileSource> Quilt<S> {
         }
 
         if contributions.is_empty() {
-            return Ok(None);
+            return Ok(TileOutcome::Empty);
+        }
+        if self.sparse && contributions.iter().all(|&(i, _)| meta[i].detail_zoom < z) {
+            return Ok(TileOutcome::Omitted);
         }
 
         let tile_merc = tile_mercator_bbox(tile_wgs84);
@@ -280,7 +347,11 @@ impl<S: TileSource> Quilt<S> {
         }
 
         let bytes = acc.encode()?;
-        Ok(if bytes.is_empty() { None } else { Some(bytes) })
+        Ok(if bytes.is_empty() {
+            TileOutcome::Empty
+        } else {
+            TileOutcome::Rendered(bytes)
+        })
     }
 }
 
@@ -307,13 +378,20 @@ fn tile_mercator_bbox(wgs84: Bbox) -> Bbox {
     }
 }
 
-fn build_metadata() -> String {
-    serde_json::json!({
+/// Archive metadata. `sparse: true` follows tileserver-gl, which then
+/// answers a missing tile with 404 (fall back to an ancestor) instead of 204
+/// (draw nothing); omitted when false so a raster archive keeps
+/// tileserver-gl's raster default.
+fn build_metadata(sparse: bool) -> String {
+    let mut metadata = serde_json::json!({
         "name": "chart",
         "description": "Nautical chart — converted from OESU",
         "vector_layers": []
-    })
-    .to_string()
+    });
+    if sparse {
+        metadata["sparse"] = serde_json::Value::Bool(true);
+    }
+    metadata.to_string()
 }
 
 #[cfg(test)]
@@ -325,8 +403,20 @@ mod tests {
 
     /// Build a minimal single-tile `.rnc` byte buffer: one `8×8` solid-color
     /// PNG, rectangular `cover` (the bbox itself), given `edate`.
-    #[allow(clippy::cast_possible_truncation)] // test PNG size is a tiny constant
     fn build_rnc(bbox: Bbox, color: [u8; 4], scale: f64, edate: &str) -> Vec<u8> {
+        build_rnc_covered(bbox, &[], color, scale, edate)
+    }
+
+    /// [`build_rnc`] with an explicit `cover`: rings of `(lon, lat)` vertices
+    /// (empty: the bbox itself).
+    #[allow(clippy::cast_possible_truncation)] // test PNG size is a tiny constant
+    fn build_rnc_covered(
+        bbox: Bbox,
+        cover: &[&[(f64, f64)]],
+        color: [u8; 4],
+        scale: f64,
+        edate: &str,
+    ) -> Vec<u8> {
         let img = image::RgbaImage::from_pixel(8, 8, Rgba(color));
         let mut png = Vec::new();
         img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
@@ -345,7 +435,16 @@ mod tests {
         }
         buf.extend_from_slice(&png);
         let footer = serde_json::json!({
-            "cover": [],
+            "cover": cover
+                .iter()
+                .map(|ring| {
+                    ring.iter()
+                        .flat_map(|&(lon, lat)| {
+                            <[f64; 2]>::from(rnc_format::wgs84_to_rnc_merc(lon, lat))
+                        })
+                        .collect::<Vec<f64>>()
+                })
+                .collect::<Vec<_>>(),
             "lat0": bbox.south, "lat1": bbox.north,
             "lon0": bbox.west, "lon1": bbox.east,
             "edate": edate, "name": "TEST", "scale": scale,
@@ -388,10 +487,10 @@ mod tests {
 
         // Older listed first: only the tiebreak (not array order) should
         // determine which one wins.
-        let bytes = Quilt::new(vec![older, newer], 0.0)
-            .render_tile(z, col, row)
-            .expect("render_tile succeeds")
-            .expect("tile has coverage");
+        let quilt = Quilt::new(vec![older, newer], 0.0, false);
+        let TileOutcome::Rendered(bytes) = quilt.render_tile(z, col, row).expect("renders") else {
+            panic!("tile has coverage");
+        };
         let img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
             .expect("re-decodes")
             .to_rgba8();
@@ -418,9 +517,83 @@ mod tests {
         );
     }
 
+    /// A sparse quilt must store every tile some contributor still adds
+    /// detail to — including mixed tiles — omit the rest, and keep reporting
+    /// uncovered tiles as `Empty` (a live server answers those 204, not 404).
+    #[test]
+    fn sparse_quilt_omits_exactly_the_tiles_past_every_contributors_detail_zoom() {
+        let coarse = RncCell::parse(
+            "COARSE".to_owned(),
+            build_rnc(
+                Bbox {
+                    west: 10.0,
+                    south: 56.0,
+                    east: 11.0,
+                    north: 57.0,
+                },
+                [200, 30, 30, 255],
+                3_000_000.0,
+                "01/01/2026",
+            ),
+        )
+        .expect("coarse cell parses");
+        let fine = RncCell::parse(
+            "FINE".to_owned(),
+            build_rnc(
+                Bbox {
+                    west: 10.4,
+                    south: 56.4,
+                    east: 10.6,
+                    north: 56.6,
+                },
+                [30, 200, 30, 255],
+                50_000.0,
+                "01/01/2026",
+            ),
+        )
+        .expect("fine cell parses");
+        assert_eq!(
+            (coarse.detail_zoom(0.0), fine.detail_zoom(0.0)),
+            (7, 13),
+            "fixture sanity: native zooms decide both detail zooms"
+        );
+
+        let sparse = Quilt::new(vec![coarse, fine], 0.0, true);
+        let outcome = |lon: f64, lat: f64, z: u8| {
+            let (col, row, _, _) = bbox_to_xyz(lon, lat, lon, lat, z);
+            match sparse.render_tile(z, col, row).expect("renders") {
+                TileOutcome::Empty => "empty",
+                TileOutcome::Omitted => "omitted",
+                TileOutcome::Rendered(_) => "rendered",
+            }
+        };
+
+        // Coarse-only area: stored up to its detail zoom, omitted past it.
+        assert_eq!(outcome(10.05, 56.95, 7), "rendered");
+        assert_eq!(outcome(10.05, 56.95, 10), "omitted");
+        // Mixed tile: the fine cell still adds detail, so the coarse part
+        // must be stored alongside it.
+        assert_eq!(outcome(10.5, 56.5, 10), "rendered");
+        // Fine-only tiles: stored through its detail zoom, omitted past it.
+        assert_eq!(outcome(10.5, 56.5, 13), "rendered");
+        assert_eq!(outcome(10.5, 56.5, 14), "omitted");
+        // Nothing there at all is never "omitted".
+        assert_eq!(outcome(50.0, 0.0, 10), "empty");
+
+        let dense = Quilt::new(sparse.items, 0.0, false);
+        let (col, row, _, _) = bbox_to_xyz(10.05, 56.95, 10.05, 56.95, 10);
+        assert!(
+            matches!(
+                dense.render_tile(10, col, row).expect("renders"),
+                TileOutcome::Rendered(_)
+            ),
+            "a dense quilt renders every covered tile"
+        );
+    }
+
     #[test]
     fn zoom_range_and_bounds_empty_items_must_bail() {
-        let result = Quilt::<RncCell>::new(Vec::new(), 0.0).zoom_range_and_bounds(None);
+        let result = Quilt::<RncCell>::new(Vec::new(), 0.0, false).zoom_range_and_bounds(None);
         assert!(
             result.is_err(),
             "empty items must bail, but got Ok with ±Infinity bbox"
@@ -440,7 +613,7 @@ mod tests {
             build_rnc(bbox, [200, 30, 30, 255], 3_000_000.0, "01/01/2026"),
         )
         .expect("cell parses");
-        Quilt::new(vec![cell], 0.0)
+        Quilt::new(vec![cell], 0.0, false)
     }
 
     #[test]
@@ -453,6 +626,86 @@ mod tests {
             .zoom_range_and_bounds(Some(6))
             .expect("above the floor");
         assert_eq!(ceil, 6);
+    }
+
+    /// A finer cell whose bbox reaches a tile but whose cover polygon does
+    /// not is a candidate, not a contributor: the tile is decided by the
+    /// coarse cell alone and omitted, even though the finer cell's detail
+    /// zoom would keep the tile if it contributed.
+    #[test]
+    fn bbox_only_candidates_do_not_keep_a_tile() {
+        let coarse = RncCell::parse(
+            "COARSE".to_owned(),
+            build_rnc(
+                Bbox {
+                    west: 10.0,
+                    south: 56.0,
+                    east: 11.0,
+                    north: 57.0,
+                },
+                [200, 30, 30, 255],
+                3_000_000.0,
+                "01/01/2026",
+            ),
+        )
+        .expect("coarse cell parses");
+        // Cover is the triangle below the SW–NE diagonal of its bbox.
+        let triangle: &[(f64, f64)] = &[(10.4, 56.4), (10.6, 56.4), (10.6, 56.6)];
+        let fine = RncCell::parse(
+            "FINE".to_owned(),
+            build_rnc_covered(
+                Bbox {
+                    west: 10.4,
+                    south: 56.4,
+                    east: 10.6,
+                    north: 56.6,
+                },
+                &[triangle],
+                [30, 200, 30, 255],
+                50_000.0,
+                "01/01/2026",
+            ),
+        )
+        .expect("fine cell parses");
+        let quilt = Quilt::new(vec![coarse, fine], 0.0, true);
+
+        // z12 tile in the bbox's NW corner, wholly above the diagonal.
+        let (col, row, _, _) = bbox_to_xyz(10.42, 56.58, 10.42, 56.58, 12);
+        let tile = Bbox::from(xyz_to_bbox(12, col, row, col, row));
+        assert!(
+            tile.east > 10.4 && tile.north > 56.4 && tile.east - 10.4 < tile.south - 56.4,
+            "fixture sanity: tile overlaps the fine bbox but not its triangle: {tile:?}"
+        );
+        assert_eq!(
+            quilt.render_tile(12, col, row).expect("renders"),
+            TileOutcome::Omitted
+        );
+    }
+
+    /// A sparse quilt stores the tile at an item's own detail zoom and omits
+    /// only strictly finer ones — also through the shortcut that decides
+    /// from bbox candidates alone.
+    #[test]
+    fn a_lone_item_keeps_its_detail_zoom_tile() {
+        let bbox = Bbox {
+            west: 10.0,
+            south: 56.0,
+            east: 11.0,
+            north: 57.0,
+        };
+        let cell = RncCell::parse(
+            "OVERVIEW".to_owned(),
+            build_rnc(bbox, [200, 30, 30, 255], 3_000_000.0, "01/01/2026"),
+        )
+        .expect("cell parses");
+        assert_eq!(cell.detail_zoom(0.0), 7, "fixture sanity");
+        let quilt = Quilt::new(vec![cell], 0.0, true);
+        let outcome = |z| {
+            let (col, row, _, _) = bbox_to_xyz(10.5, 56.5, 10.5, 56.5, z);
+            quilt.render_tile(z, col, row).expect("renders")
+        };
+        assert!(matches!(outcome(7), TileOutcome::Rendered(_)));
+        assert_eq!(outcome(8), TileOutcome::Omitted);
     }
 
     /// `write_pmtiles` must hand tiles to the writer in ascending `TileId`
@@ -476,6 +729,7 @@ mod tests {
                 .expect("cell parses"),
             ],
             0.0,
+            false,
         );
         let path = std::env::temp_dir().join(format!(
             "quilt-tiler-{}-write_pmtiles_clustered.pmtiles",
@@ -540,7 +794,7 @@ mod tests {
 
         let names: Vec<&str> = cells.iter().map(RncCell::name).collect();
         assert_eq!(names, ["GOOD"], "scale-0 cell must be skipped");
-        let (_, zoom_ceil, _) = Quilt::new(cells, 0.0)
+        let (_, zoom_ceil, _) = Quilt::new(cells, 0.0, false)
             .zoom_range_and_bounds(None)
             .expect("non-empty items");
         assert_eq!(zoom_ceil, zoom_from_scale(3_000_000, 0.0));

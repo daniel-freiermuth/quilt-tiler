@@ -25,6 +25,7 @@ use pmtiles::TileType;
 use crate::bbox::Bbox;
 use crate::tile_geom::TileGeom;
 use crate::tile_source::{TileAccumulator, TileSource};
+use crate::zoom::{first_zoom_showing, zoom_from_scale};
 
 /// Standard tile grid extent: 4096 units per axis.
 const TILE_EXTENT: u32 = 4096;
@@ -124,6 +125,19 @@ impl TileSource for s57::S57Cell {
         self.native_scale
     }
 
+    /// Native zoom, or the zoom where this cell's finest-gated `SCAMIN`
+    /// feature first shows up if that is finer — the last zoom whose render
+    /// still changes (`SCAMIN` is the only scale-dependent part of
+    /// [`Self::render`]).
+    fn detail_zoom(&self, zoom_offset: f64) -> u8 {
+        let native = zoom_from_scale(self.native_scale, zoom_offset);
+        self.features
+            .iter()
+            .filter_map(scamin)
+            .filter_map(|gate| first_zoom_showing(gate, zoom_offset))
+            .fold(native, u8::max)
+    }
+
     fn tiebreak(&self) -> Self::Tiebreaker {
         self.edition_date
     }
@@ -176,11 +190,7 @@ impl TileSource for s57::S57Cell {
                     continue;
                 };
 
-                // SCAMIN in scale space: tile.scale > scamin → tile is too coarse.
-                if let Some(attr) = feat.attributes.iter().find(|a| a.code == 133)
-                    && let s57::AttrValue::Int(scamin) = attr.value
-                    && scamin < tile.scale
-                {
+                if is_scamin_hidden(feat, tile) {
                     continue;
                 }
 
@@ -347,17 +357,31 @@ fn clip_ring(subject: &Polygon, clip: &MultiPolygon) -> MultiPolygon {
 
 // ── Feature → tile pixel push ─────────────────────────────────────────────────
 
+/// S-57 attribute code of `SCAMIN`, the feature's minimum display scale.
+const SCAMIN_CODE: u16 = 133;
+
+/// The feature's `SCAMIN` scale denominator, if it has one.
+fn scamin(feat: &s57::Feature) -> Option<u32> {
+    feat.attributes
+        .iter()
+        .find(|a| a.code == SCAMIN_CODE)
+        .and_then(|a| match a.value {
+            s57::AttrValue::Int(gate) => Some(gate),
+            _ => None,
+        })
+}
+
+/// `SCAMIN` in scale space: hidden while the tile is coarser than the gate.
+fn is_scamin_hidden(feat: &s57::Feature, tile: &TileGeom) -> bool {
+    scamin(feat).is_some_and(|gate| gate < tile.scale)
+}
+
 /// Push pixel-space features for one S-57 feature directly into `out`.
 /// Geometry is clipped to `tile.geom`; soundings are additionally filtered to
 /// their exact containing tile.
 #[profiling::function]
 fn push_features(feat: &s57::Feature, tile: &TileGeom, out: &mut Vec<RawFeature>) {
-    // SCAMIN: skip features whose minimum display scale is coarser than this tile.
-    const SCAMIN_CODE: u16 = 133;
-    if let Some(attr) = feat.attributes.iter().find(|a| a.code == SCAMIN_CODE)
-        && let s57::AttrValue::Int(scamin) = attr.value
-        && scamin < tile.scale
-    {
+    if is_scamin_hidden(feat, tile) {
         return;
     }
 
@@ -1075,6 +1099,75 @@ mod tests {
         let mut out = Vec::new();
         push_features(&f, &tile, &mut out);
         assert_eq!(out.len(), 1, "feature with SCAMIN >= tile.scale must pass");
+    }
+
+    #[test]
+    fn push_features_scamin_equal_to_tile_scale_passes() {
+        // SCAMIN is the smallest scale still showing the feature, so a tile
+        // exactly at that scale shows it — and `first_zoom_showing` counts on
+        // this boundary.
+        let center = Point::new(10.0, 55.0);
+        let mut tile = test_tile_geom(center, 0.1);
+        tile.scale = 100;
+        let attrs = vec![s57::Attribute {
+            code: 133,
+            value: s57::AttrValue::Int(100),
+        }];
+        let mut out = Vec::new();
+        push_features(&feat(s57::Geometry::Point(center), attrs), &tile, &mut out);
+        assert_eq!(out.len(), 1, "feature with SCAMIN == tile.scale must pass");
+    }
+
+    /// A cell at 1:50 000 (native zoom 13) holding `features`.
+    fn cell(features: Vec<s57::Feature>) -> s57::S57Cell {
+        s57::S57Cell {
+            name: "TEST".to_owned(),
+            native_scale: 50_000,
+            bounds: [9.9, 54.9, 10.1, 55.1],
+            features,
+            coverage: MultiPolygon::new(vec![]),
+            source: "test".to_owned(),
+            text_descriptions: HashMap::new(),
+            edition_date: s57::EditionDate::unknown(),
+        }
+    }
+
+    #[test]
+    fn detail_zoom_follows_scamin_gates_finer_than_the_native_zoom() {
+        let center = Point::new(10.0, 55.0);
+        let gated = |scamin| {
+            feat(
+                s57::Geometry::Point(center),
+                vec![s57::Attribute {
+                    code: 133,
+                    value: s57::AttrValue::Int(scamin),
+                }],
+            )
+        };
+        assert_eq!(cell(vec![]).detail_zoom(0.0), 13, "native zoom");
+        // Gated coarser than native: still shown from z13 on.
+        assert_eq!(cell(vec![gated(1_000_000)]).detail_zoom(0.0), 13);
+        // 1:4 000 only shows from z18 (z17 is ~1:4 265).
+        assert_eq!(
+            cell(vec![gated(1_000_000), gated(4_000)]).detail_zoom(0.0),
+            18
+        );
+    }
+
+    #[test]
+    fn render_returns_the_features_inside_the_tile_by_layer() {
+        let center = Point::new(10.0, 55.0);
+        let layers = cell(vec![
+            feat(s57::Geometry::Point(center), vec![]),
+            feat(s57::Geometry::Point(Point::new(20.0, 60.0)), vec![]),
+        ])
+        .render(&test_tile_geom(center, 0.1));
+        assert_eq!(layers.keys().collect::<Vec<_>>(), [&"ADMARE"]);
+        assert_eq!(
+            layers["ADMARE"].len(),
+            1,
+            "only the feature inside the tile"
+        );
     }
 
     // ── build_props ───────────────────────────────────────────────────────

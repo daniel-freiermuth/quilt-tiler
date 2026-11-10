@@ -22,6 +22,7 @@ use crate::bbox::Bbox;
 use crate::rnc::RncCell;
 use crate::tile_geom::TileGeom;
 use crate::tile_source::{TileAccumulator, TileSource};
+use crate::zoom::{MAX_ZOOM, zoom_from_scale};
 
 /// Output raster tile size in pixels. `256` is the universal default for XYZ
 /// raster tiles (`MapLibre` raster sources default `tileSize` to `256`).
@@ -46,6 +47,26 @@ impl TileSource for RncCell {
 
     fn native_scale(&self) -> u32 {
         Self::native_scale(self)
+    }
+
+    /// Coarsest zoom whose [`TILE_PX`]-wide tiles sample every source
+    /// pixel (tile pixel no wider than a source pixel); finer zooms only
+    /// repeat them. Never below the native zoom. An unreadable subtile
+    /// header yields zoom 22, so a sparse quilt never omits this cell.
+    /// (`RncCell::parse` rejects an empty extent and PNGs are never 0 px
+    /// wide, so `world_px` is finite and positive.)
+    fn detail_zoom(&self, zoom_offset: f64) -> u8 {
+        let native = zoom_from_scale(Self::native_scale(self), zoom_offset);
+        let Some(width) = self.subtile_width() else {
+            return MAX_ZOOM;
+        };
+        let bbox = self.bbox();
+        // Source pixels around the whole world at this cell's resolution.
+        let world_px = f64::from(self.cols()) * f64::from(width) * 360.0 / (bbox.east - bbox.west);
+        let pixel_zoom = (0..=MAX_ZOOM)
+            .find(|&z| f64::from(TILE_PX) * f64::from(z).exp2() >= world_px)
+            .unwrap_or(MAX_ZOOM);
+        native.max(pixel_zoom)
     }
 
     fn tiebreak(&self) -> Self::Tiebreaker {
@@ -444,5 +465,42 @@ mod tests {
             acc.encode().expect("encode succeeds")
         };
         assert_eq!(bytes, &[] as &[u8]);
+    }
+
+    #[test]
+    fn detail_zoom_is_the_finer_of_native_and_source_pixel_zoom() {
+        let at = |east: f64| Bbox {
+            west: 11.0,
+            south: 57.0,
+            east,
+            north: 58.0,
+        };
+        let parse = |cols, bbox| {
+            RncCell::parse(
+                "TEST".to_owned(),
+                build_rnc(cols, 1, bbox, [1, 2, 3, 255], 3_000_000.0),
+            )
+            .expect("valid .rnc parses")
+        };
+
+        // 8 px across 1° → 2 880 px around the world: z4 tiles already sample
+        // every source pixel, so the native 1:3M zoom (7) is the finer one.
+        let coarse = parse(1, at(12.0));
+        assert_eq!(coarse.detail_zoom(0.0), zoom_from_scale(3_000_000, 0.0));
+
+        // 2 × 8 px across 0.001° → 5.76 M px around the world: z14 tiles
+        // (4.19 M px) still skip source pixels, z15 (8.39 M px) do not.
+        let fine = parse(2, at(11.001));
+        assert_eq!(fine.detail_zoom(0.0), 15);
+
+        // 8 px across 1.40625° is exactly 2 048 px around the world, which
+        // z3's 8 × 256 px tiles match pixel for pixel: z3, not z4. (A
+        // 1:1 000 000 000 cell's native zoom is 0, so pixels decide.)
+        let exact = RncCell::parse(
+            "TEST".to_owned(),
+            build_rnc(1, 1, at(12.406_25), [1, 2, 3, 255], 1_000_000_000.0),
+        )
+        .expect("valid .rnc parses");
+        assert_eq!(exact.detail_zoom(0.0), 3);
     }
 }

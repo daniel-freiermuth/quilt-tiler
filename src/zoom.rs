@@ -3,6 +3,9 @@
 /// Combined constant: `40_075_016 / (256 × 0.00028) ≈ 559_082_264`.
 pub const ZOOM_K: f64 = 559_082_264.0;
 
+/// Finest zoom level this crate produces; [`zoom_from_scale`] clamps to it.
+pub const MAX_ZOOM: u8 = 22;
+
 /// Compute the tile zoom level that best represents a chart at `1:native_scale`.
 ///
 /// Formula: `z = floor(log2(ZOOM_K / native_scale) + offset)`, clamped to `[0, 22]`.
@@ -18,8 +21,8 @@ pub const ZOOM_K: f64 = 559_082_264.0;
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn zoom_from_scale(native_scale: u32, offset: f64) -> u8 {
     let log2 = (ZOOM_K / f64::from(native_scale)).log2();
-    // Safety: value is clamped to [0.0, 22.0] before cast.
-    (log2 + offset).floor().clamp(0.0, 22.0) as u8
+    // Safety: value is clamped to [0.0, MAX_ZOOM] before cast.
+    (log2 + offset).floor().clamp(0.0, f64::from(MAX_ZOOM)) as u8
 }
 
 /// Compute the nominal scale denominator for a tile at `zoom` with `offset`
@@ -31,6 +34,20 @@ pub fn scale_from_zoom(zoom: u8, offset: f64) -> u32 {
     (ZOOM_K / (f64::from(zoom) - offset).exp2())
         .round()
         .clamp(1.0, f64::from(u32::MAX)) as u32
+}
+
+/// Coarsest zoom where an S-57 `SCAMIN`-gated feature first shows up.
+///
+/// That is the first zoom whose nominal scale ([`scale_from_zoom`]) is at or
+/// finer than `scale_gate`, the feature being hidden while
+/// `scale_gate < tile.scale`.  `None` if no zoom in `0..=MAX_ZOOM` is that
+/// fine, so the feature never renders.
+///
+/// Scans instead of inverting [`zoom_from_scale`]'s formula so it agrees
+/// with [`scale_from_zoom`]'s rounding at every boundary exactly.
+#[must_use]
+pub fn first_zoom_showing(scale_gate: u32, offset: f64) -> Option<u8> {
+    (0..=MAX_ZOOM).find(|&z| scale_from_zoom(z, offset) <= scale_gate)
 }
 
 #[cfg(test)]
@@ -105,5 +122,39 @@ mod tests {
                 "scale round-trip out of range: native={native} → z={z} → s_back={s_back} (ratio={ratio:.3})",
             );
         }
+    }
+
+    // ── first_zoom_showing contract ─────────────────────────────────────
+
+    #[test]
+    fn first_zoom_showing_agrees_with_the_scamin_check_at_every_zoom() {
+        // The render hides a gated feature iff `gate < scale_from_zoom(z)`;
+        // first_zoom_showing must split 0..=22 at exactly that boundary,
+        // including gates sitting exactly on and one off a zoom's scale.
+        for offset in [0.0, 0.5, -1.0] {
+            let on_boundary = scale_from_zoom(12, offset);
+            for gate in [
+                on_boundary,
+                on_boundary - 1,
+                on_boundary + 1,
+                50_000,
+                3_000_000,
+            ] {
+                let first = first_zoom_showing(gate, offset).expect("gate is reachable");
+                for z in 0..=22_u8 {
+                    let shown = gate >= scale_from_zoom(z, offset);
+                    assert_eq!(
+                        shown,
+                        z >= first,
+                        "gate={gate} offset={offset} z={z} first={first}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn first_zoom_showing_is_none_for_a_gate_finer_than_zoom_22() {
+        assert_eq!(first_zoom_showing(scale_from_zoom(22, 0.0) - 1, 0.0), None);
     }
 }

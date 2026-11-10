@@ -120,6 +120,17 @@ struct Args {
     /// values shift the scale breakpoints between zoom levels.
     #[arg(long, default_value_t = 0.0)]
     zoom_offset: f64,
+
+    /// Leave out tiles a client can rebuild from an ancestor: those where
+    /// every contributing chart already shows all its detail at a coarser
+    /// zoom. Cuts most of the fine-zoom tiles over coarse-only areas.
+    /// Clients must fall back on a missing tile: the vector style sets
+    /// `MapLibre` GL JS's experimental `sparse` (≥ 6.17); raster sources do
+    /// it natively. Either way, the tile server must answer missing tiles
+    /// with 404 (tileserver-gl does, via the archive's `sparse` metadata) and
+    /// a `pmtiles://` protocol must reject them with a 404 status.
+    #[arg(long)]
+    sparse: bool,
 }
 
 fn main() -> Result<()> {
@@ -191,7 +202,7 @@ fn output_identity(args: &Args) -> (String, String, String) {
 /// Convert decrypted `OESU`/`OSENC` vector cells into an MVT `PMTiles` archive.
 fn run_vector(args: &Args) -> Result<()> {
     let cells: Vec<s57::S57Cell> = loader::load_s57_cells(&args.input, args.zoom_offset);
-    let quilt = tiles::Quilt::new(cells, args.zoom_offset);
+    let quilt = tiles::Quilt::new(cells, args.zoom_offset, args.sparse);
 
     info!(parsed = quilt.items().len(), "charts parsed, writing tiles");
 
@@ -232,6 +243,7 @@ fn run_vector(args: &Args) -> Result<()> {
         &tile_url,
         min_zoom,
         out_max_zoom,
+        args.sparse,
     )?;
     std::fs::write(&style_path, &style_json)
         .with_context(|| format!("writing style to {}", style_path.display()))?;
@@ -262,7 +274,7 @@ fn run_vector(args: &Args) -> Result<()> {
 /// Convert raster `.rnc` cells into a PNG `PMTiles` archive.
 fn run_raster(args: &Args) -> Result<()> {
     let cells: Vec<rnc::RncCell> = loader::load_rnc_cells(&args.input, args.zoom_offset);
-    let quilt = tiles::Quilt::new(cells, args.zoom_offset);
+    let quilt = tiles::Quilt::new(cells, args.zoom_offset, args.sparse);
 
     info!(
         parsed = quilt.items().len(),

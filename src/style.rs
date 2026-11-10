@@ -22,6 +22,9 @@ const STYLE_JSON: &str = include_str!("style.json");
 /// * `tile_url` — full MVT tile URL template, e.g.
 ///   `http://localhost:3000/chart/{z}/{x}/{y}`.  Embedded in `sources.enc`.
 /// * `min_zoom` / `max_zoom` — zoom range for the tile source.
+/// * `sparse` — the tile source leaves out tiles (see
+///   [`crate::tiles::Quilt`]); sets the source's experimental `MapLibre` GL JS
+///   (≥ 6.17) `sparse` flag so a 404 tile is sliced from its nearest ancestor.
 ///
 /// # Errors
 /// Returns an error if the embedded `style.json` is malformed or the built
@@ -32,6 +35,7 @@ pub fn build_style(
     tile_url: &str,
     min_zoom: u8,
     max_zoom: u8,
+    sparse: bool,
 ) -> anyhow::Result<String> {
     use anyhow::Context;
     use serde_json::{Value, json};
@@ -121,15 +125,17 @@ pub fn build_style(
     // --- inject sources block so the style is self-contained ---------------
     // MapLibre requires every source referenced in layers to be defined here.
     // The caller supplies the actual tile URL (e.g. from martin or tileserver-gl).
-    style["sources"] = json!({
-        "enc": {
-            "type": "vector",
-            "encoding": "mlt",
-            "tiles": [tile_url],
-            "minzoom": min_zoom,
-            "maxzoom": max_zoom
-        }
+    let mut source = json!({
+        "type": "vector",
+        "encoding": "mlt",
+        "tiles": [tile_url],
+        "minzoom": min_zoom,
+        "maxzoom": max_zoom
     });
+    if sparse {
+        source["sparse"] = Value::Bool(true);
+    }
+    style["sources"] = json!({ "enc": source });
 
     serde_json::to_string_pretty(&style).context("serialising vector style")
 }
@@ -189,7 +195,7 @@ mod tests {
     #[test]
     fn cardinal_buoy_body_and_topmark_are_separate_layers_with_topmark_on_top() {
         let style: Value = serde_json::from_str(
-            &build_style(5.0, 10.0, "http://localhost/{z}/{x}/{y}", 6, 18)
+            &build_style(5.0, 10.0, "http://localhost/{z}/{x}/{y}", 6, 18, false)
                 .expect("build_style succeeds"),
         )
         .expect("build_style output is valid JSON");
