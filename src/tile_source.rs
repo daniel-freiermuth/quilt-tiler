@@ -91,10 +91,12 @@ pub trait TileSource: Sync {
     /// Native display scale denominator (e.g. `50_000` for 1:50 000).
     fn native_scale(&self) -> u32;
 
-    /// Finest zoom at which rendering this item still gains detail.  At any
-    /// finer zoom its render is this zoom's render, just magnified — so a
+    /// Finest zoom at which rendering this item still gains content.  At any
+    /// finer zoom it shows the same features from the same chart — so a
     /// sparse quilt may leave such tiles out and let the client slice
-    /// (vector) or upscale (raster) the ancestor instead.
+    /// (vector) or upscale (raster) the ancestor instead. Positions are not
+    /// kept: the client's copy carries the ancestor's coordinate grid (see
+    /// [`crate::tiles::Quilt`]).
     ///
     /// Never coarser than the item's native zoom
     /// (`zoom::zoom_from_scale(native_scale, zoom_offset)`).  Called once per

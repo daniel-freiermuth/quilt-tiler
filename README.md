@@ -19,7 +19,9 @@ quilt-tiler -o chart.pmtiles <cells>/*.rnc            # raster: rnc cells
 
 `--sparse` (batch and `tileserver`) leaves out every tile whose charts already show all their detail at a
 coarser zoom — most fine-zoom tiles over areas only coarse charts cover. The client rebuilds those from
-the nearest stored ancestor, so it must treat a missing tile as "use the parent":
+the nearest stored ancestor, so it must treat a missing tile as "use the parent". Those tiles show the
+same charts and features as a dense build, but positioned on the ancestor's coordinate grid: coarse
+charts viewed far past their scale show visibly snapped lines (still finer than their real accuracy).
 
 - Vector: `MapLibre` GL JS ≥ 6.17, whose experimental `sparse` source flag the generated style sets.
   Older clients and other renderers show nothing there.
