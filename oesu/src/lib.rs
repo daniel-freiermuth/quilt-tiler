@@ -646,10 +646,17 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
         }
         let payload_len = (rec_len - 6) as usize;
 
-        let mut payload_bytes = vec![0u8; payload_len];
-        c.read_exact(&mut payload_bytes)
+        // Borrow the payload from `data` after checking the untrusted length
+        // against the bytes left, so a corrupt header cannot force a huge
+        // allocation.
+        let start = c.position() as usize;
+        let payload_bytes = start
+            .checked_add(payload_len)
+            .and_then(|end| data.get(start..end))
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
             .with_context(|| format!("reading payload of record type {rec_type}"))?;
-        let mut p = Cursor::new(payload_bytes.as_slice());
+        c.set_position((start + payload_len) as u64);
+        let mut p = Cursor::new(payload_bytes);
 
         match rec_type {
             // ── Header metadata (simple field assignments) ───────────────
@@ -2275,6 +2282,19 @@ mod tests {
         )]);
         // Declares a 4-byte payload but only 2 bytes follow.
         data.extend(record_header(HEADER_CELL_EDITION, 6 + 4).u16(1).0);
+        let err = parse_err(&data);
+        let expected = format!("reading payload of record type {HEADER_CELL_EDITION}");
+        assert!(err.contains(&expected), "{err}");
+    }
+
+    #[test]
+    fn parse_file_huge_record_length_is_rejected_without_allocating() {
+        let mut data = senc_stream(vec![(
+            HEADER_CELL_NATIVESCALE,
+            Bytes::default().u32(22_000),
+        )]);
+        // Claims a ~4 GiB payload; only 2 bytes follow.
+        data.extend(record_header(HEADER_CELL_EDITION, u32::MAX).u16(1).0);
         let err = parse_err(&data);
         let expected = format!("reading payload of record type {HEADER_CELL_EDITION}");
         assert!(err.contains(&expected), "{err}");
