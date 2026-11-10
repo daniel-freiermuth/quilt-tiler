@@ -229,6 +229,18 @@ impl CellBuilder {
         let ne_lon = read_f64(p)?;
         let se_lat = read_f64(p)?;
         let se_lon = read_f64(p)?;
+        for lat in [sw_lat, nw_lat, ne_lat, se_lat] {
+            anyhow::ensure!(
+                lat.is_finite() && (-90.0..=90.0).contains(&lat),
+                "CELL_EXTENT_RECORD latitude {lat} is not a valid latitude"
+            );
+        }
+        for lon in [sw_lon, nw_lon, ne_lon, se_lon] {
+            anyhow::ensure!(
+                lon.is_finite(),
+                "CELL_EXTENT_RECORD longitude {lon} is not finite"
+            );
+        }
 
         let s_lat = sw_lat.min(se_lat);
         let n_lat = nw_lat.max(ne_lat);
@@ -338,6 +350,10 @@ impl CellBuilder {
         }
         let lat = read_f64(p)?;
         let lon = read_f64(p)?;
+        if !(lat.is_finite() && lon.is_finite()) {
+            tracing::warn!(lat, lon, "GEOM_POINT has non-finite coordinates, skipping");
+            return Ok(());
+        }
         if let Some(f) = &mut self.current {
             f.raw_geometry = RawGeometry::Point(point![x: lon, y: lat]);
         }
@@ -1935,6 +1951,29 @@ mod tests {
         assert_eq!((b.ref_lon, b.ref_lat), (10.75, 54.75));
     }
 
+    /// `ref_lat`/`ref_lon` feed every SM→WGS84 conversion; a non-finite or
+    /// out-of-range corner would turn every finite VET/VCT/area coordinate
+    /// into NaN, so the cell is rejected instead of rendering NaN geometry.
+    #[test]
+    fn cell_extent_rejects_non_finite_or_out_of_range_corners() {
+        for (corner, bad) in [
+            (2, f64::NAN),
+            (2, 200.0),
+            (0, -90.5),
+            (5, f64::INFINITY),
+            (7, f64::NAN),
+        ] {
+            let mut values = [54.0, 10.0, 55.0, 9.5, 55.5, 11.0, 54.5, 12.0];
+            values[corner] = bad;
+            let payload = values.iter().fold(Bytes::default(), |b, &v| b.f64(v));
+            let mut b = CellBuilder::default();
+            assert!(
+                feed(&mut b, &payload.0, CellBuilder::parse_cell_extent).is_err(),
+                "corner value {corner} = {bad}"
+            );
+        }
+    }
+
     #[test]
     fn txtdsc_stores_content_under_its_file_name() {
         let mut b = CellBuilder::default();
@@ -2423,6 +2462,20 @@ mod tests {
             feed(&mut b, &nodes.0, CellBuilder::parse_vct_ext).unwrap();
             assert_eq!(vet_points(&b), [], "scale_factor {scale}");
             assert_eq!(vct_coords(&b), [], "scale_factor {scale}");
+        }
+    }
+
+    /// A POINT record holds raw f64 WGS84 lat/lon; a NaN/inf value would
+    /// reach geo through the light-sector bbox and panic the render, so the
+    /// geometry is left unset.
+    #[test]
+    fn point_skips_non_finite_coordinates() {
+        for (lat, lon) in [(f64::NAN, 10.1), (55.1, f64::INFINITY)] {
+            let mut b = builder_with_feature();
+            let payload = Bytes::default().f64(lat).f64(lon);
+            feed(&mut b, &payload.0, CellBuilder::parse_geometry_point).unwrap();
+            let geometry = &current_feature(&b).raw_geometry;
+            assert!(matches!(geometry, RawGeometry::None), "{geometry:?}");
         }
     }
 
