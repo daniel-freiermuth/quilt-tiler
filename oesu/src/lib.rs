@@ -460,7 +460,11 @@ impl CellBuilder {
                 let north = f64::from(read_f32(p)?);
                 points.push([east, north]);
             }
-            self.vet.insert(edge_index, EdgeEntry { points });
+            if points.iter().flatten().all(|v| v.is_finite()) {
+                self.vet.insert(edge_index, EdgeEntry { points });
+            } else {
+                tracing::warn!(edge_index, "VET edge has non-finite coordinates, skipping");
+            }
         }
         Ok(())
     }
@@ -479,6 +483,10 @@ impl CellBuilder {
             let node_index = read_u32(p)?;
             let east = f64::from(read_f32(p)?);
             let north = f64::from(read_f32(p)?);
+            if !(east.is_finite() && north.is_finite()) {
+                tracing::warn!(node_index, "VCT node has non-finite coordinates, skipping");
+                continue;
+            }
             self.vct.insert(
                 node_index,
                 NodeEntry {
@@ -1151,6 +1159,9 @@ fn parse_covr_payload(p: &mut Cursor<&[u8]>, payload_len: usize) -> Option<LineS
     for _ in 0..count {
         let lat = read_f32(p).ok()?;
         let lon = read_f32(p).ok()?;
+        if !(lat.is_finite() && lon.is_finite()) {
+            return None;
+        }
         coords.push(Coord {
             x: f64::from(lon),
             y: f64::from(lat),
@@ -2412,6 +2423,53 @@ mod tests {
             feed(&mut b, &nodes.0, CellBuilder::parse_vct_ext).unwrap();
             assert_eq!(vet_points(&b), [], "scale_factor {scale}");
             assert_eq!(vct_coords(&b), [], "scale_factor {scale}");
+        }
+    }
+
+    /// Plain VET/VCT/COVR coordinates are raw f32s; a NaN/inf vertex would
+    /// reach geo's boolean ops and panic the render, so the edge, node or
+    /// ring is skipped like other malformed records.
+    #[test]
+    fn vet_vct_and_covr_skip_non_finite_coordinates() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut b = CellBuilder::default();
+            let edges = Bytes::default()
+                .u32(2)
+                .u32(7)
+                .u32(2)
+                .f32(0.0)
+                .f32(0.0)
+                .f32(bad)
+                .f32(1.0)
+                .u32(8)
+                .u32(1)
+                .f32(1.5)
+                .f32(-2.5);
+            let nodes = Bytes::default()
+                .u32(2)
+                .u32(7)
+                .f32(1.0)
+                .f32(bad)
+                .u32(8)
+                .f32(1.5)
+                .f32(-2.5);
+            feed(&mut b, &edges.0, CellBuilder::parse_vet).unwrap();
+            feed(&mut b, &nodes.0, CellBuilder::parse_vct).unwrap();
+            assert_eq!(vet_points(&b), [(8, vec![[1.5, -2.5]])], "{bad}");
+            assert_eq!(vct_coords(&b), [(8, [1.5, -2.5])], "{bad}");
+
+            let covr = Bytes::default()
+                .u32(2)
+                .f32(55.0)
+                .f32(10.0)
+                .f32(bad)
+                .f32(10.1);
+            let covr_len = covr.0.len();
+            assert_eq!(
+                parse_covr_payload(&mut Cursor::new(covr.0.as_slice()), covr_len),
+                None,
+                "{bad}"
+            );
         }
     }
 
