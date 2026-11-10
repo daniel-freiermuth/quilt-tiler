@@ -218,13 +218,23 @@ impl TileAccumulator for RasterAccumulator {
         if !self.any_opaque {
             return Ok(Vec::new());
         }
-        let img = RgbaImage::from_raw(TILE_PX, TILE_PX, self.canvas)
-            .context("building output raster tile buffer")?;
-        let mut out = Vec::new();
-        img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
-            .context("encoding PNG tile")?;
-        Ok(out)
+        encode_png(self.canvas)
     }
+
+    /// A fully transparent tile.
+    fn blank() -> Result<Vec<u8>> {
+        encode_png(Self::empty().canvas)
+    }
+}
+
+/// PNG-encode a `TILE_PX`² RGBA canvas.
+fn encode_png(canvas: Vec<u8>) -> Result<Vec<u8>> {
+    let img = RgbaImage::from_raw(TILE_PX, TILE_PX, canvas)
+        .context("building output raster tile buffer")?;
+    let mut out = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .context("encoding PNG tile")?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -465,6 +475,16 @@ mod tests {
             acc.encode().expect("encode succeeds")
         };
         assert_eq!(bytes, &[] as &[u8]);
+    }
+
+    #[test]
+    fn blank_is_a_fully_transparent_tile() {
+        let blank = RasterAccumulator::blank().expect("blank encodes");
+        let img = image::load_from_memory_with_format(&blank, image::ImageFormat::Png)
+            .expect("blank is a PNG")
+            .to_rgba8();
+        assert_eq!(img.dimensions(), (TILE_PX, TILE_PX));
+        assert!(img.pixels().all(|p| p.0[3] == 0), "every pixel transparent");
     }
 
     #[test]
