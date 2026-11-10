@@ -28,24 +28,20 @@ type EncodedTile = (u64, TileCoord, Vec<u8>);
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_lines)]
-/// Quilt `items` using source type `S` into a `PMTiles` v3 archive at `output`.
-///
-/// `zoom_offset` shifts every item's native scale to a zoom level (positive =
-/// finer, negative = coarser).  Returns `(min_zoom, max_zoom)`.
+/// Quilt `quilt`'s items into a `PMTiles` v3 archive at `output`. Returns
+/// `(min_zoom, max_zoom)`.
 ///
 /// # Errors
 /// Returns an error if `max_zoom` is below the data's minimum zoom, a tile
 /// fails to encode, or writing/finalizing the `PMTiles` archive fails.
 pub fn write_pmtiles<S: TileSource>(
-    items: &[S],
+    quilt: &Quilt<S>,
     output: &Path,
     max_zoom: Option<u8>,
-    zoom_offset: f64,
 ) -> Result<(u8, u8)> {
     let mut tile_bytes: BTreeMap<u64, (TileCoord, Vec<u8>)> = BTreeMap::new();
 
-    let (zoom_floor, zoom_ceil, overall) = zoom_range_and_bounds(items, max_zoom, zoom_offset)?;
+    let (zoom_floor, zoom_ceil, overall) = quilt.zoom_range_and_bounds(max_zoom)?;
 
     let total_tiles: u64 = (zoom_floor..=zoom_ceil)
         .map(|z| {
@@ -56,7 +52,7 @@ pub fn write_pmtiles<S: TileSource>(
         .sum();
 
     info!(
-        count = items.len(),
+        count = quilt.items().len(),
         zoom_floor, zoom_ceil, total_tiles, "encoding tiles",
     );
     let pb = ProgressBar::new(total_tiles).with_style(bar_style());
@@ -83,7 +79,7 @@ pub fn write_pmtiles<S: TileSource>(
                 #[allow(clippy::cast_possible_truncation)] // idx / width < height ≤ u32::MAX
                 let row = row_lo + (idx / u64::from(width)) as u32;
 
-                let Some(bytes) = render_tile(items, z, col, row, zoom_offset)? else {
+                let Some(bytes) = quilt.render_tile(z, col, row)? else {
                     return Ok(None);
                 };
                 let coord = TileCoord::new(z, col, row).context("invalid tile coord")?;
@@ -127,131 +123,165 @@ pub fn write_pmtiles<S: TileSource>(
     Ok((zoom_floor, zoom_ceil))
 }
 
-/// Compute `(zoom_floor, zoom_ceil, overall_bbox)` for `items`: the tile zoom
-/// range and combined `WGS84` extent that a [`write_pmtiles`] batch or a live
-/// server's `/style.json` should advertise.
-///
-/// `zoom_floor` is the coarsest native zoom among `items`, minus 2 (so the
-/// finest chart's detail still fills down a couple of levels below its own
-/// native zoom). `zoom_ceil` is the finest native zoom, capped by `max_zoom`
-/// when given.
-///
-/// # Errors
-/// Returns an error if `max_zoom` is below the data's minimum zoom.
-pub fn zoom_range_and_bounds<S: TileSource>(
-    items: &[S],
-    max_zoom: Option<u8>,
+/// Items to quilt, plus the per-item data every tile needs, computed once.
+pub struct Quilt<S> {
+    items: Vec<S>,
+    /// Per-item data, indexed like `items`.
+    meta: Vec<ItemMeta>,
     zoom_offset: f64,
-) -> Result<(u8, u8, Bbox)> {
-    anyhow::ensure!(!items.is_empty(), "no items to tile");
-    let zoom_floor = items
-        .iter()
-        .map(|item| zoom_from_scale(item.native_scale(), zoom_offset))
-        .min()
-        .unwrap_or(0)
-        .saturating_sub(2);
-    let zoom_ceil_native = items
-        .iter()
-        .map(|item| zoom_from_scale(item.native_scale(), zoom_offset))
-        .max()
-        .unwrap_or(0);
-    let zoom_ceil = match max_zoom {
-        Some(cap) if cap < zoom_floor => {
-            anyhow::bail!("max_zoom {cap} is below the data's minimum zoom {zoom_floor}");
-        }
-        Some(cap) => cap.min(zoom_ceil_native),
-        None => zoom_ceil_native,
-    };
-
-    let overall = items.iter().fold(Bbox::bottom(), |acc, item| {
-        acc.join(&item.coverage().into())
-    });
-
-    Ok((zoom_floor, zoom_ceil, overall))
 }
 
-/// Render one `(z, col, row)` tile from `items`'s combined coverage.
-///
-/// Returns `None` if nothing overlaps it, or [`TileSource::encode`] decides
-/// to omit it. Pure given `(z, col, row)` — no shared mutable state across
-/// calls — so it's safe to call concurrently and on demand. Backs both
-/// [`write_pmtiles`]'s batch loop and a live tile server.
-///
-/// # Errors
-/// Returns an error if merging or encoding this tile's contents fails
-/// ([`TileAccumulator::push`] / [`TileAccumulator::encode`]).
-pub fn render_tile<S: TileSource>(
-    items: &[S],
-    z: u8,
-    col: u32,
-    row: u32,
-    zoom_offset: f64,
-) -> Result<Option<Vec<u8>>> {
-    profiling::scope!("tile");
-    let zi = i32::from(z);
-    let tile_wgs84 = Bbox::from(xyz_to_bbox(z, col, row, col, row));
-    let tile_merc = tile_mercator_bbox(tile_wgs84);
-    let tile_scale = scale_from_zoom(z, zoom_offset);
+/// What [`Quilt::render_tile`] needs from an item on every tile, computed
+/// once: [`TileSource::coverage`] clones a whole polygon and the native zoom
+/// takes a `log2`.
+struct ItemMeta {
+    bbox: Bbox,
+    native_zoom: u8,
+}
 
-    // Candidates: items whose coverage bbox overlaps this tile.
-    let mut candidates: Vec<usize> = {
-        profiling::scope!("Collecting candidates");
-        (0..items.len())
-            .filter(|&i| {
-                let bbox: Bbox = items[i].coverage().into();
-                bbox.overlaps(&tile_wgs84)
+impl<S: TileSource> Quilt<S> {
+    /// `zoom_offset` shifts every item's native scale to a zoom level
+    /// (positive = finer, negative = coarser).
+    #[must_use]
+    pub fn new(items: Vec<S>, zoom_offset: f64) -> Self {
+        let meta = items
+            .iter()
+            .map(|item| ItemMeta {
+                bbox: item.coverage().into(),
+                native_zoom: zoom_from_scale(item.native_scale(), zoom_offset),
             })
-            .collect()
-    };
-
-    if candidates.is_empty() {
-        return Ok(None);
-    }
-
-    {
-        profiling::scope!("Sorting candidates");
-        // Sort: coarsest-appropriate zoom first, finer after, too-coarse
-        // last; ties at the same floored zoom broken by recency (newer
-        // edition wins — see `TileSource::tiebreak`).
-        candidates.sort_unstable_by_key(|&i| {
-            let nz = i32::from(zoom_from_scale(items[i].native_scale(), zoom_offset));
-            (
-                nz < zi,
-                if nz >= zi { nz } else { -nz },
-                Reverse(items[i].tiebreak()),
-            )
-        });
-    }
-
-    // Greedy coverage: include an item only if its contribution adds area
-    // not yet covered.  `Coverage`'s real polygon algebra correctly handles
-    // disjoint coverage areas (e.g. NE + SW ≠ full tile), unlike a
-    // bounding-box hull.
-    let mut uncovered = S::Coverage::from(tile_wgs84);
-    let mut acc = S::Accumulator::empty();
-
-    {
-        profiling::scope!("Collecting features");
-        for &i in &candidates {
-            let contrib = items[i].coverage().meet(&uncovered);
-            if contrib.area() == 0.0 {
-                continue;
-            }
-            let item_tile = TileGeom {
-                geom: contrib.clone().into(),
-                merc: tile_merc,
-                scale: tile_scale,
-            };
-            acc.push(items[i].render(&item_tile))?;
-            uncovered = uncovered.minus(&contrib);
-            if uncovered.area() == 0.0 {
-                break;
-            }
+            .collect();
+        Self {
+            items,
+            meta,
+            zoom_offset,
         }
     }
 
-    let bytes = acc.encode()?;
-    Ok(if bytes.is_empty() { None } else { Some(bytes) })
+    #[must_use]
+    pub fn items(&self) -> &[S] {
+        &self.items
+    }
+
+    /// Compute `(zoom_floor, zoom_ceil, overall_bbox)`: the tile zoom range
+    /// and combined `WGS84` extent that a [`write_pmtiles`] batch or a live
+    /// server's `/style.json` should advertise.
+    ///
+    /// `zoom_floor` is the coarsest native zoom among the items, minus 2 (so
+    /// the finest chart's detail still fills down a couple of levels below
+    /// its own native zoom). `zoom_ceil` is the finest native zoom, capped by
+    /// `max_zoom` when given.
+    ///
+    /// # Errors
+    /// Returns an error if there are no items or `max_zoom` is below the
+    /// data's minimum zoom.
+    pub fn zoom_range_and_bounds(&self, max_zoom: Option<u8>) -> Result<(u8, u8, Bbox)> {
+        anyhow::ensure!(!self.items.is_empty(), "no items to tile");
+        let native_zooms = || self.meta.iter().map(|m| m.native_zoom);
+        let zoom_floor = native_zooms().min().unwrap_or(0).saturating_sub(2);
+        let zoom_ceil_native = native_zooms().max().unwrap_or(0);
+        let zoom_ceil = match max_zoom {
+            Some(cap) if cap < zoom_floor => {
+                anyhow::bail!("max_zoom {cap} is below the data's minimum zoom {zoom_floor}");
+            }
+            Some(cap) => cap.min(zoom_ceil_native),
+            None => zoom_ceil_native,
+        };
+
+        let overall = self
+            .meta
+            .iter()
+            .fold(Bbox::bottom(), |acc, m| acc.join(&m.bbox));
+
+        Ok((zoom_floor, zoom_ceil, overall))
+    }
+
+    /// Render one `(z, col, row)` tile from the items' combined coverage.
+    ///
+    /// Returns `None` if nothing overlaps it, or [`TileAccumulator::encode`]
+    /// decides to omit it. Pure given `(z, col, row)` — no shared mutable
+    /// state across calls — so it's safe to call concurrently and on demand.
+    /// Backs both [`write_pmtiles`]'s batch loop and a live tile server.
+    ///
+    /// # Errors
+    /// Returns an error if merging or encoding this tile's contents fails
+    /// ([`TileAccumulator::push`] / [`TileAccumulator::encode`]).
+    pub fn render_tile(&self, z: u8, col: u32, row: u32) -> Result<Option<Vec<u8>>> {
+        profiling::scope!("tile");
+        let items = &self.items;
+        let meta = &self.meta;
+        let zi = i32::from(z);
+        let tile_wgs84 = Bbox::from(xyz_to_bbox(z, col, row, col, row));
+
+        // Candidates: items whose coverage bbox overlaps this tile.
+        let mut candidates: Vec<usize> = {
+            profiling::scope!("Collecting candidates");
+            (0..items.len())
+                .filter(|&i| meta[i].bbox.overlaps(&tile_wgs84))
+                .collect()
+        };
+
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+
+        {
+            profiling::scope!("Sorting candidates");
+            // Sort: coarsest-appropriate zoom first, finer after, too-coarse
+            // last; ties at the same floored zoom broken by recency (newer
+            // edition wins — see `TileSource::tiebreak`).
+            candidates.sort_unstable_by_key(|&i| {
+                let nz = i32::from(meta[i].native_zoom);
+                (
+                    nz < zi,
+                    if nz >= zi { nz } else { -nz },
+                    Reverse(items[i].tiebreak()),
+                )
+            });
+        }
+
+        // Greedy coverage: include an item only if its contribution adds
+        // area not yet covered.  `Coverage`'s real polygon algebra correctly
+        // handles disjoint coverage areas (e.g. NE + SW ≠ full tile), unlike
+        // a bounding-box hull.
+        let mut uncovered = S::Coverage::from(tile_wgs84);
+        let mut contributions: Vec<(usize, S::Coverage)> = Vec::new();
+        {
+            profiling::scope!("Assigning coverage");
+            for &i in &candidates {
+                let contrib = items[i].coverage().meet(&uncovered);
+                if contrib.area() == 0.0 {
+                    continue;
+                }
+                uncovered = uncovered.minus(&contrib);
+                contributions.push((i, contrib));
+                if uncovered.area() == 0.0 {
+                    break;
+                }
+            }
+        }
+
+        if contributions.is_empty() {
+            return Ok(None);
+        }
+
+        let tile_merc = tile_mercator_bbox(tile_wgs84);
+        let tile_scale = scale_from_zoom(z, self.zoom_offset);
+        let mut acc = S::Accumulator::empty();
+        {
+            profiling::scope!("Collecting features");
+            for (i, contrib) in contributions {
+                acc.push(items[i].render(&TileGeom {
+                    geom: contrib.into(),
+                    merc: tile_merc,
+                    scale: tile_scale,
+                }))?;
+            }
+        }
+
+        let bytes = acc.encode()?;
+        Ok(if bytes.is_empty() { None } else { Some(bytes) })
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -358,7 +388,8 @@ mod tests {
 
         // Older listed first: only the tiebreak (not array order) should
         // determine which one wins.
-        let bytes = render_tile(&[older, newer], z, col, row, 0.0)
+        let bytes = Quilt::new(vec![older, newer], 0.0)
+            .render_tile(z, col, row)
             .expect("render_tile succeeds")
             .expect("tile has coverage");
         let img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
@@ -389,11 +420,39 @@ mod tests {
 
     #[test]
     fn zoom_range_and_bounds_empty_items_must_bail() {
-        let result = zoom_range_and_bounds::<RncCell>(&[], None, 0.0);
+        let result = Quilt::<RncCell>::new(Vec::new(), 0.0).zoom_range_and_bounds(None);
         assert!(
             result.is_err(),
             "empty items must bail, but got Ok with ±Infinity bbox"
         );
+    }
+
+    /// One 1:3 000 000 cell (native zoom 7, zoom floor 5).
+    fn overview_quilt() -> Quilt<RncCell> {
+        let bbox = Bbox {
+            west: 10.0,
+            south: 56.0,
+            east: 11.0,
+            north: 57.0,
+        };
+        let cell = RncCell::parse(
+            "OVERVIEW".to_owned(),
+            build_rnc(bbox, [200, 30, 30, 255], 3_000_000.0, "01/01/2026"),
+        )
+        .expect("cell parses");
+        Quilt::new(vec![cell], 0.0)
+    }
+
+    #[test]
+    fn max_zoom_may_not_go_below_the_zoom_floor() {
+        let quilt = overview_quilt();
+        assert!(quilt.zoom_range_and_bounds(Some(4)).is_err());
+        let (floor, ceil, _) = quilt.zoom_range_and_bounds(Some(5)).expect("at the floor");
+        assert_eq!((floor, ceil), (5, 5));
+        let (_, ceil, _) = quilt
+            .zoom_range_and_bounds(Some(6))
+            .expect("above the floor");
+        assert_eq!(ceil, 6);
     }
 
     /// `write_pmtiles` must hand tiles to the writer in ascending `TileId`
@@ -408,17 +467,22 @@ mod tests {
             east: 12.0,
             north: 58.0,
         };
-        let items = [RncCell::parse(
-            "CELL".to_owned(),
-            build_rnc(bbox, [30, 200, 30, 255], 3_000_000.0, "01/01/2026"),
-        )
-        .expect("cell parses")];
+        let quilt = Quilt::new(
+            vec![
+                RncCell::parse(
+                    "CELL".to_owned(),
+                    build_rnc(bbox, [30, 200, 30, 255], 3_000_000.0, "01/01/2026"),
+                )
+                .expect("cell parses"),
+            ],
+            0.0,
+        );
         let path = std::env::temp_dir().join(format!(
             "quilt-tiler-{}-write_pmtiles_clustered.pmtiles",
             std::process::id()
         ));
 
-        let written = write_pmtiles(&items, &path, None, 0.0);
+        let written = write_pmtiles(&quilt, &path, None);
         let archive = std::fs::read(&path);
         let _ = std::fs::remove_file(&path);
         let zooms = written.expect("write_pmtiles succeeds");
@@ -427,8 +491,9 @@ mod tests {
         ))
         .expect("archive has a valid PMTiles v3 header");
 
-        let (zoom_floor, zoom_ceil, _) =
-            zoom_range_and_bounds(&items, None, 0.0).expect("zoom range resolves");
+        let (zoom_floor, zoom_ceil, _) = quilt
+            .zoom_range_and_bounds(None)
+            .expect("zoom range resolves");
         assert_eq!(zooms, (zoom_floor, zoom_ceil));
         assert_eq!((header.min_zoom, header.max_zoom), zooms);
         // Fixture sanity: a 2×2 block or larger at some zoom, so a write
@@ -475,7 +540,9 @@ mod tests {
 
         let names: Vec<&str> = cells.iter().map(RncCell::name).collect();
         assert_eq!(names, ["GOOD"], "scale-0 cell must be skipped");
-        let (_, zoom_ceil, _) = zoom_range_and_bounds(&cells, None, 0.0).expect("non-empty items");
+        let (_, zoom_ceil, _) = Quilt::new(cells, 0.0)
+            .zoom_range_and_bounds(None)
+            .expect("non-empty items");
         assert_eq!(zoom_ceil, zoom_from_scale(3_000_000, 0.0));
     }
 }

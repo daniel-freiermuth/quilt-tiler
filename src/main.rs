@@ -191,11 +191,12 @@ fn output_identity(args: &Args) -> (String, String, String) {
 /// Convert decrypted `OESU`/`OSENC` vector cells into an MVT `PMTiles` archive.
 fn run_vector(args: &Args) -> Result<()> {
     let cells: Vec<s57::S57Cell> = loader::load_s57_cells(&args.input, args.zoom_offset);
+    let quilt = tiles::Quilt::new(cells, args.zoom_offset);
 
-    info!(parsed = cells.len(), "charts parsed, writing tiles");
+    info!(parsed = quilt.items().len(), "charts parsed, writing tiles");
 
     // Aggregate geographic bounds from parsed cells for metadata.
-    let bounds = cells.iter().fold(
+    let bounds = quilt.items().iter().fold(
         [
             f64::INFINITY,
             f64::INFINITY,
@@ -211,8 +212,7 @@ fn run_vector(args: &Args) -> Result<()> {
         },
     );
 
-    let (min_zoom, out_max_zoom) =
-        tiles::write_pmtiles(&cells, &args.output, args.max_zoom, args.zoom_offset)?;
+    let (min_zoom, out_max_zoom) = tiles::write_pmtiles(&quilt, &args.output, args.max_zoom)?;
 
     let (source_id, chart_name, tile_url) = output_identity(args);
 
@@ -262,11 +262,15 @@ fn run_vector(args: &Args) -> Result<()> {
 /// Convert raster `.rnc` cells into a PNG `PMTiles` archive.
 fn run_raster(args: &Args) -> Result<()> {
     let cells: Vec<rnc::RncCell> = loader::load_rnc_cells(&args.input, args.zoom_offset);
+    let quilt = tiles::Quilt::new(cells, args.zoom_offset);
 
-    info!(parsed = cells.len(), "raster cells parsed, writing tiles");
+    info!(
+        parsed = quilt.items().len(),
+        "raster cells parsed, writing tiles"
+    );
 
     // Aggregate geographic bounds from parsed cells for metadata.
-    let bounds = cells.iter().fold(
+    let bounds = quilt.items().iter().fold(
         [
             f64::INFINITY,
             f64::INFINITY,
@@ -283,8 +287,7 @@ fn run_raster(args: &Args) -> Result<()> {
         },
     );
 
-    let (min_zoom, out_max_zoom) =
-        tiles::write_pmtiles(&cells, &args.output, args.max_zoom, args.zoom_offset)?;
+    let (min_zoom, out_max_zoom) = tiles::write_pmtiles(&quilt, &args.output, args.max_zoom)?;
 
     let (source_id, chart_name, tile_url) = output_identity(args);
 

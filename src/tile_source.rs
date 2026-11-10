@@ -67,7 +67,7 @@ pub trait TileSource: Sync {
     /// the whole tile, so overlapping sources never double-paint.
     type Coverage: BoundedLattice + From<Bbox> + Into<Bbox> + Into<MultiPolygon> + Debug + Clone;
 
-    /// Tie-break key for `tiles::render_tile`'s candidate sort, when
+    /// Tie-break key for `tiles::Quilt::render_tile`'s candidate sort, when
     /// multiple candidates are equally well-fitted to a tile's zoom level
     /// (same floored `zoom_from_scale`) — the greater value wins the tie.
     type Tiebreaker: Ord;

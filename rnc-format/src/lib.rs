@@ -242,7 +242,7 @@ pub struct RncFooter {
     pub scale: f64,
     /// Edition date, e.g. `"01/06/2026"` (DD/MM/YYYY). Parsed downstream
     /// (`quilt_tiler::rnc::RncCell`) into a comparable date used to break
-    /// tile-selection ties — see `quilt_tiler::tiles::render_tile`.
+    /// tile-selection ties — see `quilt_tiler::tiles::Quilt::render_tile`.
     #[serde(default)]
     pub edate: String,
     /// Human-readable cell name (distinct from the `.rnc` filename, which

@@ -3,7 +3,7 @@
 //!
 //! Consumed by [`crate::S57Cell`]'s and `RncCell`'s [`Ord`] impls to break
 //! ties between cells the tile quilter ranks as otherwise equally suited to
-//! a tile's zoom level (see `quilt_tiler::tiles::render_tile`): the more
+//! a tile's zoom level (see `quilt_tiler::tiles::Quilt::render_tile`): the more
 //! recently published/updated cell wins.
 
 /// Comparable calendar date, canonicalised to `CCYY * 10_000 + MM * 100 + DD`
