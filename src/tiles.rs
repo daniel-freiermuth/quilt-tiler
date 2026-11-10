@@ -196,14 +196,22 @@ pub enum TileOutcome {
 /// A sparse quilt omits a tile at zoom `z` when every item contributing to
 /// it has a [`TileSource::detail_zoom`] coarser than `z` — decided from the
 /// bbox candidates alone when they all are, skipping the polygon algebra.
-/// Such a tile equals its nearest stored ancestor clipped to it: let `D` be
-/// the finest detail zoom among its contributors. Any item overlapping the
-/// tile with a native zoom finer than `D` would sort ahead of them and
+/// Such a tile shows what its nearest stored ancestor shows there: let `D`
+/// be the finest detail zoom among its contributors. Any item overlapping
+/// the tile with a native zoom finer than `D` would sort ahead of them and
 /// contribute, so none exists — the candidate order inside the tile is
 /// therefore the same at every zoom from `D` to `z`, and each contributor
-/// renders identically at or above its detail zoom. The ancestor at `D` is
-/// stored (its contributor with detail zoom `D` keeps it), so the nearest
-/// stored ancestor lies in `D..z`.
+/// renders the same features at or above its detail zoom. The ancestor at
+/// `D` is stored (its contributor with detail zoom `D` keeps it), so the
+/// nearest stored ancestor lies in `D..z`.
+///
+/// Same content, not same positions: a vector tile rounds vertices to a
+/// 4096-step grid across itself, so a tile sliced from an ancestor `g`
+/// levels up keeps a grid `2^g` times coarser (`2^g / 8` screen px for
+/// 512 px tiles; ~21 m at 57°N for a z8 ancestor) and its lines can kink and
+/// jump where they meet a stored neighbour. Accepted: the charts that end up
+/// sliced that deep are far less accurate than that grid. Raster ancestors
+/// are likewise upscaled rather than resampled from the source.
 ///
 /// `MapLibre` searches at most [`CLIENT_ANCESTOR_SEARCH`] levels up, so
 /// gaps deeper than that draw nothing there — see
