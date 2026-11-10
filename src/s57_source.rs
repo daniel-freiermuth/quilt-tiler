@@ -277,6 +277,17 @@ impl TileAccumulator for S57Accumulator {
         }
         Ok(out)
     }
+
+    /// One point in a layer no style references — mlt-core encodes a layer
+    /// without features to nothing.
+    fn blank() -> Result<Vec<u8>> {
+        let mut layer = LayerBuf::new("blank")?;
+        layer.push(geo::Geometry::Point(Point::new(0, 0)), Vec::new())?;
+        layer
+            .finish()
+            .encode(EncoderConfig::default())
+            .context("encoding blank MLT layer")
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1167,6 +1178,32 @@ mod tests {
             layers["ADMARE"].len(),
             1,
             "only the feature inside the tile"
+        );
+    }
+
+    #[test]
+    fn blank_is_one_unstyled_mlt_layer() {
+        let blank = S57Accumulator::blank().expect("blank encodes");
+        let layers = mlt_core::Parser::default()
+            .parse_layers(&blank)
+            .expect("blank parses as MLT");
+        let names: Vec<&str> = layers
+            .iter()
+            .map(|l| l.as_layer01().expect("MLT v1 layer").name())
+            .collect();
+        assert_eq!(names, ["blank"]);
+        let style: serde_json::Value = serde_json::from_str(
+            &crate::style::build_style(3.0, 10.0, "http://x/{z}/{x}/{y}", 0, 18, true)
+                .expect("style builds"),
+        )
+        .expect("style is JSON");
+        assert!(
+            style["layers"]
+                .as_array()
+                .expect("layers array")
+                .iter()
+                .all(|l| l["source-layer"] != "blank"),
+            "no style layer may draw the blank layer"
         );
     }
 

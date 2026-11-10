@@ -117,7 +117,7 @@ enum ServedTile {
 impl From<tiles::TileOutcome> for ServedTile {
     fn from(outcome: tiles::TileOutcome) -> Self {
         match outcome {
-            tiles::TileOutcome::Empty => Self::Empty,
+            tiles::TileOutcome::Uncovered | tiles::TileOutcome::Blank => Self::Empty,
             tiles::TileOutcome::Omitted => Self::Omitted,
             tiles::TileOutcome::Rendered(bytes) => Self::Data(Bytes::from(bytes)),
         }
@@ -421,6 +421,7 @@ async fn main() -> Result<()> {
             anyhow::ensure!(!cells.is_empty(), "no vector cells parsed from input");
             let quilt = tiles::Quilt::new(cells, args.zoom_offset, args.sparse);
             let (min_zoom, max_zoom, _bounds) = quilt.zoom_range_and_bounds(args.max_zoom)?;
+            quilt.warn_unreachable_ancestors(max_zoom);
             info!(
                 cells = quilt.items().len(),
                 min_zoom,
@@ -439,6 +440,7 @@ async fn main() -> Result<()> {
             anyhow::ensure!(!cells.is_empty(), "no raster cells parsed from input");
             let quilt = tiles::Quilt::new(cells, args.zoom_offset, args.sparse);
             let (min_zoom, max_zoom, _bounds) = quilt.zoom_range_and_bounds(args.max_zoom)?;
+            quilt.warn_unreachable_ancestors(max_zoom);
             info!(
                 cells = quilt.items().len(),
                 min_zoom,

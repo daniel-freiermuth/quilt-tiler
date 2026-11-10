@@ -44,6 +44,15 @@ pub trait TileAccumulator: Send {
     /// # Errors
     /// Returns an error if serialisation fails.
     fn encode(self) -> Result<Vec<u8>>;
+
+    /// Non-empty tile bytes that draw nothing. A sparse archive stores this
+    /// for a covered tile whose content encodes to nothing: `PMTiles` cannot
+    /// hold an empty tile, and leaving it out would make the client fill it
+    /// from an ancestor instead.
+    ///
+    /// # Errors
+    /// Returns an error if serialisation fails.
+    fn blank() -> Result<Vec<u8>>;
 }
 
 /// A source of data that can be quilted into a `PMTiles` archive.

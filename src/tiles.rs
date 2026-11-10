@@ -18,7 +18,7 @@ use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
 use martin_tile_utils::{bbox_to_xyz, wgs84_to_webmercator, xyz_to_bbox};
 use pmtiles::{PmTilesWriter, TileCoord, TileId};
 use rayon::prelude::*;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::bbox::Bbox;
 use crate::lattice::BoundedLattice;
@@ -29,11 +29,14 @@ use crate::zoom::{scale_from_zoom, zoom_from_scale};
 /// A single encoded tile ready for insertion into the output archive.
 type EncodedTile = (u64, TileCoord, Vec<u8>);
 
+/// The tiles an archive stores, keyed (and so ordered) by `PMTiles` tile ID.
+type ArchiveTiles = BTreeMap<u64, (TileCoord, Vec<u8>)>;
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-/// Quilt `quilt`'s items into a `PMTiles` v3 archive at `output`, leaving
-/// out [`TileOutcome::Empty`] and [`TileOutcome::Omitted`] tiles. Returns
-/// `(min_zoom, max_zoom)`.
+/// Quilt `quilt`'s items into a `PMTiles` v3 archive at `output`.
+///
+/// Stores the tiles [`archive_tiles`] keeps. Returns `(min_zoom, max_zoom)`.
 ///
 /// # Errors
 /// Returns an error if `max_zoom` is below the data's minimum zoom, a tile
@@ -43,10 +46,59 @@ pub fn write_pmtiles<S: TileSource>(
     output: &Path,
     max_zoom: Option<u8>,
 ) -> Result<(u8, u8)> {
-    let mut tile_bytes: BTreeMap<u64, (TileCoord, Vec<u8>)> = BTreeMap::new();
-    let omitted = AtomicU64::new(0);
-
     let (zoom_floor, zoom_ceil, overall) = quilt.zoom_range_and_bounds(max_zoom)?;
+    quilt.warn_unreachable_ancestors(zoom_ceil);
+    let tile_bytes = archive_tiles(quilt, zoom_floor..=zoom_ceil, overall)?;
+
+    let metadata = build_metadata(quilt.is_sparse());
+    let file = File::create(output).with_context(|| format!("creating {}", output.display()))?;
+    let mut writer = PmTilesWriter::new(S::tile_type())
+        .min_zoom(zoom_floor)
+        .max_zoom(zoom_ceil)
+        .bounds(overall.west, overall.south, overall.east, overall.north)
+        .metadata(&metadata)
+        .create(file)
+        .context("creating PMTiles writer")?;
+
+    let pb_write = ProgressBar::new(tile_bytes.len() as u64).with_style(bar_style());
+    {
+        profiling::scope!("writing pmtiles");
+        for (_, (coord, bytes)) in tile_bytes {
+            writer.add_tile(coord, &bytes).context("writing tile")?;
+            pb_write.inc(1);
+        }
+    }
+    pb_write.finish_and_clear();
+    {
+        profiling::scope!("finalizing pmtiles");
+        writer.finalize().context("finalizing PMTiles")?;
+    }
+
+    info!(output = %output.display(), "PMTiles written");
+    Ok((zoom_floor, zoom_ceil))
+}
+
+/// Render every tile position of `overall` at `zooms` and keep the ones an
+/// archive stores: [`TileOutcome::Rendered`] bytes, and for a sparse quilt
+/// [`TileAccumulator::blank`] in place of [`TileOutcome::Blank`] (a missing
+/// tile would make the client fill it from an ancestor). Uncovered and
+/// omitted tiles are left out.
+///
+/// # Errors
+/// Returns an error if a tile fails to render or encode.
+fn archive_tiles<S: TileSource>(
+    quilt: &Quilt<S>,
+    zooms: std::ops::RangeInclusive<u8>,
+    overall: Bbox,
+) -> Result<ArchiveTiles> {
+    let mut tile_bytes = ArchiveTiles::new();
+    let omitted = AtomicU64::new(0);
+    let blank = if quilt.is_sparse() {
+        Some(S::Accumulator::blank()?)
+    } else {
+        None
+    };
+    let (zoom_floor, zoom_ceil) = (*zooms.start(), *zooms.end());
 
     let total_tiles: u64 = (zoom_floor..=zoom_ceil)
         .map(|z| {
@@ -90,11 +142,15 @@ pub fn write_pmtiles<S: TileSource>(
 
                 let bytes = match quilt.render_tile(z, col, row)? {
                     TileOutcome::Rendered(bytes) => bytes,
+                    TileOutcome::Blank => match &blank {
+                        Some(blank) => blank.clone(),
+                        None => return Ok(None),
+                    },
                     TileOutcome::Omitted => {
                         omitted.fetch_add(1, Ordering::Relaxed);
                         return Ok(None);
                     }
-                    TileOutcome::Empty => return Ok(None),
+                    TileOutcome::Uncovered => return Ok(None),
                 };
                 let coord = TileCoord::new(z, col, row).context("invalid tile coord")?;
                 Ok(Some((TileId::from(coord).value(), coord, bytes)))
@@ -112,41 +168,16 @@ pub fn write_pmtiles<S: TileSource>(
         omitted = omitted.into_inner(),
         "tiles encoded"
     );
-
-    let metadata = build_metadata(quilt.is_sparse());
-    let file = File::create(output).with_context(|| format!("creating {}", output.display()))?;
-    let mut writer = PmTilesWriter::new(S::tile_type())
-        .min_zoom(zoom_floor)
-        .max_zoom(zoom_ceil)
-        .bounds(overall.west, overall.south, overall.east, overall.north)
-        .metadata(&metadata)
-        .create(file)
-        .context("creating PMTiles writer")?;
-
-    let pb_write = ProgressBar::new(tile_bytes.len() as u64).with_style(bar_style());
-    {
-        profiling::scope!("writing pmtiles");
-        for (_, (coord, bytes)) in tile_bytes {
-            writer.add_tile(coord, &bytes).context("writing tile")?;
-            pb_write.inc(1);
-        }
-    }
-    pb_write.finish_and_clear();
-    {
-        profiling::scope!("finalizing pmtiles");
-        writer.finalize().context("finalizing PMTiles")?;
-    }
-
-    info!(output = %output.display(), "PMTiles written");
-    Ok((zoom_floor, zoom_ceil))
+    Ok(tile_bytes)
 }
 
 /// What [`Quilt::render_tile`] produced for one tile.
 #[derive(Debug, PartialEq, Eq)]
 pub enum TileOutcome {
-    /// Nothing to draw: no item covers the tile, or the covering items have
-    /// no content in it.
-    Empty,
+    /// No item's coverage reaches the tile, at this zoom or any other.
+    Uncovered,
+    /// Items cover the tile but their content draws nothing there.
+    Blank,
     /// Left out of a sparse quilt: the client rebuilds it from its nearest
     /// stored ancestor (a `MapLibre` `sparse` vector source slices that
     /// ancestor, a raster source upscales it) — see [`Quilt`]. Also reported
@@ -172,8 +203,11 @@ pub enum TileOutcome {
 /// therefore the same at every zoom from `D` to `z`, and each contributor
 /// renders identically at or above its detail zoom. The ancestor at `D` is
 /// stored (its contributor with detail zoom `D` keeps it), so the nearest
-/// stored ancestor lies in `D..z`. `MapLibre` searches at most 10 levels up;
-/// deeper gaps draw nothing there.
+/// stored ancestor lies in `D..z`.
+///
+/// `MapLibre` searches at most [`CLIENT_ANCESTOR_SEARCH`] levels up, so
+/// gaps deeper than that draw nothing there — see
+/// [`Quilt::warn_unreachable_ancestors`].
 pub struct Quilt<S> {
     items: Vec<S>,
     /// Per-item data, indexed like `items`.
@@ -181,6 +215,10 @@ pub struct Quilt<S> {
     zoom_offset: f64,
     sparse: bool,
 }
+
+/// How many zoom levels up `MapLibre` GL JS looks for a stored ancestor of a
+/// missing tile (`TileManager.maxUnderzooming`).
+pub const CLIENT_ANCESTOR_SEARCH: u8 = 10;
 
 /// What [`Quilt::render_tile`] needs from an item on every tile, computed
 /// once: [`TileSource::coverage`] clones a whole polygon and the zooms take
@@ -221,6 +259,31 @@ impl<S: TileSource> Quilt<S> {
     #[must_use]
     pub const fn is_sparse(&self) -> bool {
         self.sparse
+    }
+
+    /// Warn when a sparse quilt leaves tiles whose nearest stored ancestor
+    /// lies beyond [`CLIENT_ANCESTOR_SEARCH`]: below `zoom_ceil`, an area
+    /// only covered by an item with a detail zoom that much coarser renders
+    /// empty in `MapLibre`.
+    pub fn warn_unreachable_ancestors(&self, zoom_ceil: u8) {
+        if !self.sparse {
+            return;
+        }
+        let reach = zoom_ceil.saturating_sub(CLIENT_ANCESTOR_SEARCH);
+        let affected = self.meta.iter().filter(|m| m.detail_zoom < reach).count();
+        if let Some(coarsest) = self.meta.iter().map(|m| m.detail_zoom).min()
+            && affected > 0
+        {
+            warn!(
+                affected,
+                coarsest_detail_zoom = coarsest,
+                zoom_ceil,
+                "items whose detail zoom is more than {CLIENT_ANCESTOR_SEARCH} levels below the \
+                 max zoom: where only they cover, MapLibre finds no stored ancestor from zoom {} \
+                 up and draws nothing",
+                coarsest + CLIENT_ANCESTOR_SEARCH + 1
+            );
+        }
     }
 
     /// Compute `(zoom_floor, zoom_ceil, overall_bbox)`: the tile zoom range
@@ -281,7 +344,7 @@ impl<S: TileSource> Quilt<S> {
         };
 
         if candidates.is_empty() {
-            return Ok(TileOutcome::Empty);
+            return Ok(TileOutcome::Uncovered);
         }
         // Contributors are a subset of candidates, so this decides the
         // common open-water case without any polygon algebra.
@@ -326,7 +389,7 @@ impl<S: TileSource> Quilt<S> {
         }
 
         if contributions.is_empty() {
-            return Ok(TileOutcome::Empty);
+            return Ok(TileOutcome::Uncovered);
         }
         if self.sparse && contributions.iter().all(|&(i, _)| meta[i].detail_zoom < z) {
             return Ok(TileOutcome::Omitted);
@@ -348,7 +411,7 @@ impl<S: TileSource> Quilt<S> {
 
         let bytes = acc.encode()?;
         Ok(if bytes.is_empty() {
-            TileOutcome::Empty
+            TileOutcome::Blank
         } else {
             TileOutcome::Rendered(bytes)
         })
@@ -400,6 +463,7 @@ mod tests {
 
     use super::*;
     use crate::rnc::RncCell;
+    use crate::rnc_source::RasterAccumulator;
 
     /// Build a minimal single-tile `.rnc` byte buffer: one `8×8` solid-color
     /// PNG, rectangular `cover` (the bbox itself), given `edate`.
@@ -519,7 +583,7 @@ mod tests {
 
     /// A sparse quilt must store every tile some contributor still adds
     /// detail to — including mixed tiles — omit the rest, and keep reporting
-    /// uncovered tiles as `Empty` (a live server answers those 204, not 404).
+    /// uncovered tiles as such (a live server answers those 204, not 404).
     #[test]
     fn sparse_quilt_omits_exactly_the_tiles_past_every_contributors_detail_zoom() {
         let coarse = RncCell::parse(
@@ -562,7 +626,8 @@ mod tests {
         let outcome = |lon: f64, lat: f64, z: u8| {
             let (col, row, _, _) = bbox_to_xyz(lon, lat, lon, lat, z);
             match sparse.render_tile(z, col, row).expect("renders") {
-                TileOutcome::Empty => "empty",
+                TileOutcome::Uncovered => "uncovered",
+                TileOutcome::Blank => "blank",
                 TileOutcome::Omitted => "omitted",
                 TileOutcome::Rendered(_) => "rendered",
             }
@@ -578,7 +643,7 @@ mod tests {
         assert_eq!(outcome(10.5, 56.5, 13), "rendered");
         assert_eq!(outcome(10.5, 56.5, 14), "omitted");
         // Nothing there at all is never "omitted".
-        assert_eq!(outcome(50.0, 0.0, 10), "empty");
+        assert_eq!(outcome(50.0, 0.0, 10), "uncovered");
 
         let dense = Quilt::new(sparse.items, 0.0, false);
         let (col, row, _, _) = bbox_to_xyz(10.05, 56.95, 10.05, 56.95, 10);
@@ -591,6 +656,150 @@ mod tests {
         );
     }
 
+    /// Color of the pixel at `(lon, lat)` in raster tile `(z, col, row)`.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn pixel_at(png: &[u8], (z, col, row): (u8, u32, u32), lon: f64, lat: f64) -> [u8; 4] {
+        let img = image::load_from_memory_with_format(png, image::ImageFormat::Png)
+            .expect("tile decodes")
+            .to_rgba8();
+        let merc = tile_mercator_bbox(Bbox::from(xyz_to_bbox(z, col, row, col, row)));
+        let (x, y) = wgs84_to_webmercator(lon, lat);
+        let px = f64::from(crate::rnc_source::TILE_PX);
+        let ix = ((x - merc.west) / (merc.east - merc.west) * px) as u32;
+        let iy = ((merc.north - y) / (merc.north - merc.south) * px) as u32;
+        img.get_pixel(ix.min(255), iy.min(255)).0
+    }
+
+    /// What a sparse archive leaves out must look, at each spot, like the
+    /// nearest stored ancestor the client falls back to — and that must be
+    /// what the dense quilt renders there. Covers the case where ancestor
+    /// and child pick different charts: CLEAR (native z13, transparent)
+    /// wins its z13 tiles and draws nothing, while at z12 MID (native z12,
+    /// blue) wins the same spot. Leaving that z13 tile out would let MID's
+    /// blue show through, so the archive must store a blank instead.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one fixture, one invariant sweep
+    fn sparse_archive_omissions_match_their_nearest_stored_ancestor() {
+        let boxes = [
+            (
+                "COARSE",
+                (10.4, 56.4, 10.6, 56.6),
+                [200, 30, 30, 255],
+                3_000_000.0,
+            ),
+            (
+                "FINE",
+                (10.43, 56.43, 10.5, 56.5),
+                [30, 200, 30, 255],
+                50_000.0,
+            ),
+            (
+                "MID",
+                (10.52, 56.52, 10.6, 56.6),
+                [30, 30, 200, 255],
+                100_000.0,
+            ),
+            ("CLEAR", (10.54, 56.54, 10.6, 56.6), [0, 0, 0, 0], 50_000.0),
+        ];
+        let items = || {
+            boxes
+                .iter()
+                .map(|&(name, (west, south, east, north), color, scale)| {
+                    let bbox = Bbox {
+                        west,
+                        south,
+                        east,
+                        north,
+                    };
+                    RncCell::parse(name.to_owned(), build_rnc(bbox, color, scale, "01/01/2026"))
+                        .expect("cell parses")
+                })
+                .collect::<Vec<_>>()
+        };
+        let sparse = Quilt::new(items(), 0.0, true);
+        let dense = Quilt::new(items(), 0.0, false);
+        let (floor, ceil, overall) = sparse.zoom_range_and_bounds(None).expect("zoom range");
+        let stored = archive_tiles(&sparse, floor..=ceil, overall).expect("archive renders");
+        let blank = RasterAccumulator::blank().expect("blank encodes");
+        assert!(
+            stored.values().any(|(_, bytes)| *bytes == blank),
+            "fixture sanity: CLEAR's z13 tiles must be stored as blanks"
+        );
+        let dense_stored = archive_tiles(&dense, floor..=ceil, overall).expect("dense renders");
+        assert!(
+            dense_stored.values().all(|(_, bytes)| *bytes != blank),
+            "a dense archive leaves blank tiles out (it is never sliced from an ancestor)"
+        );
+
+        // Sample each tile at its center, unless that is within two pixels
+        // of the coarsest stored tile of a chart edge (raster upscaling
+        // smears edges; the claim is about which chart shows, not about
+        // resampling).
+        let near_edge = |lon: f64, lat: f64, tol: f64| {
+            boxes.iter().any(|(_, (w, s, e, n), _, _)| {
+                [lon - w, e - lon, lat - s, n - lat]
+                    .iter()
+                    .any(|d| d.abs() < tol)
+            })
+        };
+        let mut omitted = 0;
+        for z in floor..=ceil {
+            let (c0, r0, c1, r1) =
+                bbox_to_xyz(overall.west, overall.south, overall.east, overall.north, z);
+            for col in c0..=c1 {
+                for row in r0..=r1 {
+                    let id = |z, col, row| {
+                        TileId::from(TileCoord::new(z, col, row).expect("valid coord")).value()
+                    };
+                    if stored.contains_key(&id(z, col, row)) {
+                        continue;
+                    }
+                    let expected = match dense.render_tile(z, col, row).expect("dense renders") {
+                        TileOutcome::Uncovered => continue,
+                        TileOutcome::Blank => blank.clone(),
+                        TileOutcome::Rendered(bytes) => bytes,
+                        TileOutcome::Omitted => unreachable!("dense quilts never omit"),
+                    };
+                    omitted += 1;
+                    let tile = Bbox::from(xyz_to_bbox(z, col, row, col, row));
+                    let (lon, lat) = (
+                        f64::midpoint(tile.west, tile.east),
+                        f64::midpoint(tile.south, tile.north),
+                    );
+                    let (az, (acol, arow), ancestor) = (1..=CLIENT_ANCESTOR_SEARCH)
+                        .filter_map(|up| z.checked_sub(up))
+                        .find_map(|az| {
+                            let shift = z - az;
+                            let at = (col >> shift, row >> shift);
+                            stored.get(&id(az, at.0, at.1)).map(|(_, b)| (az, at, b))
+                        })
+                        .unwrap_or_else(|| {
+                            panic!("z{z}/{col}/{row}: no stored ancestor within reach")
+                        });
+                    let ancestor_px_deg = 360.0 / f64::from(1u32 << az) / 256.0;
+                    if near_edge(lon, lat, 2.0 * ancestor_px_deg) {
+                        continue;
+                    }
+                    assert_eq!(
+                        pixel_at(ancestor, (az, acol, arow), lon, lat),
+                        pixel_at(&expected, (z, col, row), lon, lat),
+                        "z{z}/{col}/{row}: fallback to z{az} must show what a dense render shows"
+                    );
+                }
+            }
+        }
+        assert!(omitted > 0, "fixture sanity: something must be omitted");
+
+        let metadata = |sparse| -> serde_json::Value {
+            serde_json::from_str(&build_metadata(sparse)).expect("metadata is JSON")
+        };
+        assert_eq!(metadata(true)["sparse"], true, "tileserver-gl reads this");
+        assert!(
+            metadata(false).get("sparse").is_none(),
+            "dense raster archives keep tileserver-gl's raster default"
+        );
+    }
+
     #[test]
     fn zoom_range_and_bounds_empty_items_must_bail() {
         let result = Quilt::<RncCell>::new(Vec::new(), 0.0, false).zoom_range_and_bounds(None);
@@ -600,8 +809,8 @@ mod tests {
         );
     }
 
-    /// One 1:3 000 000 cell (native zoom 7, zoom floor 5).
-    fn overview_quilt() -> Quilt<RncCell> {
+    /// One 1:3 000 000 cell (native and detail zoom 7, zoom floor 5).
+    fn overview_quilt(sparse: bool) -> Quilt<RncCell> {
         let bbox = Bbox {
             west: 10.0,
             south: 56.0,
@@ -613,12 +822,12 @@ mod tests {
             build_rnc(bbox, [200, 30, 30, 255], 3_000_000.0, "01/01/2026"),
         )
         .expect("cell parses");
-        Quilt::new(vec![cell], 0.0, false)
+        Quilt::new(vec![cell], 0.0, sparse)
     }
 
     #[test]
     fn max_zoom_may_not_go_below_the_zoom_floor() {
-        let quilt = overview_quilt();
+        let quilt = overview_quilt(false);
         assert!(quilt.zoom_range_and_bounds(Some(4)).is_err());
         let (floor, ceil, _) = quilt.zoom_range_and_bounds(Some(5)).expect("at the floor");
         assert_eq!((floor, ceil), (5, 5));
@@ -626,6 +835,49 @@ mod tests {
             .zoom_range_and_bounds(Some(6))
             .expect("above the floor");
         assert_eq!(ceil, 6);
+    }
+
+    /// Log lines `warn_unreachable_ancestors` emits for `zoom_ceil`.
+    fn unreachable_warnings(quilt: &Quilt<RncCell>, zoom_ceil: u8) -> String {
+        #[derive(Clone, Default)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("capture lock").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            quilt.warn_unreachable_ancestors(zoom_ceil);
+        });
+        let bytes = capture.0.lock().expect("capture lock").clone();
+        String::from_utf8(bytes).expect("log is UTF-8")
+    }
+
+    #[test]
+    fn warns_exactly_when_an_ancestor_is_out_of_client_reach() {
+        // Detail zoom 7: from z17 the walk still reaches z7, from z18 not.
+        let sparse = overview_quilt(true);
+        assert_eq!(unreachable_warnings(&sparse, 17), "");
+        let warning = unreachable_warnings(&sparse, 18);
+        assert!(
+            warning.contains("WARN") && warning.contains("affected=1"),
+            "got: {warning}"
+        );
+        assert_eq!(
+            unreachable_warnings(&overview_quilt(false), 18),
+            "",
+            "a dense quilt leaves no gaps"
+        );
     }
 
     /// A finer cell whose bbox reaches a tile but whose cover polygon does
