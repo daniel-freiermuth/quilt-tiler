@@ -3,7 +3,7 @@
 //!
 //! Parses all input cells once at startup, then serves `MapLibre` GL tiles
 //! and a matching `style.json` on demand — same quilting/coverage logic as
-//! the batch `quilt-tiler` binary ([`quilt_tiler::tiles::render_tile`]), just
+//! the batch `quilt-tiler` binary ([`quilt_tiler::tiles::Quilt::render_tile`]), just
 //! computed per request instead of written to a `PMTiles` archive.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
@@ -78,18 +78,18 @@ struct Args {
     cache_mb: u64,
 }
 
-/// The parsed cells this server quilts tiles from, plus the zoom range
-/// [`quilt_tiler::tiles::zoom_range_and_bounds`] computed for them once at
-/// startup — recomputing it per request would be pure overhead since the
+/// The quilt this server renders tiles from, plus the zoom range
+/// [`quilt_tiler::tiles::Quilt::zoom_range_and_bounds`] computed for it once
+/// at startup — recomputing it per request would be pure overhead since the
 /// cell set never changes for the life of the process.
 enum Sources {
     Vector {
-        cells: Vec<s57::S57Cell>,
+        quilt: tiles::Quilt<s57::S57Cell>,
         min_zoom: u8,
         max_zoom: u8,
     },
     Raster {
-        cells: Vec<rnc::RncCell>,
+        quilt: tiles::Quilt<rnc::RncCell>,
         min_zoom: u8,
         max_zoom: u8,
     },
@@ -185,7 +185,6 @@ struct AppState {
     public_url: Option<String>,
     safety_depth: f64,
     shoal_depth: f64,
-    zoom_offset: f64,
     /// See [`build_id`].
     build_id: String,
 }
@@ -210,12 +209,8 @@ impl AppState {
     /// [`TileSource`] impl. Bypasses the cache.
     fn render_uncached(&self, z: u8, x: u32, y: u32) -> Result<Option<Bytes>> {
         match &self.sources {
-            Sources::Vector { cells, .. } => {
-                Ok(tiles::render_tile(cells, z, x, y, self.zoom_offset)?.map(Bytes::from))
-            }
-            Sources::Raster { cells, .. } => {
-                Ok(tiles::render_tile(cells, z, x, y, self.zoom_offset)?.map(Bytes::from))
-            }
+            Sources::Vector { quilt, .. } => Ok(quilt.render_tile(z, x, y)?.map(Bytes::from)),
+            Sources::Raster { quilt, .. } => Ok(quilt.render_tile(z, x, y)?.map(Bytes::from)),
         }
     }
 
@@ -380,14 +375,14 @@ async fn main() -> Result<()> {
         0 => {
             let cells = loader::load_s57_cells(&args.input, args.zoom_offset);
             anyhow::ensure!(!cells.is_empty(), "no vector cells parsed from input");
-            let (min_zoom, max_zoom, _bounds) =
-                tiles::zoom_range_and_bounds(&cells, args.max_zoom, args.zoom_offset)?;
+            let quilt = tiles::Quilt::new(cells, args.zoom_offset);
+            let (min_zoom, max_zoom, _bounds) = quilt.zoom_range_and_bounds(args.max_zoom)?;
             info!(
-                cells = cells.len(),
+                cells = quilt.items().len(),
                 min_zoom, max_zoom, "vector cells loaded"
             );
             Sources::Vector {
-                cells,
+                quilt,
                 min_zoom,
                 max_zoom,
             }
@@ -395,14 +390,14 @@ async fn main() -> Result<()> {
         n if n == args.input.len() => {
             let cells = loader::load_rnc_cells(&args.input, args.zoom_offset);
             anyhow::ensure!(!cells.is_empty(), "no raster cells parsed from input");
-            let (min_zoom, max_zoom, _bounds) =
-                tiles::zoom_range_and_bounds(&cells, args.max_zoom, args.zoom_offset)?;
+            let quilt = tiles::Quilt::new(cells, args.zoom_offset);
+            let (min_zoom, max_zoom, _bounds) = quilt.zoom_range_and_bounds(args.max_zoom)?;
             info!(
-                cells = cells.len(),
+                cells = quilt.items().len(),
                 min_zoom, max_zoom, "raster cells loaded"
             );
             Sources::Raster {
-                cells,
+                quilt,
                 min_zoom,
                 max_zoom,
             }
@@ -431,7 +426,6 @@ async fn main() -> Result<()> {
         public_url: args.public_url,
         safety_depth: args.safety_depth,
         shoal_depth: args.shoal_depth,
-        zoom_offset: args.zoom_offset,
         build_id: build_id(),
     });
 
@@ -507,7 +501,7 @@ mod tests {
     fn empty_test_state() -> Arc<AppState> {
         Arc::new(AppState {
             sources: Sources::Vector {
-                cells: Vec::new(),
+                quilt: tiles::Quilt::new(Vec::new(), 0.0),
                 min_zoom: 0,
                 max_zoom: 5,
             },
@@ -515,7 +509,6 @@ mod tests {
             public_url: Some("http://chart.test".into()),
             safety_depth: 10.0,
             shoal_depth: 2.0,
-            zoom_offset: 0.0,
             build_id: "v-test".to_string(),
         })
     }
@@ -612,7 +605,7 @@ mod tests {
     fn content_type_uses_maplibre_ecosystem_mime_types() {
         let vector_state = AppState {
             sources: Sources::Vector {
-                cells: Vec::new(),
+                quilt: tiles::Quilt::new(Vec::new(), 0.0),
                 min_zoom: 0,
                 max_zoom: 0,
             },
@@ -620,7 +613,6 @@ mod tests {
             public_url: None,
             safety_depth: 0.0,
             shoal_depth: 0.0,
-            zoom_offset: 0.0,
             build_id: String::new(),
         };
         assert_eq!(
@@ -631,7 +623,7 @@ mod tests {
 
         let raster_state = AppState {
             sources: Sources::Raster {
-                cells: Vec::new(),
+                quilt: tiles::Quilt::new(Vec::new(), 0.0),
                 min_zoom: 0,
                 max_zoom: 0,
             },
@@ -639,7 +631,6 @@ mod tests {
             public_url: None,
             safety_depth: 0.0,
             shoal_depth: 0.0,
-            zoom_offset: 0.0,
             build_id: String::new(),
         };
         assert_eq!(
