@@ -548,7 +548,13 @@ mod tests {
         let parse = |cols, bbox| {
             RncCell::parse(
                 "TEST".to_owned(),
-                build_rnc(cols, 1, bbox, [1, 2, 3, 255], 3_000_000.0),
+                build_rnc(
+                    cols,
+                    1,
+                    bbox,
+                    &vec![[1, 2, 3, 255]; cols as usize],
+                    3_000_000.0,
+                ),
             )
             .expect("valid .rnc parses")
         };
@@ -568,7 +574,7 @@ mod tests {
         // 1:1 000 000 000 cell's native zoom is 0, so pixels decide.)
         let exact = RncCell::parse(
             "TEST".to_owned(),
-            build_rnc(1, 1, at(12.406_25), [1, 2, 3, 255], 1_000_000_000.0),
+            build_rnc(1, 1, at(12.406_25), &[[1, 2, 3, 255]], 1_000_000_000.0),
         )
         .expect("valid .rnc parses");
         assert_eq!(exact.detail_zoom(0.0), 3);
