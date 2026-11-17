@@ -8,6 +8,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 use std::net::SocketAddr;
+use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -124,18 +125,18 @@ impl From<tiles::TileOutcome> for ServedTile {
     }
 }
 
-/// `(z, x, y)` → served tile. Caching `Empty`/`Omitted` too matters: a
+/// Tile → served tile. Caching `Empty`/`Omitted` too matters: a
 /// marine chart's open-water tiles repeat the same result over huge
 /// stretches of panning, and that's still real candidate-filtering work
 /// across every loaded cell without this.
-type TileCache = Cache<(u8, u32, u32), ServedTile>;
+type TileCache = Cache<tiles::TileXyz, ServedTile>;
 
 /// Weigh a cached entry by its tile size in bytes (a bodyless entry counts
 /// as a small fixed weight) — bounds the cache by approximate memory use
 /// rather than a fixed entry count, since tile sizes vary from a few hundred
 /// bytes to several hundred KB.
 #[allow(clippy::cast_possible_truncation)] // tiles are well under u32::MAX bytes
-const fn tile_weight(_key: &(u8, u32, u32), value: &ServedTile) -> u32 {
+const fn tile_weight(_key: &tiles::TileXyz, value: &ServedTile) -> u32 {
     match value {
         ServedTile::Data(bytes) => bytes.len() as u32 + 64,
         ServedTile::Empty | ServedTile::Omitted => 64,
@@ -236,27 +237,39 @@ impl AppState {
         }
     }
 
-    /// Render one `(z, x, y)` tile, dispatching to the loaded source's
+    /// Zooms this server serves — the range `style.json` advertises.
+    const fn zoom_range(&self) -> RangeInclusive<u8> {
+        match &self.sources {
+            Sources::Vector {
+                min_zoom, max_zoom, ..
+            }
+            | Sources::Raster {
+                min_zoom, max_zoom, ..
+            } => *min_zoom..=*max_zoom,
+        }
+    }
+
+    /// Render one tile, dispatching to the loaded source's
     /// [`TileSource`] impl. Bypasses the cache.
-    fn render_uncached(&self, z: u8, x: u32, y: u32) -> Result<ServedTile> {
+    fn render_uncached(&self, tile: tiles::TileXyz) -> Result<ServedTile> {
         Ok(match &self.sources {
-            Sources::Vector { quilt, .. } => quilt.render_tile(z, x, y)?.into(),
-            Sources::Raster { quilt, .. } => quilt.render_tile(z, x, y)?.into(),
+            Sources::Vector { quilt, .. } => quilt.render_tile(tile)?.into(),
+            Sources::Raster { quilt, .. } => quilt.render_tile(tile)?.into(),
         })
     }
 
-    /// Render `(z, x, y)`, transparently caching the result (including
+    /// Render `tile`, transparently caching the result (including
     /// bodyless ones) when a cache is configured.
     ///
     /// Concurrent requests for the same uncached tile are coalesced by
     /// [`moka::sync::Cache::try_get_with`]: only one render runs, the rest
     /// wait for its result instead of duplicating the work.
-    fn render(&self, z: u8, x: u32, y: u32) -> Result<ServedTile> {
+    fn render(&self, tile: tiles::TileXyz) -> Result<ServedTile> {
         self.cache.as_ref().map_or_else(
-            || self.render_uncached(z, x, y),
+            || self.render_uncached(tile),
             |cache| {
                 cache
-                    .try_get_with((z, x, y), || self.render_uncached(z, x, y))
+                    .try_get_with(tile, || self.render_uncached(tile))
                     .map_err(|e| anyhow::anyhow!("{e}"))
             },
         )
@@ -336,15 +349,25 @@ async fn style_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -
         .into_response()
 }
 
+/// Serves `/tiles/{version}/{z}/{x}/{y}`. Coordinates are parsed into a
+/// [`tiles::TileXyz`] before anything renders: 400 for a tile that can't
+/// exist on the Web Mercator grid, 404 (uncached — not a tile answer) for
+/// a real tile outside the zoom range `style.json` advertises.
 async fn tile_handler(
     State(state): State<Arc<AppState>>,
     TilePath((_version, z, x, y)): TilePath<(String, u8, u32, u32)>,
     headers: HeaderMap,
 ) -> Response {
+    let Some(tile) = tiles::TileXyz::new(z, x, y) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if !state.zoom_range().contains(&z) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let content_type = state.content_type();
-    let result = tokio::task::spawn_blocking(move || state.render(z, x, y)).await;
+    let result = tokio::task::spawn_blocking(move || state.render(tile)).await;
     match result {
-        Ok(Ok(tile)) => tile_response(tile, content_type, headers.get(header::IF_NONE_MATCH)),
+        Ok(Ok(served)) => tile_response(served, content_type, headers.get(header::IF_NONE_MATCH)),
         Ok(Err(e)) => {
             error!(error = %e, z, x, y, "tile render failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -605,7 +628,8 @@ mod tests {
 
     #[test]
     fn cache_weight_grows_by_the_tile_bytes_and_bodyless_entries_count_too() {
-        let weight = |tile| tile_weight(&(0, 0, 0), &tile);
+        let tile = tiles::TileXyz::new(0, 0, 0).expect("root tile");
+        let weight = |served| tile_weight(&tile, &served);
         let data = |n| ServedTile::Data(Bytes::from(vec![0u8; n]));
         // The cache's capacity is a byte budget, so weight must track size.
         assert_eq!(weight(data(1000)) - weight(data(10)), 990);

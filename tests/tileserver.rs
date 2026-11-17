@@ -130,15 +130,21 @@ impl Response {
     }
 }
 
-/// Path prefix of the style's raster tile URL template
-/// `<base>/tiles/<build id>/{z}/{x}/{y}`: `/tiles/<build id>`.
-fn tile_path_prefix(server: &Server) -> String {
+/// The raster source `style.json` advertises.
+fn raster_source(server: &Server) -> serde_json::Value {
     let resp = server.get("/style.json");
     assert_eq!(resp.status, 200, "GET /style.json");
     let style: serde_json::Value = serde_json::from_slice(&resp.body).expect("style.json is JSON");
-    let url = style["sources"]["raster"]["tiles"][0]
+    style["sources"]["raster"].clone()
+}
+
+/// Path prefix of the style's raster tile URL template
+/// `<base>/tiles/<build id>/{z}/{x}/{y}`: `/tiles/<build id>`.
+fn tile_path_prefix(server: &Server) -> String {
+    let source = raster_source(server);
+    let url = source["tiles"][0]
         .as_str()
-        .unwrap_or_else(|| panic!("no raster tile URL in style: {style}"));
+        .unwrap_or_else(|| panic!("no raster tile URL in source: {source}"));
     let start = url
         .find("/tiles/")
         .unwrap_or_else(|| panic!("unexpected tile URL {url:?}"));
@@ -153,6 +159,66 @@ fn tile_path_prefix(server: &Server) -> String {
 
 fn tile_path(prefix: &str, z: u8, (x, y): (u32, u32)) -> String {
     format!("{prefix}/{z}/{x}/{y}")
+}
+
+#[test]
+fn tile_coordinates_are_validated_before_rendering() {
+    let dir = Scratch::new("tileserver-tile-coords");
+    let [coarse, fine] = common::write_raster_fixtures(&dir);
+    let server = Server::spawn(&[
+        "--cache-mb".as_ref(),
+        "0".as_ref(),
+        coarse.as_os_str(),
+        fine.as_os_str(),
+    ]);
+    let prefix = tile_path_prefix(&server);
+    let source = raster_source(&server);
+    let zoom = |key: &str| -> u8 {
+        source[key]
+            .as_u64()
+            .and_then(|z| u8::try_from(z).ok())
+            .unwrap_or_else(|| panic!("no {key} in raster source: {source}"))
+    };
+    let (min_zoom, max_zoom) = (zoom("minzoom"), zoom("maxzoom"));
+    let inside = |z| tile_containing(10.3, 56.3, z);
+
+    // Beyond any Web Mercator zoom a tile can exist at.
+    assert_eq!(server.get(&tile_path(&prefix, 31, (0, 0))).status, 400);
+    assert_eq!(server.get(&tile_path(&prefix, 255, (0, 0))).status, 400);
+
+    // Column/row off the edge of the zoom's 2^z × 2^z grid.
+    let z = max_zoom;
+    let edge = 1u32 << z;
+    assert_eq!(server.get(&tile_path(&prefix, z, (edge, 0))).status, 400);
+    assert_eq!(server.get(&tile_path(&prefix, z, (0, edge))).status, 400);
+    assert_eq!(
+        server
+            .get(&tile_path(&prefix, z, (edge - 1, edge - 1)))
+            .status,
+        204,
+        "last tile of the grid is valid (and far from every chart)"
+    );
+
+    // Valid tiles outside the zoom range `style.json` advertises.
+    let resp = server.get(&tile_path(&prefix, max_zoom + 1, inside(max_zoom + 1)));
+    assert_eq!(resp.status, 404, "zoom above the advertised maxzoom");
+    assert_eq!(
+        resp.header("cache-control"),
+        None,
+        "an out-of-range miss is not an immutable tile answer"
+    );
+    if let Some(below) = min_zoom.checked_sub(1) {
+        let resp = server.get(&tile_path(&prefix, below, inside(below)));
+        assert_eq!(resp.status, 404, "zoom below the advertised minzoom");
+    }
+
+    // The server survived all of the above and still renders.
+    assert_eq!(
+        server
+            .get(&tile_path(&prefix, max_zoom, inside(max_zoom)))
+            .status,
+        200
+    );
 }
 
 #[test]

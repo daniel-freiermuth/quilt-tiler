@@ -140,7 +140,10 @@ fn archive_tiles<S: TileSource>(
                 #[allow(clippy::cast_possible_truncation)] // idx / width < height ≤ u32::MAX
                 let row = row_lo + (idx / u64::from(width)) as u32;
 
-                let bytes = match quilt.render_tile(z, col, row)? {
+                let tile = TileXyz::new(z, col, row).with_context(|| {
+                    format!("tile {z}/{col}/{row} is off the Web Mercator grid")
+                })?;
+                let bytes = match quilt.render_tile(tile)? {
                     TileOutcome::Rendered(bytes) => bytes,
                     TileOutcome::Blank => match &blank {
                         Some(blank) => blank.clone(),
@@ -169,6 +172,44 @@ fn archive_tiles<S: TileSource>(
         "tiles encoded"
     );
     Ok(tile_bytes)
+}
+
+/// A Web Mercator tile address [`Quilt::render_tile`] can render.
+///
+/// Zoom is at most [`martin_tile_utils::MAX_ZOOM`] (the deepest zoom
+/// `xyz_to_bbox` projects without panicking) and column/row lie inside that
+/// zoom's `2^z × 2^z` grid. Parse untrusted `(z, x, y)` into this once, at
+/// the boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TileXyz {
+    z: u8,
+    x: u32,
+    y: u32,
+}
+
+impl TileXyz {
+    /// `None` unless `z ≤ MAX_ZOOM` and `x, y < 2^z`.
+    #[must_use]
+    pub fn new(z: u8, x: u32, y: u32) -> Option<Self> {
+        martin_tile_utils::TileCoord::is_possible_on_zoom_level(z, x, y).then_some(Self { z, x, y })
+    }
+
+    #[must_use]
+    pub const fn z(self) -> u8 {
+        self.z
+    }
+
+    /// Column, counted east from the antimeridian.
+    #[must_use]
+    pub const fn x(self) -> u32 {
+        self.x
+    }
+
+    /// Row, counted south from the top of the Web Mercator square.
+    #[must_use]
+    pub const fn y(self) -> u32 {
+        self.y
+    }
 }
 
 /// What [`Quilt::render_tile`] produced for one tile.
@@ -327,17 +368,18 @@ impl<S: TileSource> Quilt<S> {
         Ok((zoom_floor, zoom_ceil, overall))
     }
 
-    /// Render one `(z, col, row)` tile from the items' combined coverage.
+    /// Render one tile from the items' combined coverage.
     ///
-    /// Pure given `(z, col, row)` — no shared mutable state across calls —
-    /// so it's safe to call concurrently and on demand. Backs both
+    /// Pure given `tile` — no shared mutable state across calls — so it's
+    /// safe to call concurrently and on demand. Backs both
     /// [`write_pmtiles`]'s batch loop and a live tile server.
     ///
     /// # Errors
     /// Returns an error if merging or encoding this tile's contents fails
     /// ([`TileAccumulator::push`] / [`TileAccumulator::encode`]).
-    pub fn render_tile(&self, z: u8, col: u32, row: u32) -> Result<TileOutcome> {
+    pub fn render_tile(&self, tile: TileXyz) -> Result<TileOutcome> {
         profiling::scope!("tile");
+        let (z, col, row) = (tile.z(), tile.x(), tile.y());
         let items = &self.items;
         let meta = &self.meta;
         let zi = i32::from(z);
@@ -473,6 +515,26 @@ mod tests {
     use crate::rnc::RncCell;
     use crate::rnc_source::RasterAccumulator;
 
+    fn xyz(z: u8, col: u32, row: u32) -> TileXyz {
+        TileXyz::new(z, col, row).expect("tile on the Web Mercator grid")
+    }
+
+    #[test]
+    fn tile_xyz_accepts_exactly_the_renderable_grid() {
+        let max = martin_tile_utils::MAX_ZOOM;
+        let last = (1u32 << max) - 1;
+        let tile = TileXyz::new(max, last, last).expect("deepest zoom's last tile");
+        assert_eq!((tile.z(), tile.x(), tile.y()), (max, last, last));
+        // `xyz_to_bbox` panics past MAX_ZOOM, so no tile may exist there.
+        assert_eq!(TileXyz::new(max + 1, 0, 0), None);
+        assert_eq!(TileXyz::new(u8::MAX, 0, 0), None);
+        // Column/row one past the 2^z grid edge.
+        assert_eq!(TileXyz::new(3, 8, 0), None);
+        assert_eq!(TileXyz::new(3, 0, 8), None);
+        assert!(TileXyz::new(3, 7, 7).is_some());
+        assert_eq!(TileXyz::new(0, 1, 0), None);
+    }
+
     /// Build a minimal single-tile `.rnc` byte buffer: one `8×8` solid-color
     /// PNG, rectangular `cover` (the bbox itself), given `edate`.
     fn build_rnc(bbox: Bbox, color: [u8; 4], scale: f64, edate: &str) -> Vec<u8> {
@@ -560,7 +622,8 @@ mod tests {
         // Older listed first: only the tiebreak (not array order) should
         // determine which one wins.
         let quilt = Quilt::new(vec![older, newer], 0.0, false);
-        let TileOutcome::Rendered(bytes) = quilt.render_tile(z, col, row).expect("renders") else {
+        let TileOutcome::Rendered(bytes) = quilt.render_tile(xyz(z, col, row)).expect("renders")
+        else {
             panic!("tile has coverage");
         };
         let img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
@@ -633,7 +696,7 @@ mod tests {
         let sparse = Quilt::new(vec![coarse, fine], 0.0, true);
         let outcome = |lon: f64, lat: f64, z: u8| {
             let (col, row, _, _) = bbox_to_xyz(lon, lat, lon, lat, z);
-            match sparse.render_tile(z, col, row).expect("renders") {
+            match sparse.render_tile(xyz(z, col, row)).expect("renders") {
                 TileOutcome::Uncovered => "uncovered",
                 TileOutcome::Blank => "blank",
                 TileOutcome::Omitted => "omitted",
@@ -657,7 +720,7 @@ mod tests {
         let (col, row, _, _) = bbox_to_xyz(10.05, 56.95, 10.05, 56.95, 10);
         assert!(
             matches!(
-                dense.render_tile(10, col, row).expect("renders"),
+                dense.render_tile(xyz(10, col, row)).expect("renders"),
                 TileOutcome::Rendered(_)
             ),
             "a dense quilt renders every covered tile"
@@ -762,7 +825,8 @@ mod tests {
                     if stored.contains_key(&id(z, col, row)) {
                         continue;
                     }
-                    let expected = match dense.render_tile(z, col, row).expect("dense renders") {
+                    let expected = match dense.render_tile(xyz(z, col, row)).expect("dense renders")
+                    {
                         TileOutcome::Uncovered => continue,
                         TileOutcome::Blank => blank.clone(),
                         TileOutcome::Rendered(bytes) => bytes,
@@ -937,7 +1001,7 @@ mod tests {
             "fixture sanity: tile overlaps the fine bbox but not its triangle: {tile:?}"
         );
         assert_eq!(
-            quilt.render_tile(12, col, row).expect("renders"),
+            quilt.render_tile(xyz(12, col, row)).expect("renders"),
             TileOutcome::Omitted
         );
     }
@@ -962,7 +1026,7 @@ mod tests {
         let quilt = Quilt::new(vec![cell], 0.0, true);
         let outcome = |z| {
             let (col, row, _, _) = bbox_to_xyz(10.5, 56.5, 10.5, 56.5, z);
-            quilt.render_tile(z, col, row).expect("renders")
+            quilt.render_tile(xyz(z, col, row)).expect("renders")
         };
         assert!(matches!(outcome(7), TileOutcome::Rendered(_)));
         assert_eq!(outcome(8), TileOutcome::Omitted);
@@ -1105,7 +1169,7 @@ mod tests {
             non_square |= col_hi - col_lo != row_hi - row_lo;
             for row in row_lo..=row_hi {
                 for col in col_lo..=col_hi {
-                    let expected = match quilt.render_tile(z, col, row).expect("render_tile") {
+                    let expected = match quilt.render_tile(xyz(z, col, row)).expect("render_tile") {
                         TileOutcome::Rendered(bytes) => Some(bytes),
                         TileOutcome::Uncovered | TileOutcome::Blank | TileOutcome::Omitted => None,
                     };
