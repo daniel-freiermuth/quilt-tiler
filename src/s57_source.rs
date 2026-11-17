@@ -17,9 +17,9 @@ use geo::{
     MultiPolygon, Point, Polygon, coord,
 };
 use martin_tile_utils::wgs84_to_webmercator;
-use mlt_core::{
-    PropKind, PropValue, PropertyKey, TileLayer, TileLayerBuilder, encoder::EncoderConfig,
-};
+use mlt_core::compact_str::{CompactString, ToCompactString, format_compact};
+use mlt_core::encoder::{EncoderConfig, Profile};
+use mlt_core::{PropKind, PropValue, PropertyKey, TileLayer, TileLayerBuilder};
 use pmtiles::TileType;
 
 use crate::bbox::Bbox;
@@ -263,7 +263,7 @@ impl TileAccumulator for S57Accumulator {
     }
 
     fn encode(self) -> Result<Vec<u8>> {
-        let cfg = EncoderConfig::default();
+        let cfg = encoder_config();
         let mut layers: Vec<_> = self.0.into_iter().collect();
         layers.sort_unstable_by_key(|(name, _)| *name);
         let mut out = Vec::new();
@@ -284,12 +284,25 @@ impl TileAccumulator for S57Accumulator {
         layer.push(geo::Geometry::Point(Point::new(0, 0)), Vec::new())?;
         layer
             .finish()
-            .encode(EncoderConfig::default())
+            .encode(encoder_config())
             .context("encoding blank MLT layer")
     }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// The MLT encoder settings every tile is written with.
+///
+/// `MinSize`: v1 wire format, no stored triangles, Hilbert and feature-ID
+/// sort trials, `FSST`, `FastPFOR` and shared string dictionaries, the same
+/// codecs mlt-core 0.12's `EncoderConfig::default()` allowed.  0.12 also
+/// tried a Morton sort, but only on layers under 512 features or not
+/// spanning the tile; 0.22 runs every enabled sort as a full encode trial
+/// on every layer.  On chart-like test layers Morton saved at most 0.4% over
+/// Hilbert while adding 20-100% encode time, so it stays off.
+fn encoder_config() -> EncoderConfig {
+    EncoderConfig::from_profile(Profile::MinSize)
+}
 
 /// Coerce `val` to `kind`, converting to a string representation as a last resort.
 ///
@@ -306,11 +319,13 @@ fn coerce(val: PropValue, kind: PropKind) -> PropValue {
         }
         (PropValue::F32(Some(v)), PropKind::F64) => PropValue::F64(Some(f64::from(v))),
         (v, PropKind::Str) => PropValue::Str(Some(match v {
-            PropValue::Bool(Some(b)) => b.to_string(),
-            PropValue::I64(Some(i)) => i.to_string(),
-            PropValue::U64(Some(u)) => u.to_string(),
-            PropValue::F32(Some(f)) => f.to_string(),
-            PropValue::F64(Some(f)) => f.to_string(),
+            PropValue::Bool(Some(b)) => b.to_compact_string(),
+            PropValue::I64(Some(i)) => i.to_compact_string(),
+            PropValue::U64(Some(u)) => u.to_compact_string(),
+            // `to_compact_string` formats floats with `zmij` ("3.0", "1e-7"),
+            // not `Display` ("3", "0.0000001"); keep the `Display` strings.
+            PropValue::F32(Some(f)) => format_compact!("{f}"),
+            PropValue::F64(Some(f)) => format_compact!("{f}"),
             _ => return PropValue::Str(None),
         })),
         (_, k) => PropValue::null(k),
@@ -448,7 +463,7 @@ fn build_props(attrs: &[s57::Attribute]) -> Vec<(String, PropValue)> {
             let val = match &attr.value {
                 s57::AttrValue::Int(i) => PropValue::U64(Some(u64::from(*i))),
                 s57::AttrValue::Double(f) => PropValue::F64(Some(*f)),
-                s57::AttrValue::Str(s) => PropValue::Str(Some(s.clone())),
+                s57::AttrValue::Str(s) => PropValue::Str(Some(CompactString::new(s))),
             };
             Some((key.to_string(), val))
         })
@@ -521,7 +536,7 @@ fn emit_buoy_light_flare(
     let geom = geo::Geometry::Point(geo::Point::new(c.x, c.y));
     let mut props = vec![(
         "COLOUR".to_string(),
-        PropValue::Str(Some(colour.to_string())),
+        PropValue::Str(Some(CompactString::new(colour))),
     )];
     if let Some(cv) = catlit {
         props.push(("CATLIT".to_string(), cv.clone()));
@@ -552,7 +567,7 @@ fn light_sectors_to_features(
             37 => {
                 catlit = Some(match &attr.value {
                     s57::AttrValue::Int(i) => PropValue::U64(Some(u64::from(*i))),
-                    s57::AttrValue::Str(s) => PropValue::Str(Some(s.clone())),
+                    s57::AttrValue::Str(s) => PropValue::Str(Some(CompactString::new(s))),
                     s57::AttrValue::Double(f) => PropValue::F64(Some(*f)),
                 });
             }
@@ -635,8 +650,8 @@ fn light_sectors_to_features(
         for stroke in clip_stroke(&pts, &tile.geom) {
             let ls: geo::LineString<i32> = stroke.map_coords(|c| to_px(c, tile.merc));
             let mut props = vec![
-                ("kind".to_string(), PropValue::Str(Some(kind.to_string()))),
-                ("color".to_string(), PropValue::Str(Some(hex.to_string()))),
+                ("kind".to_string(), PropValue::Str(Some(kind.into()))),
+                ("color".to_string(), PropValue::Str(Some(hex.into()))),
             ];
             if let Some(cv) = &catlit {
                 props.push(("CATLIT".to_string(), cv.clone()));
@@ -1188,7 +1203,7 @@ mod tests {
             .expect("blank parses as MLT");
         let names: Vec<&str> = layers
             .iter()
-            .map(|l| l.as_layer01().expect("MLT v1 layer").name())
+            .map(|l| l.name().expect("MLT v1 layer"))
             .collect();
         assert_eq!(names, ["blank"]);
         let style: serde_json::Value = serde_json::from_str(
@@ -1953,6 +1968,28 @@ mod tests {
             coerce(PropValue::Bool(Some(false)), PropKind::Str),
             PropValue::Str(Some("false".into()))
         );
+    }
+
+    /// Floats coerced into a Str column keep `Display` formatting: a style
+    /// filter like `["==", ["get", "VALSOU"], "3"]` must match an integral
+    /// value regardless of which encoder version wrote the tile.
+    #[test]
+    fn coerce_float_to_str_uses_display_formatting() {
+        let cases: [(PropValue, &str); 6] = [
+            (PropValue::F64(Some(3.0)), "3"),
+            (PropValue::F64(Some(3.5)), "3.5"),
+            (PropValue::F64(Some(1e-7)), "0.0000001"),
+            (PropValue::F64(Some(1e20)), "100000000000000000000"),
+            (PropValue::F32(Some(2.0)), "2"),
+            (PropValue::F32(Some(0.1)), "0.1"),
+        ];
+        for (val, want) in cases {
+            assert_eq!(
+                coerce(val.clone(), PropKind::Str),
+                PropValue::Str(Some(want.into())),
+                "coercing {val:?}"
+            );
+        }
     }
 
     #[test]
