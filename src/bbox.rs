@@ -1,13 +1,10 @@
-//! Axis-aligned bounding box — the [`BoundedLattice`] instance for bbox algebra.
+//! Axis-aligned bounding box.
 
 use geo::{BoundingRect, MultiPolygon, Polygon};
 
-use crate::lattice::BoundedLattice;
-
 /// An axis-aligned bounding box in WGS84 or projected coordinates.
 ///
-/// Lattice order: `a ≥ b` iff `a` fully contains `b`.
-/// Meet = intersection, join = bounding hull.
+/// [`Self::bottom`] is the empty box; [`Self::join`] is the bounding hull.
 #[derive(Copy, Clone, Debug)]
 pub struct Bbox {
     pub west: f64,
@@ -42,16 +39,10 @@ impl Bbox {
         Some(b)
     }
 
+    /// The empty box: identity for [`Self::join`], overlaps nothing.
     #[inline]
     #[must_use]
-    pub fn is_bottom(&self) -> bool {
-        self.west > self.east || self.south > self.north
-    }
-}
-
-impl BoundedLattice for Bbox {
-    #[inline]
-    fn bottom() -> Self {
+    pub const fn bottom() -> Self {
         Self {
             west: f64::INFINITY,
             south: f64::INFINITY,
@@ -61,7 +52,15 @@ impl BoundedLattice for Bbox {
     }
 
     #[inline]
-    fn join(&self, other: &Self) -> Self {
+    #[must_use]
+    pub fn is_bottom(&self) -> bool {
+        self.west > self.east || self.south > self.north
+    }
+
+    /// Bounding hull of `self` and `other`.
+    #[inline]
+    #[must_use]
+    pub const fn join(&self, other: &Self) -> Self {
         Self {
             west: self.west.min(other.west),
             south: self.south.min(other.south),
@@ -70,57 +69,17 @@ impl BoundedLattice for Bbox {
         }
     }
 
+    /// `true` when the boxes share at least a point; never for an empty box.
     #[inline]
-    fn meet(&self, other: &Self) -> Self {
-        Self {
-            west: self.west.max(other.west),
-            south: self.south.max(other.south),
-            east: self.east.min(other.east),
-            north: self.north.min(other.north),
-        }
-    }
-
-    #[inline]
-    fn subsumes(&self, other: &Self) -> bool {
-        self.west <= other.west
-            && self.south <= other.south
-            && self.east >= other.east
-            && self.north >= other.north
-    }
-
-    /// Avoids constructing the meet.
-    #[inline]
+    #[must_use]
     #[allow(clippy::suspicious_operation_groupings)] // cross-axis comparisons are intentional
-    fn overlaps(&self, other: &Self) -> bool {
+    pub fn overlaps(&self, other: &Self) -> bool {
         !self.is_bottom()
             && !other.is_bottom()
             && self.west <= other.east
             && self.east >= other.west
             && self.south <= other.north
             && self.north >= other.south
-    }
-
-    /// Plain rectangle area in degrees² (or projected units² for [`Self`]
-    /// values in metres).  `0.0` for [`Self::is_bottom`].
-    fn area(&self) -> f64 {
-        if self.is_bottom() {
-            0.0
-        } else {
-            (self.east - self.west) * (self.north - self.south)
-        }
-    }
-
-    /// Conservative rectangle difference: a [`Self`] cannot represent the
-    /// exact (possibly L-shaped) remainder of a partial overlap, so this
-    /// returns ⊥ only when `other` fully covers `self`, and `self`
-    /// unchanged otherwise — erring toward "still uncovered" rather than
-    /// risking a false "fully covered".
-    fn minus(&self, other: &Self) -> Self {
-        if other.subsumes(self) {
-            Self::bottom()
-        } else {
-            *self
-        }
     }
 }
 
@@ -175,8 +134,8 @@ impl From<Bbox> for Polygon {
 }
 
 #[cfg(test)]
-// Exact equality is intended: join/meet/minus only select or copy literal
-// coordinates (min/max), no arithmetic that could introduce rounding.
+// Exact equality is intended: join only selects literal coordinates
+// (min/max), no arithmetic that could introduce rounding.
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
@@ -286,23 +245,6 @@ mod tests {
         assert_eq!(j.north, 8.0);
     }
 
-    // ── meet ────────────────────────────────────────────────────────
-
-    #[test]
-    fn meet_non_overlapping_returns_bottom() {
-        let m = bbox_a().meet(&bbox_disjoint());
-        assert!(m.is_bottom(), "meet of disjoint boxes must be bottom");
-    }
-
-    #[test]
-    fn meet_overlapping_returns_intersection() {
-        let m = bbox_a().meet(&bbox_b());
-        assert_eq!(m.west, 3.0);
-        assert_eq!(m.south, 4.0);
-        assert_eq!(m.east, 5.0);
-        assert_eq!(m.north, 6.0);
-    }
-
     // ── overlaps ────────────────────────────────────────────────────
 
     #[test]
@@ -338,72 +280,5 @@ mod tests {
         assert!(inverted.is_bottom());
         assert!(!inverted.overlaps(&bbox_a()));
         assert!(!bbox_a().overlaps(&inverted));
-    }
-
-    // ── area ────────────────────────────────────────────────────────
-
-    #[test]
-    fn area_of_bottom_is_zero() {
-        assert_eq!(Bbox::bottom().area(), 0.0);
-    }
-
-    #[test]
-    fn area_of_normal_bbox() {
-        // bbox_a: 4 wide × 4 tall = 16
-        assert!((bbox_a().area() - 16.0).abs() < f64::EPSILON);
-    }
-
-    // ── subsumes ────────────────────────────────────────────────────
-
-    #[test]
-    fn subsumes_inner() {
-        assert!(bbox_a().subsumes(&bbox_inner()));
-    }
-
-    #[test]
-    fn subsumes_self() {
-        assert!(bbox_a().subsumes(&bbox_a()));
-    }
-
-    #[test]
-    fn does_not_subsume_partial_overlap() {
-        assert!(!bbox_a().subsumes(&bbox_b()));
-    }
-
-    // ── minus ───────────────────────────────────────────────────────
-
-    #[test]
-    fn minus_full_subsumption_returns_bottom() {
-        // bbox_a fully contains bbox_inner, so bbox_inner − bbox_a = ⊥
-        let result = bbox_inner().minus(&bbox_a());
-        assert!(
-            result.is_bottom(),
-            "fully subsumed minus must return bottom"
-        );
-    }
-
-    #[test]
-    fn minus_partial_overlap_returns_self_conservative() {
-        // Conservative contract: partial overlap → returns self unchanged.
-        let a = bbox_a();
-        let result = a.minus(&bbox_b());
-        assert_eq!(result.west, a.west);
-        assert_eq!(result.south, a.south);
-        assert_eq!(result.east, a.east);
-        assert_eq!(result.north, a.north);
-    }
-
-    #[test]
-    fn minus_disjoint_returns_self() {
-        let a = bbox_a();
-        let result = a.minus(&bbox_disjoint());
-        assert_eq!(result.west, a.west);
-        assert_eq!(result.east, a.east);
-    }
-
-    #[test]
-    fn minus_self_returns_bottom() {
-        let result = bbox_a().minus(&bbox_a());
-        assert!(result.is_bottom(), "a − a must be bottom");
     }
 }

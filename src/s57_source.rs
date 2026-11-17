@@ -113,11 +113,10 @@ impl LayerBuf {
 impl TileSource for s57::S57Cell {
     type Content = HashMap<&'static str, Vec<RawFeature>>;
     type Accumulator = S57Accumulator;
-    type Coverage = MultiPolygon;
     type Tiebreaker = s57::EditionDate;
 
     #[profiling::function]
-    fn coverage(&self) -> Self::Coverage {
+    fn coverage(&self) -> MultiPolygon {
         self.coverage.clone()
     }
 
