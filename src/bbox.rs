@@ -14,31 +14,6 @@ pub struct Bbox {
 }
 
 impl Bbox {
-    /// A degenerate point-extent bbox.
-    #[inline]
-    #[must_use]
-    pub const fn point(lon: f64, lat: f64) -> Self {
-        Self {
-            west: lon,
-            south: lat,
-            east: lon,
-            north: lat,
-        }
-    }
-
-    /// Smallest bbox enclosing all `pts`; `None` when the iterator is empty.
-    pub fn of(mut pts: impl Iterator<Item = (f64, f64)>) -> Option<Self> {
-        let (lon, lat) = pts.next()?;
-        let mut b = Self::point(lon, lat);
-        for (lon, lat) in pts {
-            b.west = b.west.min(lon);
-            b.south = b.south.min(lat);
-            b.east = b.east.max(lon);
-            b.north = b.north.max(lat);
-        }
-        Some(b)
-    }
-
     /// The empty box: identity for [`Self::join`], overlaps nothing.
     #[inline]
     #[must_use]
@@ -196,21 +171,13 @@ mod tests {
     fn point_bbox_is_not_bottom() {
         // Zero width and zero height: a single sounding or light is still a
         // real extent, only an inverted one is ⊥.
-        assert!(!Bbox::point(11.5, 57.5).is_bottom());
-    }
-
-    // ── of ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn of_empty_iterator_is_none() {
-        assert!(Bbox::of(std::iter::empty()).is_none());
-    }
-
-    #[test]
-    fn of_encloses_all_points_regardless_of_order() {
-        let b = Bbox::of([(3.0, -1.0), (-2.0, 4.0), (1.0, 2.0)].into_iter())
-            .expect("non-empty iterator yields a bbox");
-        assert_eq!((b.west, b.south, b.east, b.north), (-2.0, -1.0, 3.0, 4.0));
+        let point = Bbox {
+            west: 11.5,
+            south: 57.5,
+            east: 11.5,
+            north: 57.5,
+        };
+        assert!(!point.is_bottom());
     }
 
     // ── join ────────────────────────────────────────────────────────
