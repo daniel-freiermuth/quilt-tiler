@@ -8,14 +8,10 @@
 //! Both traits are intentionally *not* object-safe — they are designed for
 //! monomorphised static dispatch only.
 
-use std::fmt::Debug;
-
 use anyhow::Result;
 use geo::MultiPolygon;
 use pmtiles::TileType;
 
-use crate::bbox::Bbox;
-use crate::lattice::BoundedLattice;
 use crate::tile_geom::TileGeom;
 
 /// Accumulates per-cell [`TileSource::Content`]s into a single tile, then
@@ -65,17 +61,6 @@ pub trait TileSource: Sync {
     /// encodes it to bytes.
     type Accumulator: TileAccumulator<Content = Self::Content>;
 
-    /// Lattice element used to track coverage within a tile.
-    ///
-    /// Must convert to and from [`Bbox`]: `write_pmtiles` needs `From<Bbox>` to
-    /// construct the tile-shaped coverage sentinel, and `Into<Bbox>` to
-    /// aggregate item extents into the overall bounding box for tile iteration.
-    /// `Into<MultiPolygon>` feeds an item's exact per-tile contribution
-    /// region into [`TileGeom::geom`] for [`Self::render`] — `write_pmtiles`
-    /// clips each candidate to only the area it actually contributes, not
-    /// the whole tile, so overlapping sources never double-paint.
-    type Coverage: BoundedLattice + From<Bbox> + Into<Bbox> + Into<MultiPolygon> + Debug + Clone;
-
     /// Tie-break key for `tiles::Quilt::render_tile`'s candidate sort, when
     /// multiple candidates are equally well-fitted to a tile's zoom level
     /// (same floored `zoom_from_scale`) — the greater value wins the tie.
@@ -85,8 +70,13 @@ pub trait TileSource: Sync {
     #[allow(dead_code)] // consumed by debug logging in a follow-up commit
     fn source(&self) -> String;
 
-    /// Geographic coverage of this item.
-    fn coverage(&self) -> Self::Coverage;
+    /// Geographic coverage of this item, in WGS84.
+    ///
+    /// `write_pmtiles` clips each candidate's coverage to only the area it
+    /// actually contributes to a tile, not the whole tile, and passes that
+    /// region to [`Self::render`] as [`TileGeom::geom`] — so overlapping
+    /// sources never double-paint.
+    fn coverage(&self) -> MultiPolygon;
 
     /// Native display scale denominator (e.g. `50_000` for 1:50 000).
     fn native_scale(&self) -> u32;

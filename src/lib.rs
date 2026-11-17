@@ -7,7 +7,6 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod bbox;
-pub mod lattice;
 pub mod loader;
 pub mod rnc;
 pub mod rnc_source;

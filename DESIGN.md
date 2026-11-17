@@ -387,9 +387,10 @@ two Mercator flavours' metre values directly.
 
 **Output:** one `PMTiles` archive per run, `TileType::Png`, 256×256 tiles (the universal
 raster-tile default). `write_pmtiles`'s generic quilting loop (coverage-based candidate
-selection, greedy uncovered-area tracking) is unchanged — raster cells use `Coverage =
-Bbox` (axis-aligned, no exact-shaped `COVR`/`NOCOVR` polygons like S-57), so each output
-tile's `render()` call rasterises by nearest-neighbour resampling rather than rendering
+selection, greedy uncovered-area tracking) is unchanged — raster cells report their
+footer's `cover` polygon as coverage, just as S-57 cells report their `COVR` polygons,
+and each output tile's `render()` call rasterises by nearest-neighbour resampling
+within that cell's contribution polygon rather than rendering
 vector features. `PMTiles` stores one tile type per archive, so a run's inputs must be
 uniformly vector or uniformly raster (`main.rs` dispatches on `.rnc` extension and
 rejects a mix rather than silently dropping one kind).

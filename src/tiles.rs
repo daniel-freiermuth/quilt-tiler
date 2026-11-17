@@ -3,7 +3,7 @@
 //! For every `(z, col, row)` in the data's zoom range, candidate source items
 //! are selected by coverage overlap, sorted by zoom fit (ties broken by
 //! [`TileSource::tiebreak`] — newer edition wins), then added greedily until
-//! the tile is covered by their combined [`TileSource::Coverage`].  A sparse
+//! the tile is covered by their combined [`TileSource::coverage`].  A sparse
 //! [`Quilt`] additionally leaves out tiles a client can rebuild from an
 //! ancestor.
 
@@ -14,6 +14,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
+use geo::{Area, BooleanOps, MultiPolygon};
 use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
 use martin_tile_utils::{bbox_to_xyz, wgs84_to_webmercator, xyz_to_bbox};
 use pmtiles::{PmTilesWriter, TileCoord, TileId};
@@ -21,7 +22,6 @@ use rayon::prelude::*;
 use tracing::{info, warn};
 
 use crate::bbox::Bbox;
-use crate::lattice::BoundedLattice;
 use crate::tile_geom::TileGeom;
 use crate::tile_source::{TileAccumulator, TileSource};
 use crate::zoom::{scale_from_zoom, zoom_from_scale};
@@ -376,21 +376,21 @@ impl<S: TileSource> Quilt<S> {
         }
 
         // Greedy coverage: include an item only if its contribution adds
-        // area not yet covered.  `Coverage`'s real polygon algebra correctly
-        // handles disjoint coverage areas (e.g. NE + SW ≠ full tile), unlike
-        // a bounding-box hull.
-        let mut uncovered = S::Coverage::from(tile_wgs84);
-        let mut contributions: Vec<(usize, S::Coverage)> = Vec::new();
+        // area not yet covered.  Real polygon algebra correctly handles
+        // disjoint coverage areas (e.g. NE + SW ≠ full tile), unlike a
+        // bounding-box hull.
+        let mut uncovered = MultiPolygon::from(tile_wgs84);
+        let mut contributions: Vec<(usize, MultiPolygon)> = Vec::new();
         {
             profiling::scope!("Assigning coverage");
             for &i in &candidates {
-                let contrib = items[i].coverage().meet(&uncovered);
-                if contrib.area() == 0.0 {
+                let contrib = items[i].coverage().intersection(&uncovered);
+                if contrib.unsigned_area() == 0.0 {
                     continue;
                 }
-                uncovered = uncovered.minus(&contrib);
+                uncovered = uncovered.difference(&contrib);
                 contributions.push((i, contrib));
-                if uncovered.area() == 0.0 {
+                if uncovered.unsigned_area() == 0.0 {
                     break;
                 }
             }
@@ -410,7 +410,7 @@ impl<S: TileSource> Quilt<S> {
             profiling::scope!("Collecting features");
             for (i, contrib) in contributions {
                 acc.push(items[i].render(&TileGeom {
-                    geom: contrib.into(),
+                    geom: contrib,
                     merc: tile_merc,
                     scale: tile_scale,
                 }))?;

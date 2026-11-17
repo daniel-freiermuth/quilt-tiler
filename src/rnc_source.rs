@@ -34,14 +34,13 @@ impl TileSource for RncCell {
     /// item's contribution area for the tile.
     type Content = Vec<u8>;
     type Accumulator = RasterAccumulator;
-    type Coverage = MultiPolygon;
     type Tiebreaker = EditionDate;
 
     fn source(&self) -> String {
         self.name().to_owned()
     }
 
-    fn coverage(&self) -> Self::Coverage {
+    fn coverage(&self) -> MultiPolygon {
         Self::coverage(self)
     }
 
