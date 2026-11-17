@@ -886,8 +886,6 @@ mod tests {
     fn feat(geometry: s57::Geometry, attributes: Vec<s57::Attribute>) -> s57::Feature {
         s57::Feature {
             type_code: 1,
-            id: 1,
-            primitive: 0,
             attributes,
             geometry,
         }
@@ -1152,7 +1150,6 @@ mod tests {
             features,
             coverage: MultiPolygon::new(vec![]),
             source: "test".to_owned(),
-            text_descriptions: HashMap::new(),
             edition_date: s57::EditionDate::unknown(),
         }
     }

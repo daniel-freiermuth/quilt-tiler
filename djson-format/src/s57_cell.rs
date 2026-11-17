@@ -98,7 +98,6 @@ impl TryFrom<DjsonCell> for s57::S57Cell {
             features,
             coverage,
             source,
-            text_descriptions: std::collections::HashMap::new(),
             edition_date: s57::EditionDate::unknown(),
         })
     }
@@ -107,26 +106,24 @@ impl TryFrom<DjsonCell> for s57::S57Cell {
 /// One [`Feature`] per point/sounding record, line part or polygon.
 fn push_features(type_code: u16, rec: Record, out: &mut Vec<Feature>) {
     let attributes = attributes(&rec);
-    let mut push = |primitive: u8, geometry: S57Geometry| {
+    let mut push = |geometry: S57Geometry| {
         out.push(Feature {
             type_code,
-            id: u16::try_from(out.len()).unwrap_or(u16::MAX),
-            primitive,
             attributes: attributes.clone(),
             geometry,
         });
     };
     match rec.geometry {
-        Geometry::Point(p) => push(0, S57Geometry::Point(p)),
-        Geometry::Soundings(s) => push(0, S57Geometry::Soundings(s)),
+        Geometry::Point(p) => push(S57Geometry::Point(p)),
+        Geometry::Soundings(s) => push(S57Geometry::Soundings(s)),
         Geometry::Lines(lines) => {
             for line in lines {
-                push(1, S57Geometry::Line(line));
+                push(S57Geometry::Line(line));
             }
         }
         Geometry::Areas(polys) => {
             for poly in polys {
-                push(2, S57Geometry::Area(poly));
+                push(S57Geometry::Area(poly));
             }
         }
     }
@@ -358,16 +355,25 @@ mod tests {
         let kinds: Vec<_> = cell
             .features
             .iter()
-            .map(|f| (s57::object_acronym(f.type_code).unwrap(), f.primitive))
+            .map(|f| {
+                let kind = match f.geometry {
+                    S57Geometry::None => "none",
+                    S57Geometry::Point(_) => "point",
+                    S57Geometry::Soundings(_) => "soundings",
+                    S57Geometry::Line(_) => "line",
+                    S57Geometry::Area(_) => "area",
+                };
+                (s57::object_acronym(f.type_code).unwrap(), kind)
+            })
             .collect();
         assert_eq!(
             kinds,
             [
-                ("DEPARE", 2),
-                ("DEPARE", 2),
-                ("COALNE", 1),
-                ("COALNE", 1),
-                ("SOUNDG", 0)
+                ("DEPARE", "area"),
+                ("DEPARE", "area"),
+                ("COALNE", "line"),
+                ("COALNE", "line"),
+                ("SOUNDG", "soundings")
             ]
         );
         let depare = &cell.features[0];
