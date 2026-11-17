@@ -277,8 +277,7 @@ where
             .iter()
             .map(|ring| {
                 ring.as_array()
-                    .map(|r| r.iter().filter_map(serde_json::Value::as_f64).collect())
-                    .unwrap_or_default()
+                    .map_or_default(|r| r.iter().filter_map(serde_json::Value::as_f64).collect())
             })
             .collect())
     } else {
