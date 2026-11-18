@@ -164,7 +164,7 @@ struct RawTriPrim {
     _prim_type: u8,
     /// [W, S, E, N] — WGS84 degrees.
     /// For EXT records (84) the bbox is converted from SM to WGS84 at parse time,
-    /// since `CELL_EXTENT_RECORD` always precedes feature geometry in the stream.
+    /// so an EXT area arriving before `CELL_EXTENT_RECORD` is rejected.
     _bbox: [f64; 4],
     /// SM (east, north) coordinate pairs, one per vertex.
     _vertices: Vec<[f32; 2]>,
@@ -184,6 +184,24 @@ enum RawGeometry {
     },
 }
 
+/// SM reference point: the centre of the cell's `CELL_EXTENT_RECORD`.
+///
+/// Every SM-relative coordinate in the stream (VET/VCT nodes, soundings,
+/// EXT area `TriPrim` bboxes) is georeferenced against it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GeoRef {
+    lat: f64,
+    lon: f64,
+}
+
+/// Decoded `CELL_EXTENT_RECORD`: SM reference point plus WGS84 bounds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CellExtent {
+    georef: GeoRef,
+    /// `[west, south, east, north]` in WGS84 degrees.
+    bounds: [f64; 4],
+}
+
 // ── Record accumulator ──────────────────────────────────────────────────────
 
 /// Accumulator for record-by-record parsing of an OESU binary stream.
@@ -200,9 +218,9 @@ struct CellBuilder {
     update_number: u16,
     senc_create_date: String,
     sounding_datum: String,
-    ref_lat: f64,
-    ref_lon: f64,
-    bounds: [f64; 4],
+    /// `None` until `CELL_EXTENT_RECORD` is seen; deliberately not defaulted
+    /// to 0/0, which would silently georeference the cell at Null Island.
+    extent: Option<CellExtent>,
     raw_features: Vec<RawFeature>,
     raw_covr: Vec<LineString>,
     raw_nocovr: Vec<LineString>,
@@ -217,10 +235,10 @@ impl CellBuilder {
     /// `CELL_EXTENT_RECORD` (100): 8 × f64 corner coordinates.
     #[allow(clippy::similar_names)] // sw/nw/ne/se are domain vocabulary
     fn parse_cell_extent(&mut self, p: &mut Cursor<&[u8]>, payload_len: usize) -> Result<()> {
-        if payload_len < 64 {
-            tracing::warn!(payload_len, "CELL_EXTENT_RECORD too short, skipping");
-            return Ok(());
-        }
+        anyhow::ensure!(
+            payload_len >= 64,
+            "CELL_EXTENT_RECORD too short ({payload_len} bytes, need 64)"
+        );
         let sw_lat = read_f64(p)?;
         let sw_lon = read_f64(p)?;
         let nw_lat = read_f64(p)?;
@@ -247,10 +265,22 @@ impl CellBuilder {
         let w_lon = sw_lon.min(nw_lon);
         let e_lon = ne_lon.max(se_lon);
 
-        self.ref_lat = f64::midpoint(n_lat, s_lat);
-        self.ref_lon = f64::midpoint(e_lon, w_lon);
-        self.bounds = [w_lon, s_lat, e_lon, n_lat];
+        self.extent = Some(CellExtent {
+            georef: GeoRef {
+                lat: f64::midpoint(n_lat, s_lat),
+                lon: f64::midpoint(e_lon, w_lon),
+            },
+            bounds: [w_lon, s_lat, e_lon, n_lat],
+        });
         Ok(())
+    }
+
+    /// The SM reference point, or an error naming `record` if the stream has
+    /// not delivered `CELL_EXTENT_RECORD` yet.
+    fn georef(&self, record: &str) -> Result<GeoRef> {
+        self.extent
+            .map(|e| e.georef)
+            .with_context(|| format!("{record} precedes CELL_EXTENT_RECORD"))
     }
 
     /// `CELL_TXTDSC_INFO_FILE_RECORD` (101): embedded text-description file.
@@ -390,7 +420,7 @@ impl CellBuilder {
     }
 
     /// `FEATURE_GEOMETRY_RECORD_AREA_EXT` (84): extended area with i16 SM coords.
-    fn parse_geometry_area_ext(&mut self, p: &mut Cursor<&[u8]>, payload_len: usize) {
+    fn parse_geometry_area_ext(&mut self, p: &mut Cursor<&[u8]>, payload_len: usize) -> Result<()> {
         // Read scale_factor from offset 44: skip 4×f64 extent + 3×u32 counts.
         // It is the last header field, so failing to read it means the
         // payload is shorter than the 52-byte EXT header.
@@ -403,16 +433,10 @@ impl CellBuilder {
         let _ = read_u32(&mut hdr_p); // edge_count
         let Ok(scale_factor) = read_f64(&mut hdr_p) else {
             tracing::warn!(payload_len, "GEOM_AREA_EXT too short");
-            return;
+            return Ok(());
         };
-        match parse_area_payload(
-            p,
-            payload_len,
-            true,
-            scale_factor,
-            self.ref_lat,
-            self.ref_lon,
-        ) {
+        let georef = self.georef("FEATURE_GEOMETRY_RECORD_AREA_EXT")?;
+        match parse_area_payload(p, payload_len, Some((scale_factor, georef))) {
             Ok(raw) => {
                 if let Some(f) = &mut self.current {
                     f.raw_geometry = raw;
@@ -420,6 +444,7 @@ impl CellBuilder {
             }
             Err(e) => tracing::warn!("GEOM_AREA_EXT parse error: {e:#}"),
         }
+        Ok(())
     }
 
     /// `FEATURE_GEOMETRY_RECORD_MULTIPOINT` (83): sounding point cloud.
@@ -734,18 +759,16 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
             // ── Feature geometry ─────────────────────────────────────────
             FEATURE_GEOMETRY_RECORD_POINT => b.parse_geometry_point(&mut p, payload_len)?,
             FEATURE_GEOMETRY_RECORD_LINE => b.parse_geometry_line(&mut p, payload_len)?,
-            FEATURE_GEOMETRY_RECORD_AREA => {
-                match parse_area_payload(&mut p, payload_len, false, 0.0, b.ref_lat, b.ref_lon) {
-                    Ok(raw) => {
-                        if let Some(f) = &mut b.current {
-                            f.raw_geometry = raw;
-                        }
+            FEATURE_GEOMETRY_RECORD_AREA => match parse_area_payload(&mut p, payload_len, None) {
+                Ok(raw) => {
+                    if let Some(f) = &mut b.current {
+                        f.raw_geometry = raw;
                     }
-                    Err(e) => tracing::warn!("GEOM_AREA parse error: {e:#}"),
                 }
-            }
+                Err(e) => tracing::warn!("GEOM_AREA parse error: {e:#}"),
+            },
             FEATURE_GEOMETRY_RECORD_AREA_EXT => {
-                b.parse_geometry_area_ext(&mut p, payload_len);
+                b.parse_geometry_area_ext(&mut p, payload_len)?;
             }
             FEATURE_GEOMETRY_RECORD_MULTIPOINT => {
                 b.parse_geometry_multipoint(&mut p, payload_len)?;
@@ -770,6 +793,16 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
     if b.native_scale == 0 {
         bail!("cell {source:?} has no HEADER_CELL_NATIVESCALE record (or scale is zero)");
     }
+    let Some(CellExtent {
+        georef: GeoRef {
+            lat: ref_lat,
+            lon: ref_lon,
+        },
+        bounds,
+    }) = b.extent
+    else {
+        bail!("cell {source:?} has no CELL_EXTENT_RECORD");
+    };
 
     // Push the last in-flight feature.
     b.flush_current_feature();
@@ -786,9 +819,7 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
         update_number,
         senc_create_date,
         sounding_datum,
-        ref_lat,
-        ref_lon,
-        bounds,
+        extent: _,
         raw_features,
         raw_covr,
         raw_nocovr,
@@ -1188,12 +1219,11 @@ fn parse_covr_payload(p: &mut Cursor<&[u8]>, payload_len: usize) -> Option<LineS
 
 /// Parse an area geometry payload (records 82 and 84).
 ///
-/// If `ext` is true, the payload layout differs:
+/// `ext` is `Some((scale_factor, georef))` for EXT records, whose layout differs:
 ///   - the fixed header is 52 bytes instead of 44 (extra `f64 scale_factor`)
-///   - `TriPrim` bbox uses 4×i16 SM coords (scaled by `scale_factor`, then `fromSM`)
+///   - `TriPrim` bbox uses 4×i16 SM coords (scaled by `scale_factor`, then `fromSM`
+///     against `georef`)
 ///   - `TriPrim` vertices use `nvert × 2 × i16` (divided by `scale_factor`)
-///
-/// For non-EXT records `scale_factor` and `ref_lat`/`ref_lon` are ignored.
 #[allow(
     clippy::too_many_lines,
     clippy::cast_possible_truncation,
@@ -1202,12 +1232,9 @@ fn parse_covr_payload(p: &mut Cursor<&[u8]>, payload_len: usize) -> Option<LineS
 fn parse_area_payload(
     p: &mut Cursor<&[u8]>,
     payload_len: usize,
-    ext: bool,
-    scale_factor: f64,
-    ref_lat: f64,
-    ref_lon: f64,
+    ext: Option<(f64, GeoRef)>,
 ) -> Result<RawGeometry> {
-    let min_len = if ext { 52 } else { 44 };
+    let min_len = if ext.is_some() { 52 } else { 44 };
     anyhow::ensure!(
         payload_len >= min_len,
         "area payload too short ({payload_len} bytes)"
@@ -1223,7 +1250,7 @@ fn parse_area_payload(
     let triprim_count = read_u32(p)? as usize;
     let edge_count = read_u32(p)? as usize;
 
-    if ext {
+    if ext.is_some() {
         // Consume the scale_factor field; caller already read it to pass in.
         let _ = read_f64(p)?;
     }
@@ -1252,7 +1279,7 @@ fn parse_area_payload(
         }
         let nvert = read_u32(p)? as usize;
 
-        let (bbox, vertices) = if ext {
+        let (bbox, vertices) = if let Some((scale_factor, georef)) = ext {
             // bbox: 4×i16 SM coords [min_east, max_east, min_north, max_north]
             anyhow::ensure!(
                 p.position() as usize + 4 * 2 + nvert * 2 * 2 <= payload_len,
@@ -1262,8 +1289,8 @@ fn parse_area_payload(
             let max_east = f64::from(read_i16(p)?) / scale_factor;
             let min_north = f64::from(read_i16(p)?) / scale_factor;
             let max_north = f64::from(read_i16(p)?) / scale_factor;
-            let min_coord = crate::georef::from_sm(min_east, min_north, ref_lat, ref_lon);
-            let max_coord = crate::georef::from_sm(max_east, max_north, ref_lat, ref_lon);
+            let min_coord = crate::georef::from_sm(min_east, min_north, georef.lat, georef.lon);
+            let max_coord = crate::georef::from_sm(max_east, max_north, georef.lat, georef.lon);
             let bbox = [min_coord.x, min_coord.y, max_coord.x, max_coord.y];
 
             let mut verts = Vec::with_capacity(nvert);
@@ -1929,6 +1956,15 @@ mod tests {
         .0
     }
 
+    /// A `CELL_EXTENT_RECORD` whose (lat, lon) corners, in SW, NW, NE, SE
+    /// order, span the given bounds.
+    fn cell_extent(south: f64, west: f64, north: f64, east: f64) -> (u16, Bytes) {
+        let payload = [south, west, north, west, north, east, south, east]
+            .iter()
+            .fold(Bytes::default(), |b, &v| b.f64(v));
+        (CELL_EXTENT_RECORD, payload)
+    }
+
     /// Runs one record parser the way `parse_file` does: a fresh cursor over
     /// the payload, plus the payload's length.
     fn feed<R>(
@@ -1939,9 +1975,17 @@ mod tests {
         parse(b, &mut Cursor::new(payload), payload.len())
     }
 
-    /// A builder with an open feature for attribute/geometry records to attach to.
+    /// A builder past its `CELL_EXTENT_RECORD`, with an open feature for
+    /// attribute/geometry records to attach to.
     fn builder_with_feature() -> CellBuilder {
         CellBuilder {
+            extent: Some(CellExtent {
+                georef: GeoRef {
+                    lat: 54.75,
+                    lon: 10.75,
+                },
+                bounds: [9.5, 54.0, 12.0, 55.5],
+            }),
             current: Some(RawFeature {
                 type_code: 1,
                 id: 1,
@@ -1973,6 +2017,7 @@ mod tests {
     fn parse_file_decodes_header_and_keeps_last_feature() {
         let data = senc_stream(vec![
             (HEADER_CELL_NATIVESCALE, Bytes::default().u32(50_000)),
+            cell_extent(54.0, 10.0, 55.0, 11.0),
             (HEADER_CELL_NAME, Bytes::default().raw(b"TEST01\0")),
             (FEATURE_ID_RECORD, Bytes::default().u16(42).u16(7).u8(0)),
             (
@@ -2009,6 +2054,7 @@ mod tests {
             .f32(10.0);
         let data = senc_stream(vec![
             (HEADER_CELL_NATIVESCALE, Bytes::default().u32(50_000)),
+            cell_extent(54.0, 10.0, 55.25, 11.5),
             (CELL_COVR_RECORD, covr),
         ]);
         let cell = parse_file("test.oesu".to_owned(), &data).unwrap();
@@ -2027,8 +2073,7 @@ mod tests {
     #[test]
     fn short_records_are_skipped_without_error() {
         type Parser = fn(&mut CellBuilder, &mut Cursor<&[u8]>, usize) -> Result<()>;
-        let cases: [(&str, usize, Parser); 11] = [
-            ("CELL_EXTENT", 64, CellBuilder::parse_cell_extent),
+        let cases: [(&str, usize, Parser); 10] = [
             ("TXTDSC", 8, |b, p, n| {
                 b.parse_txtdsc(p, n);
                 Ok(())
@@ -2037,8 +2082,7 @@ mod tests {
             ("GEOM_POINT", 16, CellBuilder::parse_geometry_point),
             ("GEOM_LINE", 36, CellBuilder::parse_geometry_line),
             ("GEOM_AREA_EXT", 52, |b, p, n| {
-                b.parse_geometry_area_ext(p, n);
-                Ok(())
+                b.parse_geometry_area_ext(p, n)
             }),
             (
                 "GEOM_MULTIPOINT",
@@ -2077,8 +2121,27 @@ mod tests {
             .f64(54.5)
             .f64(12.0);
         feed(&mut b, &payload.0, CellBuilder::parse_cell_extent).unwrap();
-        assert_eq!(b.bounds, [9.5, 54.0, 12.0, 55.5]);
-        assert_eq!((b.ref_lon, b.ref_lat), (10.75, 54.75));
+        let expected = CellExtent {
+            georef: GeoRef {
+                lat: 54.75,
+                lon: 10.75,
+            },
+            bounds: [9.5, 54.0, 12.0, 55.5],
+        };
+        assert_eq!(b.extent, Some(expected));
+    }
+
+    /// A truncated extent must not leave the builder unreferenced and let the
+    /// cell parse anyway.
+    #[test]
+    fn short_cell_extent_is_rejected() {
+        let mut b = CellBuilder::default();
+        let err = feed(&mut b, &[0; 63], CellBuilder::parse_cell_extent).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("too short (63 bytes, need 64)"),
+            "{err:#}"
+        );
+        assert_eq!(b.extent, None);
     }
 
     /// `ref_lat`/`ref_lon` feed every SM→WGS84 conversion; a non-finite or
@@ -2253,7 +2316,7 @@ mod tests {
             .i32(2)
             .i32(3)
             .i32(0);
-        feed(&mut b, &payload.0, CellBuilder::parse_geometry_area_ext);
+        feed(&mut b, &payload.0, CellBuilder::parse_geometry_area_ext).unwrap();
         let geometry = &current_feature(&b).raw_geometry;
         let RawGeometry::Area { edge_refs, .. } = geometry else {
             panic!("expected an area, got {geometry:?}");
@@ -2293,7 +2356,7 @@ mod tests {
             .i32(2)
             .i32(3)
             .i32(0);
-        feed(&mut b, &payload.0, CellBuilder::parse_geometry_area_ext);
+        feed(&mut b, &payload.0, CellBuilder::parse_geometry_area_ext).unwrap();
         let geometry = &current_feature(&b).raw_geometry;
         let RawGeometry::Area {
             _vertex_counts: vertex_counts,
@@ -2483,10 +2546,10 @@ mod tests {
 
     #[test]
     fn parse_file_zero_terminator_stops_parsing() {
-        let mut data = senc_stream(vec![(
-            HEADER_CELL_NATIVESCALE,
-            Bytes::default().u32(22_000),
-        )]);
+        let mut data = senc_stream(vec![
+            (HEADER_CELL_NATIVESCALE, Bytes::default().u32(22_000)),
+            cell_extent(54.0, 10.0, 55.0, 11.0),
+        ]);
         data.extend(record_header(0, 0).0);
         data.extend(scale_record(99_999).0);
         let cell = parse_file("test.oesu".to_owned(), &data).unwrap();
@@ -2495,10 +2558,10 @@ mod tests {
 
     #[test]
     fn parse_file_short_nonzero_record_stops_parsing() {
-        let mut data = senc_stream(vec![(
-            HEADER_CELL_NATIVESCALE,
-            Bytes::default().u32(22_000),
-        )]);
+        let mut data = senc_stream(vec![
+            (HEADER_CELL_NATIVESCALE, Bytes::default().u32(22_000)),
+            cell_extent(54.0, 10.0, 55.0, 11.0),
+        ]);
         data.extend(record_header(HEADER_CELL_NATIVESCALE, 3).0);
         data.extend(scale_record(99_999).0);
         let cell = parse_file("test.oesu".to_owned(), &data).unwrap();
@@ -2516,6 +2579,52 @@ mod tests {
         data.extend(scale_record(22_000).0);
         let err = parse_err(&data);
         assert!(err.contains("has no HEADER_CELL_NATIVESCALE"), "{err}");
+    }
+
+    /// Every SM-relative coordinate is georeferenced against the extent's
+    /// centre, so a cell without one must not load with geometry around 0°N 0°E.
+    #[test]
+    fn parse_file_missing_cell_extent_is_rejected() {
+        let data = senc_stream(vec![
+            (HEADER_CELL_NATIVESCALE, Bytes::default().u32(50_000)),
+            (
+                VECTOR_CONNECTED_NODE_TABLE_RECORD,
+                Bytes::default().u32(1).u32(1).f32(100.0).f32(-200.0),
+            ),
+        ]);
+        let err = parse_err(&data);
+        assert!(err.contains("has no CELL_EXTENT_RECORD"), "{err}");
+    }
+
+    #[test]
+    fn parse_file_short_cell_extent_is_rejected() {
+        let data = senc_stream(vec![
+            (HEADER_CELL_NATIVESCALE, Bytes::default().u32(50_000)),
+            (CELL_EXTENT_RECORD, Bytes::default().f64(54.0).f64(10.0)),
+        ]);
+        let err = parse_err(&data);
+        assert!(
+            err.contains("CELL_EXTENT_RECORD too short (16 bytes, need 64)"),
+            "{err}"
+        );
+    }
+
+    /// An EXT area converts its `TriPrim` bboxes at parse time, so it needs
+    /// the reference point already; arriving first is a malformed stream.
+    #[test]
+    fn parse_file_area_ext_before_cell_extent_is_rejected() {
+        let area = Bytes::default().extent().u32(0).u32(0).u32(0).f64(10.0);
+        let data = senc_stream(vec![
+            (HEADER_CELL_NATIVESCALE, Bytes::default().u32(50_000)),
+            (FEATURE_ID_RECORD, Bytes::default().u16(42).u16(1).u8(3)),
+            (FEATURE_GEOMETRY_RECORD_AREA_EXT, area),
+            cell_extent(54.0, 10.0, 55.0, 11.0),
+        ]);
+        let err = parse_err(&data);
+        assert!(
+            err.contains("FEATURE_GEOMETRY_RECORD_AREA_EXT precedes CELL_EXTENT_RECORD"),
+            "{err}"
+        );
     }
 
     /// End to end: EXT tables divide i16 coords by `scale_factor`, and a LINE
@@ -2550,6 +2659,7 @@ mod tests {
             .i32(0);
         let data = senc_stream(vec![
             (HEADER_CELL_NATIVESCALE, Bytes::default().u32(50_000)),
+            cell_extent(54.0, 9.5, 55.5, 12.0),
             (VECTOR_CONNECTED_NODE_TABLE_EXT_RECORD, nodes),
             (VECTOR_EDGE_NODE_TABLE_EXT_RECORD, edges),
             (FEATURE_ID_RECORD, Bytes::default().u16(42).u16(1).u8(1)),
@@ -2562,7 +2672,8 @@ mod tests {
         let Geometry::Line(line) = &feature.geometry else {
             panic!("expected a line, got {:?}", feature.geometry);
         };
-        let sm = |east, north| crate::georef::from_sm(east, north, 0.0, 0.0);
+        // The extent's centre (54.75°N, 10.75°E) is the SM reference point.
+        let sm = |east, north| crate::georef::from_sm(east, north, 54.75, 10.75);
         assert_eq!(
             line.0,
             [
@@ -2733,26 +2844,27 @@ mod tests {
     /// 16/256 GiB pre-allocation that aborts the process.
     #[test]
     fn area_payload_huge_counts_are_truncation_errors() {
-        for ext in [false, true] {
+        let georef = GeoRef {
+            lat: 54.75,
+            lon: 10.75,
+        };
+        for ext in [None, Some((10.0, georef))] {
             for (contours, triprims, expected) in [
                 (u32::MAX, 0, "truncated vertex count array"),
                 (0, u32::MAX, "truncated TriPrim header"),
             ] {
                 let mut payload = Bytes::default().extent().u32(contours).u32(triprims).u32(0);
-                if ext {
+                if ext.is_some() {
                     payload = payload.f64(10.0);
                 }
                 let err = parse_area_payload(
                     &mut Cursor::new(payload.0.as_slice()),
                     payload.0.len(),
                     ext,
-                    10.0,
-                    0.0,
-                    0.0,
                 )
                 .unwrap_err()
                 .to_string();
-                assert!(err.contains(expected), "ext={ext}: {err}");
+                assert!(err.contains(expected), "ext={ext:?}: {err}");
             }
         }
     }
