@@ -17,8 +17,6 @@ mod edition_date;
 
 // ── Feature data model ───────────────────────────────────────────────────────
 
-use std::collections::HashMap;
-
 pub use edition_date::EditionDate;
 use geo_types::{LineString, MultiPolygon, Point, Polygon};
 
@@ -47,9 +45,6 @@ pub enum Geometry {
 #[derive(Debug, Clone)]
 pub struct Feature {
     pub type_code: u16,
-    pub id: u16,
-    /// `GEO_POINT`=0, `GEO_LINE`=1, `GEO_AREA`=2, `GEO_META`=3 (matches `OpenCPN` `GeoPrim_t`).
-    pub primitive: u8,
     pub attributes: Vec<Attribute>,
     pub geometry: Geometry,
 }
@@ -73,7 +68,6 @@ pub struct S57Cell {
     /// closed polygon (inner `Vec`).  Empty when no COVR record was present.
     pub coverage: MultiPolygon,
     pub source: String,
-    pub text_descriptions: HashMap<String, String>,
     /// Most recent edition/update date — `HEADER_CELL_UPDATEDATE` if the
     /// cell has updates applied, else `HEADER_CELL_PUBLISHDATE`.
     /// [`EditionDate::unknown`] if neither header was present. Consumed by
