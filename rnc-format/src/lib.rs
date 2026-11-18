@@ -255,39 +255,53 @@ pub struct RncFooter {
     /// Real files store this as a **flat** single ring
     /// `[x0, y0, x1, y1, …]`. No official schema, so [`deserialize_cover`]
     /// also accepts a nested `[[x0,y0,…], …]` shape defensively, normalizing
-    /// either way to "list of rings". Empty when the field is absent.
+    /// either way to "list of rings". Empty when the field is absent or `[]`.
+    /// Every ring holds an even number (≥ 6) of numbers; anything else is a
+    /// parse error.
     #[serde(default, deserialize_with = "deserialize_cover")]
     pub cover: Vec<Vec<f64>>,
+}
+
+/// On-disk shapes accepted for [`RncFooter::cover`].
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CoverShape {
+    /// `[x0, y0, x1, y1, …]` — one ring (the real on-disk shape).
+    Flat(Vec<f64>),
+    /// `[[x0, y0, …], [x0, y0, …]]` — list of rings.
+    Nested(Vec<Vec<f64>>),
 }
 
 /// Normalize `cover` into "list of rings" regardless of whether the source
 /// JSON nests rings (`[[x0,y0,…], [x1,y1,…]]`) or gives one flat ring
 /// (`[x0,y0,x1,y1,…]`) directly — see [`RncFooter::cover`].
+///
+/// Rejects any other shape, non-numeric elements, and rings that aren't
+/// an even count of at least 6 numbers (3 `x, y` points).
 fn deserialize_cover<'de, D>(deserializer: D) -> std::result::Result<Vec<Vec<f64>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let value = serde_json::Value::deserialize(deserializer)?;
-    let Some(items) = value.as_array() else {
-        return Ok(Vec::new());
+    let rings = match CoverShape::deserialize(deserializer).map_err(|_| {
+        serde::de::Error::custom(
+            "`cover` must be a flat `[x0, y0, …]` or nested `[[x0, y0, …], …]` array of numbers",
+        )
+    })? {
+        CoverShape::Flat(ring) if ring.is_empty() => Vec::new(),
+        CoverShape::Flat(ring) => vec![ring],
+        CoverShape::Nested(rings) => rings,
     };
-    let is_nested = items.first().is_some_and(serde_json::Value::is_array);
-    if is_nested {
-        Ok(items
-            .iter()
-            .map(|ring| {
-                ring.as_array()
-                    .map_or_default(|r| r.iter().filter_map(serde_json::Value::as_f64).collect())
-            })
-            .collect())
-    } else {
-        let ring: Vec<f64> = items.iter().filter_map(serde_json::Value::as_f64).collect();
-        Ok(if ring.is_empty() {
-            Vec::new()
-        } else {
-            vec![ring]
-        })
+    if let Some((i, ring)) = rings
+        .iter()
+        .enumerate()
+        .find(|(_, ring)| ring.len() < 6 || ring.len() % 2 != 0)
+    {
+        return Err(serde::de::Error::custom(format!(
+            "`cover` ring {i} has {} numbers; need an even count of at least 6 (3 x, y points)",
+            ring.len()
+        )));
     }
+    Ok(rings)
 }
 
 impl RncFooter {
@@ -337,17 +351,19 @@ impl RncFooter {
         (xmin, y_north.min(y_south), xmax, y_north.max(y_south))
     }
 
-    /// Exact `WGS-84` coverage polygon: [`Self::cover`]'s rings when present
-    /// and valid, else [`Self::wgs84_bbox`] as a rectangle.
+    /// Exact `WGS-84` coverage polygon: [`Self::cover`]'s rings when present,
+    /// else [`Self::wgs84_bbox`] as a rectangle.
     ///
     /// Each `cover` ring becomes an independent exterior (no holes — `cover`
-    /// has no NOCOVR-equivalent concept); degenerate rings (fewer than 3
-    /// points, zero area) are dropped.
-    #[must_use]
-    pub fn coverage(&self) -> MultiPolygon {
-        cover_to_multipolygon(&self.cover).unwrap_or_else(|| {
+    /// has no NOCOVR-equivalent concept).
+    ///
+    /// # Errors
+    /// Returns an error when any `cover` ring is unusable (odd length, fewer
+    /// than 3 points, or zero area) instead of silently substituting the bbox.
+    pub fn coverage(&self) -> Result<MultiPolygon> {
+        if self.cover.is_empty() {
             let (west, south, east, north) = self.wgs84_bbox();
-            MultiPolygon::new(vec![Polygon::new(
+            return Ok(MultiPolygon::new(vec![Polygon::new(
                 LineString::new(vec![
                     coord! { x: west, y: south },
                     coord! { x: east, y: south },
@@ -356,27 +372,29 @@ impl RncFooter {
                     coord! { x: west, y: south },
                 ]),
                 vec![],
-            )])
-        })
+            )]));
+        }
+        cover_to_multipolygon(&self.cover)
     }
 }
 
 /// Convert footer `cover` rings (flat format-native Mercator `x, y` pairs)
-/// into a `WGS-84` [`MultiPolygon`]. Returns `None` when nothing usable
-/// remains, so the caller can fall back to the bbox rectangle.
-fn cover_to_multipolygon(rings: &[Vec<f64>]) -> Option<MultiPolygon> {
-    let polygons: Vec<Polygon> = rings
+/// into a `WGS-84` [`MultiPolygon`], failing on the first unusable ring.
+fn cover_to_multipolygon(rings: &[Vec<f64>]) -> Result<MultiPolygon> {
+    let polygons = rings
         .iter()
-        .filter_map(|ring| {
-            if ring.len() < 6 || ring.len() % 2 != 0 {
-                return None; // need at least 3 points (6 numbers)
-            }
-            let mut coords: Vec<Coord> = ring
-                .as_chunks::<2>()
-                .0
+        .enumerate()
+        .map(|(i, ring)| {
+            let (points, rest) = ring.as_chunks::<2>();
+            anyhow::ensure!(
+                points.len() >= 3 && rest.is_empty(),
+                "`cover` ring {i} has {} numbers; need an even count of at least 6",
+                ring.len()
+            );
+            let mut coords: Vec<Coord> = points
                 .iter()
-                .map(|p| {
-                    let (lon, lat) = rnc_merc_to_wgs84(p[0], p[1]);
+                .map(|&[x, y]| {
+                    let (lon, lat) = rnc_merc_to_wgs84(x, y);
                     coord! { x: lon, y: lat }
                 })
                 .collect();
@@ -386,10 +404,11 @@ fn cover_to_multipolygon(rings: &[Vec<f64>]) -> Option<MultiPolygon> {
                 coords.push(first);
             }
             let poly = Polygon::new(LineString::new(coords), vec![]);
-            (poly.unsigned_area() > 0.0).then_some(poly)
+            anyhow::ensure!(poly.unsigned_area() > 0.0, "`cover` ring {i} has zero area");
+            Ok(poly)
         })
-        .collect();
-    (!polygons.is_empty()).then(|| MultiPolygon::new(polygons))
+        .collect::<Result<Vec<Polygon>>>()?;
+    Ok(MultiPolygon::new(polygons))
 }
 
 #[cfg(test)]
@@ -652,7 +671,7 @@ mod tests {
             vec![],
         );
         let bbox_area = bbox_rect.unsigned_area();
-        let cover_area = footer.coverage().unsigned_area();
+        let cover_area = footer.coverage().expect("valid cover").unsigned_area();
         assert!((cover_area - bbox_area / 2.0).abs() < bbox_area * 1e-6);
     }
 
@@ -662,7 +681,43 @@ mod tests {
         let footer = RncFooter::parse(&data).expect("valid footer parses");
         let (west, south, east, north) = footer.wgs84_bbox();
         let bbox_area = (east - west) * (north - south);
-        assert!((footer.coverage().unsigned_area() - bbox_area).abs() < 1e-9);
+        assert!(
+            (footer.coverage().expect("bbox fallback").unsigned_area() - bbox_area).abs() < 1e-9
+        );
+    }
+
+    #[test]
+    fn footer_rejects_malformed_cover() {
+        for cover in [
+            serde_json::json!("oops"),
+            serde_json::json!(null),
+            serde_json::json!([1.0, null, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            serde_json::json!([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], "ring"]),
+            serde_json::json!([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
+            serde_json::json!([1.0, 2.0, 3.0, 4.0]),
+            serde_json::json!([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], []]),
+        ] {
+            let data = footer_json(11.0, 57.0, 12.0, 58.0, 3_000_000.0, &cover);
+            assert!(
+                RncFooter::parse(&data).is_err(),
+                "cover {cover} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn coverage_rejects_zero_area_ring() {
+        let collinear = flat_ring(&[(11.0, 57.0), (11.5, 57.0), (12.0, 57.0)]);
+        let data = footer_json(
+            11.0,
+            57.0,
+            12.0,
+            58.0,
+            3_000_000.0,
+            &serde_json::json!(collinear),
+        );
+        let footer = RncFooter::parse(&data).expect("well-shaped cover parses");
+        assert!(footer.coverage().is_err());
     }
 
     #[test]

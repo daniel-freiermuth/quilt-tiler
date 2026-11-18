@@ -77,7 +77,9 @@ impl RncCell {
             bail!("degenerate cell extent: bbox {bbox:?}");
         }
 
-        let coverage = footer.coverage();
+        let coverage = footer
+            .coverage()
+            .context("building footer coverage polygon")?;
         // `zoom_from_scale` requires native_scale ≥ 1: anything smaller would
         // map to zoom 22 and drag the whole run's zoom ceiling with it.
         if footer.scale.is_nan() || footer.scale < 1.0 {
@@ -393,13 +395,16 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_bbox_rectangle_when_cover_is_degenerate() {
-        // A two-point "ring" (4 numbers) has no area — must be dropped.
+    fn rejects_degenerate_cover_instead_of_falling_back_to_bbox() {
+        // A two-point "ring" (4 numbers) has no area. Substituting the bbox
+        // would silently change which chart wins a tile, so it must fail.
         let degenerate = vec![1.0, 2.0, 3.0, 4.0];
         let data = build_rnc(1, 1, (11.0, 57.0, 12.0, 58.0), 3_000_000.0, &[degenerate]);
-        let cell = RncCell::parse("TEST".to_owned(), data).expect("valid .rnc parses");
-        let bbox_area = geo::Polygon::from(cell.bbox()).unsigned_area();
-        assert!((cell.coverage().unsigned_area() - bbox_area).abs() < 1e-9);
+        let err = RncCell::parse("TEST".to_owned(), data).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("`cover` ring 0 has 4 numbers"),
+            "expected cover-ring error, got: {err:#}"
+        );
     }
 
     #[test]
