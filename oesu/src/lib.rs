@@ -2387,6 +2387,42 @@ mod tests {
         );
     }
 
+    /// An EXT `TriPrim` bbox is i16 SM scaled by `scale_factor`, converted to
+    /// WGS84 at parse time against the cell extent's reference point.
+    #[test]
+    fn geometry_area_ext_georeferences_triprim_bbox_against_the_cell_extent() {
+        let mut b = builder_with_feature();
+        // extent, no contours, one TriPrim, no edges, scale_factor; the
+        // TriPrim has no vertices, only its [min_e, max_e, min_n, max_n] bbox.
+        let payload = Bytes::default()
+            .extent()
+            .u32(0)
+            .u32(1)
+            .u32(0)
+            .f64(100.0)
+            .u8(4)
+            .u32(0)
+            .i16(-300)
+            .i16(100)
+            .i16(-25)
+            .i16(400);
+        feed(&mut b, &payload.0, CellBuilder::parse_geometry_area_ext).unwrap();
+        let geometry = &current_feature(&b).raw_geometry;
+        let RawGeometry::Area {
+            _tri_prims: tri_prims,
+            ..
+        } = geometry
+        else {
+            panic!("expected an area, got {geometry:?}");
+        };
+        let [RawTriPrim { _bbox: bbox, .. }] = tri_prims.as_slice() else {
+            panic!("expected one TriPrim, got {tri_prims:?}");
+        };
+        let min = crate::georef::from_sm(-3.0, -0.25, 54.75, 10.75);
+        let max = crate::georef::from_sm(1.0, 4.0, 54.75, 10.75);
+        assert_eq!(*bbox, [min.x, min.y, max.x, max.y]);
+    }
+
     #[test]
     fn vet_keeps_the_edges_and_points_the_payload_holds() {
         // One edge whose single point ends exactly at the payload end.
