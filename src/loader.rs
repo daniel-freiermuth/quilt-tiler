@@ -145,7 +145,8 @@ mod tests {
     }
 
     /// Minimal decrypted SENC stream `oesu::parse_file` accepts: server
-    /// status (decrypted, licensed), version 201, cell name, native scale.
+    /// status (decrypted, licensed), version 201, cell name, native scale,
+    /// cell extent.
     fn minimal_oesu(name: &str, scale: u32) -> Vec<u8> {
         let status: Vec<u8> = [1u16, 1, 1, 30, 0, 0]
             .iter()
@@ -157,6 +158,12 @@ mod tests {
         out.extend(record(1, &201u16.to_le_bytes()));
         out.extend(record(2, &cstr));
         out.extend(record(7, &scale.to_le_bytes()));
+        // (lat, lon) corners in SW, NW, NE, SE order.
+        let extent: Vec<u8> = [57.0, 11.0, 58.0, 11.0, 58.0, 12.0, 57.0, 12.0]
+            .iter()
+            .flat_map(|v: &f64| v.to_le_bytes())
+            .collect();
+        out.extend(record(100, &extent));
         out
     }
 
