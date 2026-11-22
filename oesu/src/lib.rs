@@ -27,9 +27,126 @@ mod georef;
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read};
 
-use anyhow::{Context, Result, bail};
 use geo::{Area, BooleanOps, Coord, Intersects, LineString, MultiPolygon, Point, Polygon, point};
 use s57::{AttrValue, Attribute, Feature, Geometry};
+
+// ── Errors ───────────────────────────────────────────────────────────────────
+
+/// Why a SENC stream could not be parsed.
+///
+/// Variants split into two groups:
+/// - **Domain refusals** ([`Self::is_refusal`]): the file is intact, but this
+///   tool must not or cannot use it (expired licence, decryption/signature
+///   failure, raster chart, unsupported SENC version). Retrying the same file
+///   never helps; the user has to act (renew, re-download, re-key).
+/// - **Corrupt or truncated data**: the stream is malformed. Recovery: skip
+///   the file; other cells are unaffected.
+#[derive(Debug, thiserror::Error)]
+pub enum OesuError {
+    /// `expireStatus == 0`. Recovery: renew the chart subscription.
+    #[error(
+        "chart license has expired (expireDays={expire_days}, graceDays={grace_days}); \
+         renew your chart subscription to continue using this chart"
+    )]
+    LicenseExpired { expire_days: u16, grace_days: u16 },
+    /// `decryptStatus == 0`. Recovery: install a valid chart key.
+    #[error(
+        "chart decryption/signature failure (decryptStatus=0, serverStatus={server_status}); \
+         the chart key may be missing or invalid"
+    )]
+    DecryptionFailed { server_status: u16 },
+    /// SENC version 1024: the decrypter's signature-failure sentinel.
+    /// Recovery: install a valid chart key or re-download the chart.
+    #[error(
+        "SENC version 1024 is a signature-failure sentinel; \
+         the chart key is invalid or the file is corrupt"
+    )]
+    SignatureFailure,
+    /// A BSB raster chart (`.oernc`) was passed instead of a vector SENC.
+    /// Recovery: none in this tool; raster charts are not supported.
+    #[error(
+        "file is a BSB raster chart (.oernc), not a vector SENC (.oesu); \
+         raster charts are not supported by this tool"
+    )]
+    UnsupportedRaster,
+    /// SENC version outside 200–299. Recovery: a newer parser is required.
+    #[error(
+        "unsupported SENC version {0} (valid range is 200–299); \
+         this file requires a newer parser or is in an incompatible format"
+    )]
+    UnsupportedVersion(u16),
+    /// The prologue's first or second record is not the required type.
+    #[error(
+        "expected record type {expected}, found type {found}; \
+         the file may be corrupt, still encrypted, or in an unknown format"
+    )]
+    UnexpectedRecord { expected: u16, found: u16 },
+    /// A record declares more payload than the stream still holds.
+    #[error(
+        "record type {record_type} declares {declared} payload bytes but only {remaining} remain"
+    )]
+    Truncated {
+        record_type: u16,
+        declared: usize,
+        remaining: usize,
+    },
+    /// A record whose fields must all be present is shorter than its layout.
+    #[error("{record} too short ({len} bytes, need {need})")]
+    RecordTooShort {
+        record: &'static str,
+        len: usize,
+        need: usize,
+    },
+    /// An area payload's count-driven `section` runs past the payload end.
+    #[error("{record}: truncated {section} at entry {entry}/{count}")]
+    TruncatedSection {
+        record: &'static str,
+        section: &'static str,
+        entry: usize,
+        count: usize,
+    },
+    /// An area payload's edge section doesn't hold `edge_count` entries.
+    #[error("unexpected {remaining} bytes for edge section (expected {expected})")]
+    EdgeSectionMismatch { remaining: usize, expected: usize },
+    /// `CELL_EXTENT_RECORD` has a non-finite or out-of-range latitude.
+    #[error("CELL_EXTENT_RECORD latitude {0} is not a valid latitude")]
+    InvalidExtentLatitude(f64),
+    /// `CELL_EXTENT_RECORD` has a non-finite longitude.
+    #[error("CELL_EXTENT_RECORD longitude {0} is not finite")]
+    InvalidExtentLongitude(f64),
+    /// `record` needs the cell's reference point, but arrived before
+    /// `CELL_EXTENT_RECORD`.
+    #[error("{record} precedes CELL_EXTENT_RECORD")]
+    RecordBeforeExtent { record: &'static str },
+    /// The stream ended without a non-zero `HEADER_CELL_NATIVESCALE`.
+    #[error("cell has no HEADER_CELL_NATIVESCALE record (or scale is zero)")]
+    MissingNativeScale,
+    /// The stream ended without a `CELL_EXTENT_RECORD`.
+    #[error("cell has no CELL_EXTENT_RECORD")]
+    MissingCellExtent,
+    /// A field read ran past the end of its record or stream.
+    #[error("reading record data: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+impl OesuError {
+    /// `true` for domain refusals — an intact file this tool must not or
+    /// cannot use — as opposed to corrupt or truncated data.
+    #[must_use]
+    pub const fn is_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::LicenseExpired { .. }
+                | Self::DecryptionFailed { .. }
+                | Self::SignatureFailure
+                | Self::UnsupportedRaster
+                | Self::UnsupportedVersion(_)
+        )
+    }
+}
+
+/// Result of SENC parsing; the error defaults to [`OesuError`].
+pub type Result<T, E = OesuError> = std::result::Result<T, E>;
 
 // ── Record type constants ────────────────────────────────────────────────────
 
@@ -235,10 +352,13 @@ impl CellBuilder {
     /// `CELL_EXTENT_RECORD` (100): 8 × f64 corner coordinates.
     #[allow(clippy::similar_names)] // sw/nw/ne/se are domain vocabulary
     fn parse_cell_extent(&mut self, p: &mut Cursor<&[u8]>, payload_len: usize) -> Result<()> {
-        anyhow::ensure!(
-            payload_len >= 64,
-            "CELL_EXTENT_RECORD too short ({payload_len} bytes, need 64)"
-        );
+        if payload_len < 64 {
+            return Err(OesuError::RecordTooShort {
+                record: "CELL_EXTENT_RECORD",
+                len: payload_len,
+                need: 64,
+            });
+        }
         let sw_lat = read_f64(p)?;
         let sw_lon = read_f64(p)?;
         let nw_lat = read_f64(p)?;
@@ -248,16 +368,14 @@ impl CellBuilder {
         let se_lat = read_f64(p)?;
         let se_lon = read_f64(p)?;
         for lat in [sw_lat, nw_lat, ne_lat, se_lat] {
-            anyhow::ensure!(
-                lat.is_finite() && (-90.0..=90.0).contains(&lat),
-                "CELL_EXTENT_RECORD latitude {lat} is not a valid latitude"
-            );
+            if !(lat.is_finite() && (-90.0..=90.0).contains(&lat)) {
+                return Err(OesuError::InvalidExtentLatitude(lat));
+            }
         }
         for lon in [sw_lon, nw_lon, ne_lon, se_lon] {
-            anyhow::ensure!(
-                lon.is_finite(),
-                "CELL_EXTENT_RECORD longitude {lon} is not finite"
-            );
+            if !lon.is_finite() {
+                return Err(OesuError::InvalidExtentLongitude(lon));
+            }
         }
 
         let s_lat = sw_lat.min(se_lat);
@@ -277,10 +395,10 @@ impl CellBuilder {
 
     /// The SM reference point, or an error naming `record` if the stream has
     /// not delivered `CELL_EXTENT_RECORD` yet.
-    fn georef(&self, record: &str) -> Result<GeoRef> {
+    fn georef(&self, record: &'static str) -> Result<GeoRef> {
         self.extent
             .map(|e| e.georef)
-            .with_context(|| format!("{record} precedes CELL_EXTENT_RECORD"))
+            .ok_or(OesuError::RecordBeforeExtent { record })
     }
 
     /// `CELL_TXTDSC_INFO_FILE_RECORD` (101): embedded text-description file.
@@ -664,11 +782,16 @@ fn is_valid_scale_factor(scale_factor: f64) -> bool {
 
 // ── Main entry point ─────────────────────────────────────────────────────────
 
+/// Parse a decrypted SENC stream into an [`s57::S57Cell`].
+///
+/// # Errors
+/// Returns an [`OesuError`]: a domain refusal ([`OesuError::is_refusal`])
+/// when the prologue rejects the chart, otherwise a corrupt/truncated-data
+/// variant.
 #[allow(
     clippy::too_many_lines,           // 196 lines (down from 520); post-processing prevents going below 100
     clippy::cast_possible_truncation, // Cursor positions bounded by payload_len (≤ u32)
     clippy::similar_names,            // resolved_vct/resolved_vet are domain vocab
-    clippy::missing_errors_doc,       // private binary parser; error cases in record comments
 )]
 pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
     // ── Prologue: validate SERVER_STATUS + version ───────────────────────────
@@ -696,14 +819,15 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
         let payload_len = (rec_len - 6) as usize;
         let remaining = data.len().saturating_sub(c.position() as usize);
         if payload_len > remaining {
-            bail!(
-                "reading payload of record type {rec_type}: declares {payload_len} bytes but only {remaining} remain"
-            );
+            return Err(OesuError::Truncated {
+                record_type: rec_type,
+                declared: payload_len,
+                remaining,
+            });
         }
 
         let mut payload_bytes = vec![0u8; payload_len];
-        c.read_exact(&mut payload_bytes)
-            .with_context(|| format!("reading payload of record type {rec_type}"))?;
+        c.read_exact(&mut payload_bytes)?;
         let mut p = Cursor::new(payload_bytes.as_slice());
 
         match rec_type {
@@ -725,7 +849,11 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
                 b.update_number = read_u16(&mut p).unwrap_or(0);
             }
             HEADER_CELL_NATIVESCALE => {
-                b.native_scale = read_u32(&mut p).context("reading HEADER_CELL_NATIVESCALE")?;
+                b.native_scale = read_u32(&mut p).map_err(|_| OesuError::RecordTooShort {
+                    record: "HEADER_CELL_NATIVESCALE",
+                    len: payload_len,
+                    need: 4,
+                })?;
             }
             HEADER_CELL_SENCCREATEDATE => {
                 b.senc_create_date = read_cstring(&mut p, payload_len).unwrap_or_default();
@@ -791,7 +919,7 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
     }
 
     if b.native_scale == 0 {
-        bail!("cell {source:?} has no HEADER_CELL_NATIVESCALE record (or scale is zero)");
+        return Err(OesuError::MissingNativeScale);
     }
     let Some(CellExtent {
         georef: GeoRef {
@@ -801,7 +929,7 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
         bounds,
     }) = b.extent
     else {
-        bail!("cell {source:?} has no CELL_EXTENT_RECORD");
+        return Err(OesuError::MissingCellExtent);
     };
 
     // Push the last in-flight feature.
@@ -1068,10 +1196,11 @@ fn decode_covr(source: &str, covr: &[LineString], no_covr: &[LineString]) -> Mul
 #[allow(clippy::items_after_statements)] // PAYLOAD const follows early-exit guards; clearer here
 fn strip_server_status(data: &[u8]) -> Result<(&[u8], u16, u16)> {
     if data.len() < 6 {
-        bail!(
-            "file too short to be a valid SENC stream ({} bytes)",
-            data.len()
-        );
+        return Err(OesuError::RecordTooShort {
+            record: "SERVER_STATUS_RECORD",
+            len: data.len(),
+            need: 6,
+        });
     }
 
     let mut header = Cursor::new(data);
@@ -1080,36 +1209,36 @@ fn strip_server_status(data: &[u8]) -> Result<(&[u8], u16, u16)> {
 
     if rec_type != SERVER_STATUS_RECORD {
         // Not a SENC file: check for BSB raster chart signature.
-        if data.starts_with(b"!BSB") || data.starts_with(b"BSB/") {
-            bail!(
-                "file is a BSB raster chart (.oernc), not a vector SENC (.oesu); \
-                 raster charts are not supported by this tool"
-            );
+        if is_bsb_raster(data) {
+            return Err(OesuError::UnsupportedRaster);
         }
-        bail!(
-            "expected SERVER_STATUS_RECORD (200) as first record, found type {rec_type}; \
-             the file may be corrupt, still encrypted, or a raster chart (.oernc)"
-        );
+        return Err(OesuError::UnexpectedRecord {
+            expected: SERVER_STATUS_RECORD,
+            found: rec_type,
+        });
     }
 
     // Payload layout (12 bytes):
     //   u16 serverStatus, u16 decryptStatus, u16 expireStatus,
     //   u16 expireDaysRemaining, u16 graceDaysAllowed, u16 graceDaysRemaining
     const PAYLOAD: usize = 12;
+    let too_short = OesuError::RecordTooShort {
+        record: "SERVER_STATUS_RECORD",
+        len: rec_len,
+        need: 6 + PAYLOAD,
+    };
     if rec_len < 6 + PAYLOAD {
-        bail!(
-            "SERVER_STATUS_RECORD too short ({rec_len} bytes, need at least {})",
-            6 + PAYLOAD
-        );
+        return Err(too_short);
     }
     let Some(rest) = data.get(rec_len..) else {
-        bail!("file truncated inside SERVER_STATUS_RECORD");
+        return Err(OesuError::Truncated {
+            record_type: SERVER_STATUS_RECORD,
+            declared: rec_len - 6,
+            remaining: data.len().saturating_sub(6),
+        });
     };
 
-    let mut pl = Cursor::new(
-        data.get(6..6 + PAYLOAD)
-            .context("SERVER_STATUS_RECORD payload out of bounds")?,
-    );
+    let mut pl = Cursor::new(data.get(6..6 + PAYLOAD).ok_or(too_short)?);
     let server_status = read_u16(&mut pl)?;
     let decrypt_status = read_u16(&mut pl)?;
     let expire_status = read_u16(&mut pl)?;
@@ -1128,20 +1257,21 @@ fn strip_server_status(data: &[u8]) -> Result<(&[u8], u16, u16)> {
     );
 
     if decrypt_status == 0 {
-        bail!(
-            "chart decryption/signature failure (decryptStatus=0, serverStatus={server_status}); \
-             the chart key may be missing or invalid"
-        );
+        return Err(OesuError::DecryptionFailed { server_status });
     }
     if expire_status == 0 {
-        bail!(
-            "chart license has expired \
-             (expireStatus=0, expireDays={expire_days}, graceDays={grace_days}); \
-             renew your chart subscription to continue using this chart"
-        );
+        return Err(OesuError::LicenseExpired {
+            expire_days,
+            grace_days,
+        });
     }
 
     Ok((rest, expire_days, grace_days))
+}
+
+/// `true` if `data` starts with a BSB raster chart (`.oernc`) signature.
+fn is_bsb_raster(data: &[u8]) -> bool {
+    data.starts_with(b"!BSB") || data.starts_with(b"BSB/")
 }
 
 /// Read and range-check the SENC version from `HEADER_SENC_VERSION` (record 1).
@@ -1149,7 +1279,11 @@ fn strip_server_status(data: &[u8]) -> Result<(&[u8], u16, u16)> {
 /// are the version record.
 fn read_senc_version(data: &[u8]) -> Result<u16> {
     if data.len() < 8 {
-        bail!("file too short to contain a SENC version record");
+        return Err(OesuError::RecordTooShort {
+            record: "HEADER_SENC_VERSION",
+            len: data.len(),
+            need: 8,
+        });
     }
 
     let mut c = Cursor::new(data);
@@ -1157,34 +1291,29 @@ fn read_senc_version(data: &[u8]) -> Result<u16> {
     let rec_len = read_u32(&mut c)?;
 
     if rec_type != HEADER_SENC_VERSION {
-        if data.starts_with(b"!BSB") || data.starts_with(b"BSB/") {
-            bail!(
-                "expected SENC version record after SERVER_STATUS, found BSB raster data; \
-                 this appears to be an .oernc raster chart, which is not supported"
-            );
+        if is_bsb_raster(data) {
+            return Err(OesuError::UnsupportedRaster);
         }
-        bail!(
-            "expected HEADER_SENC_VERSION (type 1) after server status, found type {rec_type}; \
-             the file may be corrupt or in an unknown format"
-        );
+        return Err(OesuError::UnexpectedRecord {
+            expected: HEADER_SENC_VERSION,
+            found: rec_type,
+        });
     }
     if rec_len < 8 {
-        bail!("HEADER_SENC_VERSION record too short ({rec_len} bytes, need 8)");
+        return Err(OesuError::RecordTooShort {
+            record: "HEADER_SENC_VERSION",
+            len: rec_len as usize,
+            need: 8,
+        });
     }
 
     let version = read_u16(&mut c)?;
 
     if version == 1024 {
-        bail!(
-            "SENC version 1024 is a signature-failure sentinel; \
-             the chart key is invalid or the file is corrupt"
-        );
+        return Err(OesuError::SignatureFailure);
     }
     if !(200..=299).contains(&version) {
-        bail!(
-            "unsupported SENC version {version} (valid range is 200–299); \
-             this file requires a newer parser or is in an incompatible format"
-        );
+        return Err(OesuError::UnsupportedVersion(version));
     }
 
     tracing::debug!(version, "SENC version OK");
@@ -1234,11 +1363,24 @@ fn parse_area_payload(
     payload_len: usize,
     ext: Option<(f64, GeoRef)>,
 ) -> Result<RawGeometry> {
-    let min_len = if ext.is_some() { 52 } else { 44 };
-    anyhow::ensure!(
-        payload_len >= min_len,
-        "area payload too short ({payload_len} bytes)"
-    );
+    let (record, min_len) = if ext.is_some() {
+        ("FEATURE_GEOMETRY_RECORD_AREA_EXT", 52)
+    } else {
+        ("FEATURE_GEOMETRY_RECORD_AREA", 44)
+    };
+    if payload_len < min_len {
+        return Err(OesuError::RecordTooShort {
+            record,
+            len: payload_len,
+            need: min_len,
+        });
+    }
+    let truncated = |section, entry, count| OesuError::TruncatedSection {
+        record,
+        section,
+        entry,
+        count,
+    };
 
     // 4×f64 extent (informational, not used for geometry)
     let _s = read_f64(p)?;
@@ -1259,20 +1401,18 @@ fn parse_area_payload(
     let n_contours = contour_count as usize;
     let mut vertex_counts = Vec::new();
     for k in 0..n_contours {
-        anyhow::ensure!(
-            p.position() as usize + 4 <= payload_len,
-            "truncated vertex count array at entry {k}/{n_contours}"
-        );
+        if p.position() as usize + 4 > payload_len {
+            return Err(truncated("vertex count array", k, n_contours));
+        }
         vertex_counts.push(read_u32(p)?);
     }
 
     // TriPrim chain.
     let mut tri_prims = Vec::new();
     for k in 0..triprim_count {
-        anyhow::ensure!(
-            p.position() as usize + 5 <= payload_len,
-            "truncated TriPrim header at entry {k}/{triprim_count}"
-        );
+        if p.position() as usize + 5 > payload_len {
+            return Err(truncated("TriPrim header", k, triprim_count));
+        }
         let prim_type = read_u8(p)?;
         if TriPrimType::from_u8(prim_type).is_none() {
             tracing::warn!(prim_type, entry = k, "unrecognized TriPrim primitive type");
@@ -1281,10 +1421,9 @@ fn parse_area_payload(
 
         let (bbox, vertices) = if let Some((scale_factor, georef)) = ext {
             // bbox: 4×i16 SM coords [min_east, max_east, min_north, max_north]
-            anyhow::ensure!(
-                p.position() as usize + 4 * 2 + nvert * 2 * 2 <= payload_len,
-                "truncated EXT TriPrim body at entry {k}/{triprim_count} (nvert={nvert})"
-            );
+            if p.position() as usize + 4 * 2 + nvert * 2 * 2 > payload_len {
+                return Err(truncated("TriPrim body", k, triprim_count));
+            }
             let min_east = f64::from(read_i16(p)?) / scale_factor;
             let max_east = f64::from(read_i16(p)?) / scale_factor;
             let min_north = f64::from(read_i16(p)?) / scale_factor;
@@ -1302,10 +1441,9 @@ fn parse_area_payload(
             (bbox, verts)
         } else {
             // bbox: 4×f64 already in WGS84 [min_lon, max_lon, min_lat, max_lat]
-            anyhow::ensure!(
-                p.position() as usize + 32 + nvert * 8 <= payload_len,
-                "truncated TriPrim body at entry {k}/{triprim_count} (nvert={nvert})"
-            );
+            if p.position() as usize + 32 + nvert * 8 > payload_len {
+                return Err(truncated("TriPrim body", k, triprim_count));
+            }
             let minlon = read_f64(p)?;
             let maxlon = read_f64(p)?;
             let minlat = read_f64(p)?;
@@ -1333,11 +1471,12 @@ fn parse_area_payload(
     // says 3-int entries for version ≤ 200, but all known files are version 201+.
     let cursor = p.position() as usize;
     let remaining = payload_len.saturating_sub(cursor);
-    anyhow::ensure!(
-        remaining == edge_count * 16,
-        "unexpected {remaining} bytes for edge section (expected {})",
-        edge_count * 16,
-    );
+    if remaining != edge_count * 16 {
+        return Err(OesuError::EdgeSectionMismatch {
+            remaining,
+            expected: edge_count * 16,
+        });
+    }
 
     let mut edge_refs = Vec::with_capacity(edge_count);
     for _ in 0..edge_count {
@@ -2138,8 +2277,15 @@ mod tests {
         let mut b = CellBuilder::default();
         let err = feed(&mut b, &[0; 63], CellBuilder::parse_cell_extent).unwrap_err();
         assert!(
-            format!("{err:#}").contains("too short (63 bytes, need 64)"),
-            "{err:#}"
+            matches!(
+                err,
+                OesuError::RecordTooShort {
+                    record: "CELL_EXTENT_RECORD",
+                    len: 63,
+                    need: 64
+                }
+            ),
+            "{err:?}"
         );
         assert_eq!(b.extent, None);
     }
@@ -2160,10 +2306,14 @@ mod tests {
             values[corner] = bad;
             let payload = values.iter().fold(Bytes::default(), |b, &v| b.f64(v));
             let mut b = CellBuilder::default();
-            assert!(
-                feed(&mut b, &payload.0, CellBuilder::parse_cell_extent).is_err(),
-                "corner value {corner} = {bad}"
-            );
+            let err = feed(&mut b, &payload.0, CellBuilder::parse_cell_extent).unwrap_err();
+            // Even payload slots are latitudes, odd ones longitudes.
+            let expected_variant = if corner % 2 == 0 {
+                matches!(err, OesuError::InvalidExtentLatitude(_))
+            } else {
+                matches!(err, OesuError::InvalidExtentLongitude(_))
+            };
+            assert!(expected_variant, "corner value {corner} = {bad}: {err:?}");
         }
     }
 
@@ -2519,25 +2669,103 @@ mod tests {
         record_header(HEADER_CELL_NATIVESCALE, 6 + 4).u32(scale)
     }
 
-    fn parse_err(data: &[u8]) -> String {
+    fn parse_err(data: &[u8]) -> OesuError {
         match parse_file("test.oesu".to_owned(), data) {
             Ok(cell) => panic!("expected parse error, got cell {:?}", cell.name),
-            Err(e) => format!("{e:#}"),
+            Err(e) => e,
         }
+    }
+
+    /// A `SERVER_STATUS` + version prologue with the given status fields
+    /// (`serverStatus, decryptStatus, expireStatus, expireDays, graceAllowed,
+    /// graceDays`) and SENC version.
+    fn prologue(status: [u16; 6], version: u16) -> Vec<u8> {
+        let status = status.iter().fold(Bytes::default(), |b, &v| b.u16(v));
+        record_header(SERVER_STATUS_RECORD, 6 + 12)
+            .raw(&status.0)
+            .raw(&record_header(HEADER_SENC_VERSION, 6 + 2).u16(version).0)
+            .0
+    }
+
+    /// Domain refusals — an intact file this tool must not use — are typed
+    /// distinctly from corrupt or truncated streams.
+    #[test]
+    fn prologue_refusals_are_typed_and_distinct_from_corruption() {
+        let err = parse_err(&prologue([1, 1, 0, 0, 7, 3], 201));
+        assert!(
+            matches!(
+                err,
+                OesuError::LicenseExpired {
+                    expire_days: 0,
+                    grace_days: 3
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(err.is_refusal());
+
+        let err = parse_err(&prologue([5, 0, 1, 30, 0, 0], 201));
+        assert!(
+            matches!(err, OesuError::DecryptionFailed { server_status: 5 }),
+            "{err:?}"
+        );
+        assert!(err.is_refusal());
+
+        let err = parse_err(&prologue([1, 1, 1, 30, 0, 0], 1024));
+        assert!(matches!(err, OesuError::SignatureFailure), "{err:?}");
+        assert!(err.is_refusal());
+
+        let err = parse_err(&prologue([1, 1, 1, 30, 0, 0], 300));
+        assert!(matches!(err, OesuError::UnsupportedVersion(300)), "{err:?}");
+        assert!(err.is_refusal());
+
+        let err = parse_err(b"!BSB/VER=3.0,CED/SE=1");
+        assert!(matches!(err, OesuError::UnsupportedRaster), "{err:?}");
+        assert!(err.is_refusal());
+
+        let err = parse_err(b"not a senc stream");
+        assert!(
+            matches!(
+                err,
+                OesuError::UnexpectedRecord {
+                    expected: SERVER_STATUS_RECORD,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(!err.is_refusal());
+
+        // SERVER_STATUS declares 12 payload bytes; only 4 follow.
+        let mut truncated = prologue([1, 1, 1, 30, 0, 0], 201);
+        truncated.truncate(10);
+        let err = parse_err(&truncated);
+        assert!(
+            matches!(
+                err,
+                OesuError::Truncated {
+                    record_type: SERVER_STATUS_RECORD,
+                    declared: 12,
+                    remaining: 4
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(!err.is_refusal());
     }
 
     #[test]
     fn parse_file_missing_native_scale_is_rejected() {
         let data = senc_stream(vec![(HEADER_CELL_NAME, Bytes::default().raw(b"TEST01\0"))]);
         let err = parse_err(&data);
-        assert!(err.contains("has no HEADER_CELL_NATIVESCALE"), "{err}");
+        assert!(matches!(err, OesuError::MissingNativeScale), "{err:?}");
     }
 
     #[test]
     fn parse_file_zero_native_scale_is_rejected() {
         let data = senc_stream(vec![(HEADER_CELL_NATIVESCALE, Bytes::default().u32(0))]);
         let err = parse_err(&data);
-        assert!(err.contains("has no HEADER_CELL_NATIVESCALE"), "{err}");
+        assert!(matches!(err, OesuError::MissingNativeScale), "{err:?}");
     }
 
     /// A self-consistent record too short for the u32 scale must error, not
@@ -2549,7 +2777,17 @@ mod tests {
             Bytes::default().u16(10_000),
         )]);
         let err = parse_err(&data);
-        assert!(err.contains("reading HEADER_CELL_NATIVESCALE"), "{err}");
+        assert!(
+            matches!(
+                err,
+                OesuError::RecordTooShort {
+                    record: "HEADER_CELL_NATIVESCALE",
+                    len: 2,
+                    need: 4
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -2561,8 +2799,17 @@ mod tests {
         // Declares a 4-byte payload but only 2 bytes follow.
         data.extend(record_header(HEADER_CELL_EDITION, 6 + 4).u16(1).0);
         let err = parse_err(&data);
-        let expected = format!("reading payload of record type {HEADER_CELL_EDITION}");
-        assert!(err.contains(&expected), "{err}");
+        assert!(
+            matches!(
+                err,
+                OesuError::Truncated {
+                    record_type: HEADER_CELL_EDITION,
+                    declared: 4,
+                    remaining: 2
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -2575,9 +2822,17 @@ mod tests {
         // not by a ~4 GiB zeroed allocation followed by a failed read.
         data.extend(record_header(HEADER_CELL_EDITION, u32::MAX).u16(1).0);
         let err = parse_err(&data);
-        let expected = format!("reading payload of record type {HEADER_CELL_EDITION}");
-        assert!(err.contains(&expected), "{err}");
-        assert!(err.contains("only 2 remain"), "{err}");
+        assert!(
+            matches!(
+                err,
+                OesuError::Truncated {
+                    record_type: HEADER_CELL_EDITION,
+                    remaining: 2,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -2614,7 +2869,7 @@ mod tests {
         data.extend(record_header(0, 0).0);
         data.extend(scale_record(22_000).0);
         let err = parse_err(&data);
-        assert!(err.contains("has no HEADER_CELL_NATIVESCALE"), "{err}");
+        assert!(matches!(err, OesuError::MissingNativeScale), "{err:?}");
     }
 
     /// Every SM-relative coordinate is georeferenced against the extent's
@@ -2629,7 +2884,7 @@ mod tests {
             ),
         ]);
         let err = parse_err(&data);
-        assert!(err.contains("has no CELL_EXTENT_RECORD"), "{err}");
+        assert!(matches!(err, OesuError::MissingCellExtent), "{err:?}");
     }
 
     #[test]
@@ -2640,8 +2895,15 @@ mod tests {
         ]);
         let err = parse_err(&data);
         assert!(
-            err.contains("CELL_EXTENT_RECORD too short (16 bytes, need 64)"),
-            "{err}"
+            matches!(
+                err,
+                OesuError::RecordTooShort {
+                    record: "CELL_EXTENT_RECORD",
+                    len: 16,
+                    need: 64
+                }
+            ),
+            "{err:?}"
         );
     }
 
@@ -2658,8 +2920,13 @@ mod tests {
         ]);
         let err = parse_err(&data);
         assert!(
-            err.contains("FEATURE_GEOMETRY_RECORD_AREA_EXT precedes CELL_EXTENT_RECORD"),
-            "{err}"
+            matches!(
+                err,
+                OesuError::RecordBeforeExtent {
+                    record: "FEATURE_GEOMETRY_RECORD_AREA_EXT"
+                }
+            ),
+            "{err:?}"
         );
     }
 
@@ -2886,8 +3153,8 @@ mod tests {
         };
         for ext in [None, Some((10.0, georef))] {
             for (contours, triprims, expected) in [
-                (u32::MAX, 0, "truncated vertex count array"),
-                (0, u32::MAX, "truncated TriPrim header"),
+                (u32::MAX, 0, "vertex count array"),
+                (0, u32::MAX, "TriPrim header"),
             ] {
                 let mut payload = Bytes::default().extent().u32(contours).u32(triprims).u32(0);
                 if ext.is_some() {
@@ -2898,9 +3165,14 @@ mod tests {
                     payload.0.len(),
                     ext,
                 )
-                .unwrap_err()
-                .to_string();
-                assert!(err.contains(expected), "ext={ext:?}: {err}");
+                .unwrap_err();
+                assert!(
+                    matches!(
+                        err,
+                        OesuError::TruncatedSection { section, entry: 0, .. } if section == expected
+                    ),
+                    "ext={ext:?}: {err:?}"
+                );
             }
         }
     }

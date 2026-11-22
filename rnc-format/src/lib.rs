@@ -42,9 +42,52 @@
     )
 )]
 
-use anyhow::{Context, Result, bail};
 use geo::{Area, Coord, LineString, MultiPolygon, Polygon, coord};
 use serde::Deserialize;
+
+/// Why a `.rnc` file could not be parsed.
+///
+/// Every variant means the file itself is unusable (truncated, corrupt, or
+/// not an `.rnc` file); none is transient. Recovery: skip the file — retrying
+/// the same bytes always fails the same way.
+#[derive(Debug, thiserror::Error)]
+pub enum RncError {
+    /// A fixed-position `u32` lies beyond the end of the file (typically a
+    /// file shorter than the 16-byte header).
+    #[error("offset {offset} out of bounds (file is {len} bytes)")]
+    OutOfBounds { offset: usize, len: usize },
+    /// The header declares a grid with zero columns or rows.
+    #[error("empty tile grid ({cols}x{rows})")]
+    EmptyGrid { cols: u32, rows: u32 },
+    /// The declared grid's offset table size overflows `u64`.
+    #[error("tile grid too large ({cols}x{rows})")]
+    GridTooLarge { cols: u32, rows: u32 },
+    /// The file ends before the offset table the header declares.
+    #[error("truncated offset table: file is {len} bytes, need at least {need}")]
+    TruncatedOffsetTable { len: usize, need: u64 },
+    /// Tile offsets decrease somewhere, so tile byte ranges would be inverted.
+    #[error("offset table is not monotonically non-decreasing")]
+    OffsetsNotMonotonic,
+    /// The last tile ends past the end of the file.
+    #[error("offset table points past end of file (offset {offset}, file is {len} bytes)")]
+    OffsetPastEof { offset: usize, len: usize },
+    /// No `{"cover"` footer marker anywhere in the file.
+    #[error("RNC footer marker `{{\"cover\"` not found")]
+    FooterMissing,
+    /// The footer JSON is malformed or doesn't match [`RncFooter`]'s shape
+    /// (including a malformed `cover` array).
+    #[error("failed to parse RNC footer JSON: {0}")]
+    FooterJson(#[from] serde_json::Error),
+    /// A `cover` ring isn't an even count of at least 6 numbers.
+    #[error("`cover` ring {ring} has {numbers} numbers; need an even count of at least 6")]
+    InvalidCoverRing { ring: usize, numbers: usize },
+    /// A `cover` ring encloses no area.
+    #[error("`cover` ring {ring} has zero area")]
+    ZeroAreaCoverRing { ring: usize },
+}
+
+/// Result of `.rnc` parsing; the error defaults to [`RncError`].
+pub type Result<T, E = RncError> = std::result::Result<T, E>;
 
 /// This format's internal Mercator sphere circumference, in metres.
 pub const MERC_SPHERE_BASE: f64 = 4.003_017_861_858_939_4e7;
@@ -142,7 +185,10 @@ fn read_u32_le(data: &[u8], at: usize) -> Result<u32> {
     let b = data
         .get(at..)
         .and_then(<[u8]>::first_chunk::<4>)
-        .with_context(|| format!("offset {at} out of bounds (file is {} bytes)", data.len()))?;
+        .ok_or(RncError::OutOfBounds {
+            offset: at,
+            len: data.len(),
+        })?;
     Ok(u32::from_le_bytes(*b))
 }
 
@@ -168,22 +214,23 @@ impl RncHeader {
     /// malformed, or describes an empty/oversized grid.
     #[allow(clippy::cast_possible_truncation)] // table_end is bounds-checked below
     pub fn parse(data: &[u8]) -> Result<Self> {
-        let cols = read_u32_le(data, 8).context("reading grid column count")?;
-        let rows = read_u32_le(data, 12).context("reading grid row count")?;
+        let cols = read_u32_le(data, 8)?;
+        let rows = read_u32_le(data, 12)?;
         let n_tiles = u64::from(cols) * u64::from(rows);
         if n_tiles == 0 {
-            bail!("empty tile grid ({cols}x{rows})");
+            return Err(RncError::EmptyGrid { cols, rows });
         }
-        let n_offsets = n_tiles.checked_add(2).context("tile grid too large")?;
-        let table_bytes = n_offsets.checked_mul(4).context("offset table too large")?;
-        let table_end = 16u64
-            .checked_add(table_bytes)
-            .context("offset table overflows file size")?;
+        let table_end = n_tiles
+            .checked_add(2)
+            .and_then(|n| n.checked_mul(4))
+            .and_then(|bytes| bytes.checked_add(16))
+            .ok_or(RncError::GridTooLarge { cols, rows })?;
+        let n_offsets = n_tiles + 2; // cannot overflow: checked above
         if (data.len() as u64) < table_end {
-            bail!(
-                "truncated offset table: file is {} bytes, need at least {table_end}",
-                data.len()
-            );
+            return Err(RncError::TruncatedOffsetTable {
+                len: data.len(),
+                need: table_end,
+            });
         }
 
         let mut offsets = Vec::with_capacity(n_offsets as usize);
@@ -192,14 +239,18 @@ impl RncHeader {
             offsets.push(read_u32_le(data, at)?);
         }
         if !offsets.is_sorted() {
-            bail!("offset table is not monotonically non-decreasing");
+            return Err(RncError::OffsetsNotMonotonic);
         }
-        #[allow(clippy::cast_possible_truncation)] // n_tiles < offsets.len(), checked above
-        let last_tile_end = *offsets
+        // n_tiles < offsets.len() == n_tiles + 2, so this index always exists.
+        #[allow(clippy::cast_possible_truncation)]
+        let last_tile_end = offsets
             .get(n_tiles as usize)
-            .context("offset table shorter than tile grid")? as usize;
+            .map_or(usize::MAX, |&o| o as usize);
         if last_tile_end > data.len() {
-            bail!("offset table points past end of file");
+            return Err(RncError::OffsetPastEof {
+                offset: last_tile_end,
+                len: data.len(),
+            });
         }
 
         Ok(Self {
@@ -317,8 +368,8 @@ impl RncFooter {
             .windows(MARKER.len())
             .rposition(|w| w == MARKER)
             .and_then(|pos| data.get(pos..))
-            .context("RNC footer marker `{\"cover\"` not found")?;
-        serde_json::from_slice(footer).context("failed to parse RNC footer JSON")
+            .ok_or(RncError::FooterMissing)?;
+        Ok(serde_json::from_slice(footer)?)
     }
 
     /// `WGS-84` bounding box, corners normalized so `west <= east` and
@@ -386,11 +437,12 @@ fn cover_to_multipolygon(rings: &[Vec<f64>]) -> Result<MultiPolygon> {
         .enumerate()
         .map(|(i, ring)| {
             let (points, rest) = ring.as_chunks::<2>();
-            anyhow::ensure!(
-                points.len() >= 3 && rest.is_empty(),
-                "`cover` ring {i} has {} numbers; need an even count of at least 6",
-                ring.len()
-            );
+            if points.len() < 3 || !rest.is_empty() {
+                return Err(RncError::InvalidCoverRing {
+                    ring: i,
+                    numbers: ring.len(),
+                });
+            }
             let mut coords: Vec<Coord> = points
                 .iter()
                 .map(|&[x, y]| {
@@ -404,8 +456,12 @@ fn cover_to_multipolygon(rings: &[Vec<f64>]) -> Result<MultiPolygon> {
                 coords.push(first);
             }
             let poly = Polygon::new(LineString::new(coords), vec![]);
-            anyhow::ensure!(poly.unsigned_area() > 0.0, "`cover` ring {i} has zero area");
-            Ok(poly)
+            // The `else` branch also rejects a NaN area.
+            if poly.unsigned_area() > 0.0 {
+                Ok(poly)
+            } else {
+                Err(RncError::ZeroAreaCoverRing { ring: i })
+            }
         })
         .collect::<Result<Vec<Polygon>>>()?;
     Ok(MultiPolygon::new(polygons))
@@ -517,7 +573,10 @@ mod tests {
     fn header_rejects_truncated_table() {
         let data = vec![0u8; 10];
         let err = RncHeader::parse(&data).unwrap_err();
-        assert!(format!("{err:#}").contains("offset"));
+        assert!(
+            matches!(err, RncError::OutOfBounds { offset: 8, len: 10 }),
+            "{err:?}"
+        );
     }
 
     /// Build a minimal `.rnc` byte buffer for a `cols×rows` grid with the
@@ -540,8 +599,10 @@ mod tests {
         data.extend_from_slice(&0u32.to_le_bytes());
         data.extend_from_slice(&5u32.to_le_bytes());
         let err = RncHeader::parse(&data).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("empty tile grid"), "unexpected: {msg}");
+        assert!(
+            matches!(err, RncError::EmptyGrid { cols: 0, rows: 5 }),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -551,8 +612,10 @@ mod tests {
         data.extend_from_slice(&3u32.to_le_bytes());
         data.extend_from_slice(&0u32.to_le_bytes());
         let err = RncHeader::parse(&data).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("empty tile grid"), "unexpected: {msg}");
+        assert!(
+            matches!(err, RncError::EmptyGrid { cols: 3, rows: 0 }),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -562,11 +625,7 @@ mod tests {
         data.extend_from_slice(&u32::MAX.to_le_bytes());
         data.extend_from_slice(&u32::MAX.to_le_bytes());
         let err = RncHeader::parse(&data).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("too large") || msg.contains("overflow"),
-            "unexpected: {msg}"
-        );
+        assert!(matches!(err, RncError::GridTooLarge { .. }), "{err:?}");
     }
 
     #[test]
@@ -575,8 +634,7 @@ mod tests {
         let offsets = [100u32, 90, 100];
         let data = make_rnc_bytes(1, 1, &offsets, 80);
         let err = RncHeader::parse(&data).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("monotonically"), "unexpected: {msg}");
+        assert!(matches!(err, RncError::OffsetsNotMonotonic), "{err:?}");
     }
 
     #[test]
@@ -588,8 +646,16 @@ mod tests {
         let offsets = [28u32, 128, 128];
         let data = make_rnc_bytes(1, 1, &offsets, 20);
         let err = RncHeader::parse(&data).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("past end of file"), "unexpected: {msg}");
+        assert!(
+            matches!(
+                err,
+                RncError::OffsetPastEof {
+                    offset: 128,
+                    len: 48
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -698,9 +764,10 @@ mod tests {
             serde_json::json!([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], []]),
         ] {
             let data = footer_json(11.0, 57.0, 12.0, 58.0, 3_000_000.0, &cover);
+            let err = RncFooter::parse(&data).unwrap_err();
             assert!(
-                RncFooter::parse(&data).is_err(),
-                "cover {cover} must be rejected"
+                matches!(err, RncError::FooterJson(_)),
+                "cover {cover} must be rejected as malformed JSON: {err:?}"
             );
         }
     }
@@ -717,7 +784,10 @@ mod tests {
             &serde_json::json!(collinear),
         );
         let footer = RncFooter::parse(&data).expect("well-shaped cover parses");
-        assert!(footer.coverage().is_err());
+        assert!(matches!(
+            footer.coverage(),
+            Err(RncError::ZeroAreaCoverRing { ring: 0 })
+        ));
     }
 
     #[test]
