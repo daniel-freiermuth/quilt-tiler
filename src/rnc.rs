@@ -180,7 +180,7 @@ impl RncCell {
 mod tests {
     use super::*;
     use geo::Area;
-    use rnc_format::wgs84_to_rnc_merc;
+    use rnc_format::{RncError, wgs84_to_rnc_merc};
     use std::io::Cursor;
 
     fn solid_png(w: u32, h: u32, rgba: [u8; 4]) -> Vec<u8> {
@@ -338,7 +338,13 @@ mod tests {
     #[test]
     fn rejects_truncated_header() {
         let err = RncCell::parse("TEST".to_owned(), vec![0u8; 10]).unwrap_err();
-        assert!(format!("{err:#}").contains("offset"));
+        assert!(
+            matches!(
+                err.downcast_ref::<RncError>(),
+                Some(RncError::OutOfBounds { .. })
+            ),
+            "{err:#}"
+        );
     }
 
     /// Footer scales that aren't a valid `1:N` denominator (`N ≥ 1`) must be
@@ -402,7 +408,10 @@ mod tests {
         let data = build_rnc(1, 1, (11.0, 57.0, 12.0, 58.0), 3_000_000.0, &[degenerate]);
         let err = RncCell::parse("TEST".to_owned(), data).unwrap_err();
         assert!(
-            format!("{err:#}").contains("`cover` ring 0 has 4 numbers"),
+            matches!(
+                err.downcast_ref::<RncError>(),
+                Some(RncError::FooterJson(_))
+            ),
             "expected cover-ring error, got: {err:#}"
         );
     }

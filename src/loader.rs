@@ -54,6 +54,12 @@ pub fn load_s57_cells(paths: &[impl AsRef<Path> + Sync], zoom_offset: f64) -> Ve
                     );
                     Some(cell)
                 }
+                Err(e) if e.is_refusal() => {
+                    // Intact chart this tool must not use (expired licence,
+                    // bad key, raster, unsupported version): the user must act.
+                    warn!(file = %path.display(), error = %e, "chart refused, skipping");
+                    None
+                }
                 Err(e) => {
                     warn!(file = %path.display(), error = %e, "skipping");
                     None
