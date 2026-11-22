@@ -673,6 +673,20 @@ mod tests {
     }
 
     #[test]
+    fn header_offset_table_length_check_is_exact() {
+        // 1x1 grid: the 3-entry table ends at byte 28, as does the file.
+        let exact = make_rnc_bytes(1, 1, &[28, 28, 28], 0);
+        let header = RncHeader::parse(&exact).expect("table ending the file parses");
+        assert_eq!(header.tile_range(0, 0), Some((28, 28)));
+
+        let err = RncHeader::parse(&exact[..27]).unwrap_err();
+        assert!(
+            matches!(err, RncError::TruncatedOffsetTable { len: 27, need: 28 }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn footer_parses_flat_cover_ring() {
         // The real on-disk shape (not the docs' claimed nested shape).
         let data = footer_json(
@@ -788,6 +802,26 @@ mod tests {
             footer.coverage(),
             Err(RncError::ZeroAreaCoverRing { ring: 0 })
         ));
+    }
+
+    /// `cover` is a public field, so `coverage` re-checks ring shape for
+    /// footers not built by `parse`.
+    #[test]
+    fn coverage_rejects_misshapen_ring() {
+        let data = footer_json(11.0, 57.0, 12.0, 58.0, 3_000_000.0, &serde_json::json!([]));
+        let mut footer = RncFooter::parse(&data).expect("valid footer parses");
+        let triangle = flat_ring(&[(11.0, 57.0), (12.0, 57.0), (12.0, 58.0)]);
+        for (ring, numbers) in [(vec![1.0, 2.0, 3.0, 4.0], 4), (vec![1.0; 7], 7)] {
+            footer.cover = vec![triangle.clone(), ring];
+            assert!(
+                matches!(
+                    footer.coverage(),
+                    Err(RncError::InvalidCoverRing { ring: 1, numbers: n }) if n == numbers
+                ),
+                "{numbers} numbers: {:?}",
+                footer.coverage()
+            );
+        }
     }
 
     #[test]

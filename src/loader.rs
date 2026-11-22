@@ -54,19 +54,24 @@ pub fn load_s57_cells(paths: &[impl AsRef<Path> + Sync], zoom_offset: f64) -> Ve
                     );
                     Some(cell)
                 }
-                Err(e) if e.is_refusal() => {
-                    // Intact chart this tool must not use (expired licence,
-                    // bad key, raster, unsupported version): the user must act.
-                    warn!(file = %path.display(), error = %e, "chart refused, skipping");
-                    None
-                }
                 Err(e) => {
-                    warn!(file = %path.display(), error = %e, "skipping");
+                    warn_skipped_s57(path, &e);
                     None
                 }
             }
         })
         .collect()
+}
+
+/// Log why a vector cell was skipped, separating refusals (an intact chart
+/// the user must act on: expired licence, bad key, raster, unsupported
+/// version) from corrupt or truncated data.
+fn warn_skipped_s57(path: &Path, e: &oesu::OesuError) {
+    if e.is_refusal() {
+        warn!(file = %path.display(), error = %e, "chart refused, skipping");
+    } else {
+        warn!(file = %path.display(), error = %e, "skipping");
+    }
 }
 
 /// Parse all `.rnc` raster cell files in `paths` in parallel.
@@ -217,6 +222,55 @@ mod tests {
         assert_eq!(cells.len(), 1, "only the valid cell survives");
         assert_eq!(cells[0].name, "GOODCELL");
         assert_eq!(cells[0].native_scale, 50_000);
+    }
+
+    /// Captures formatted log output written on the current thread.
+    #[derive(Clone, Default)]
+    struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn skip_log(e: &oesu::OesuError) -> String {
+        let buf = LogBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            warn_skipped_s57(Path::new("cell.oesu"), e);
+        });
+        let bytes = buf.0.lock().expect("log buffer lock").clone();
+        String::from_utf8(bytes).expect("utf-8 log output")
+    }
+
+    #[test]
+    fn skipped_s57_cells_log_refusals_apart_from_corruption() {
+        let refused = skip_log(&oesu::OesuError::UnsupportedRaster);
+        assert!(refused.contains("chart refused, skipping"), "{refused}");
+
+        let corrupt = skip_log(&oesu::OesuError::MissingNativeScale);
+        assert!(corrupt.contains("skipping"), "{corrupt}");
+        assert!(!corrupt.contains("chart refused"), "{corrupt}");
     }
 
     #[test]

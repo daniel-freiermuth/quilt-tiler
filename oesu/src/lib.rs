@@ -2754,6 +2754,70 @@ mod tests {
         assert!(!err.is_refusal());
     }
 
+    /// Each prologue length check sits exactly at its boundary and reports
+    /// the record and sizes involved.
+    #[test]
+    fn prologue_length_checks_are_exact() {
+        let err = parse_err(&record_header(SERVER_STATUS_RECORD, 6 + 12).0[..5]);
+        assert!(
+            matches!(
+                err,
+                OesuError::RecordTooShort {
+                    record: "SERVER_STATUS_RECORD",
+                    len: 5,
+                    need: 6
+                }
+            ),
+            "{err:?}"
+        );
+
+        // A complete 6-byte header is enough to read; the payload is missing.
+        let err = parse_err(&record_header(SERVER_STATUS_RECORD, 6 + 12).0);
+        assert!(
+            matches!(
+                err,
+                OesuError::Truncated {
+                    record_type: SERVER_STATUS_RECORD,
+                    declared: 12,
+                    remaining: 0
+                }
+            ),
+            "{err:?}"
+        );
+
+        // One byte short of the 12-byte payload, though the stream goes on.
+        let mut short_status = prologue([1, 1, 1, 30, 0, 0], 201);
+        short_status[2..6].copy_from_slice(&17u32.to_le_bytes());
+        let err = parse_err(&short_status);
+        assert!(
+            matches!(
+                err,
+                OesuError::RecordTooShort {
+                    record: "SERVER_STATUS_RECORD",
+                    len: 17,
+                    need: 18
+                }
+            ),
+            "{err:?}"
+        );
+
+        // HEADER_SENC_VERSION declaring one byte less than its 8-byte minimum.
+        let mut short_version = prologue([1, 1, 1, 30, 0, 0], 201);
+        short_version[20..24].copy_from_slice(&7u32.to_le_bytes());
+        let err = parse_err(&short_version);
+        assert!(
+            matches!(
+                err,
+                OesuError::RecordTooShort {
+                    record: "HEADER_SENC_VERSION",
+                    len: 7,
+                    need: 8
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
     #[test]
     fn parse_file_missing_native_scale_is_rejected() {
         let data = senc_stream(vec![(HEADER_CELL_NAME, Bytes::default().raw(b"TEST01\0"))]);
@@ -3175,6 +3239,80 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Every `AREA`/`AREA_EXT` section check accepts a payload that ends
+    /// exactly where the section does and names the section one byte short.
+    #[test]
+    fn area_payload_section_checks_are_exact() {
+        fn parse(payload: &[u8], ext: Option<(f64, GeoRef)>) -> Result<RawGeometry> {
+            parse_area_payload(&mut Cursor::new(payload), payload.len(), ext)
+        }
+        fn assert_truncated(result: &Result<RawGeometry>, expected: &str) {
+            assert!(
+                matches!(
+                    result,
+                    Err(OesuError::TruncatedSection { section, entry: 0, count: 1, .. })
+                        if *section == expected
+                ),
+                "expected truncated {expected}: {result:?}"
+            );
+        }
+        let georef = GeoRef {
+            lat: 54.75,
+            lon: 10.75,
+        };
+        let header = |contours, triprims, edges, ext: bool| {
+            let b = Bytes::default()
+                .extent()
+                .u32(contours)
+                .u32(triprims)
+                .u32(edges);
+            if ext { b.f64(10.0) } else { b }
+        };
+
+        // The vertex count array ends the payload.
+        parse(&header(1, 0, 0, false).u32(4).0, None).unwrap();
+
+        // A TriPrim header that ends the payload leaves no room for its body.
+        let header_only = header(0, 1, 0, false).u8(1).u32(0);
+        assert_truncated(&parse(&header_only.0, None), "TriPrim body");
+
+        // Plain body: 4×f64 bbox + nvert × 2×f32.
+        let plain = header(0, 1, 0, false)
+            .u8(1)
+            .u32(1)
+            .extent()
+            .f32(1.5)
+            .f32(-2.5);
+        parse(&plain.0, None).unwrap();
+        assert_truncated(&parse(&plain.0[..plain.0.len() - 1], None), "TriPrim body");
+
+        // EXT body: 4×i16 bbox + nvert × 2×i16.
+        let ext = Some((10.0, georef));
+        let packed = header(0, 1, 0, true)
+            .u8(1)
+            .u32(1)
+            .i16(0)
+            .i16(1)
+            .i16(0)
+            .i16(1)
+            .i16(15)
+            .i16(-25);
+        parse(&packed.0, ext).unwrap();
+        assert_truncated(&parse(&packed.0[..packed.0.len() - 1], ext), "TriPrim body");
+
+        let err = parse(&header(0, 0, 2, false).0, None).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OesuError::EdgeSectionMismatch {
+                    remaining: 0,
+                    expected: 32
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
