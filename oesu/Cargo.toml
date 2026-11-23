@@ -10,5 +10,9 @@ tracing = "0.1"
 geo    = { version = "0.33.1", default-features = false, features = ["spade"] }
 thiserror = "2.0.18"
 
+[dev-dependencies]
+# Captures `tracing` output so tests can assert on recovery warnings.
+tracing-subscriber = "0.3"
+
 [lints]
 workspace = true

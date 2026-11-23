@@ -1279,6 +1279,7 @@ dependencies = [
  "s57",
  "thiserror",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

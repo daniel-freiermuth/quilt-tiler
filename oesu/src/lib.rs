@@ -226,11 +226,23 @@ impl From<OesuCell> for s57::S57Cell {
         // applied (then it's strictly newer) — see oesu/src/lib.rs's own
         // header parsing. Prefer it; fall back when a malformed cell omits
         // the UPDATEDATE record entirely.
-        let edition_date = s57::EditionDate::from_ccyymmdd(if c.update_date.is_empty() {
+        let raw = if c.update_date.is_empty() {
             &c.publish_date
         } else {
             &c.update_date
-        });
+        };
+        let edition_date = if raw.is_empty() {
+            s57::EditionDate::unknown()
+        } else {
+            s57::EditionDate::parse_ccyymmdd(raw).unwrap_or_else(|| {
+                tracing::warn!(
+                    cell = %c.source,
+                    raw = %raw,
+                    "unparseable edition date; ranking as oldest"
+                );
+                s57::EditionDate::unknown()
+            })
+        };
         Self {
             name: c.name,
             native_scale: c.native_scale,
@@ -837,17 +849,27 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
                 b.name = read_cstring(&mut p, payload_len).unwrap_or_default();
             }
             HEADER_CELL_PUBLISHDATE => {
-                b.publish_date = read_cstring(&mut p, payload_len).unwrap_or_default();
+                b.publish_date =
+                    read_cstring(&mut p, payload_len).context("reading HEADER_CELL_PUBLISHDATE")?;
             }
-            HEADER_CELL_EDITION => {
-                b.edition = read_u16(&mut p).unwrap_or(0);
-            }
+            // Edition/update numbers have no consumer (only the dates rank
+            // cells), so a short record is not worth dropping the cell over.
+            HEADER_CELL_EDITION => match read_u16(&mut p) {
+                Ok(edition) => b.edition = edition,
+                Err(e) => {
+                    tracing::warn!(payload_len, "HEADER_CELL_EDITION too short, ignoring: {e}");
+                }
+            },
             HEADER_CELL_UPDATEDATE => {
-                b.update_date = read_cstring(&mut p, payload_len).unwrap_or_default();
+                b.update_date =
+                    read_cstring(&mut p, payload_len).context("reading HEADER_CELL_UPDATEDATE")?;
             }
-            HEADER_CELL_UPDATE => {
-                b.update_number = read_u16(&mut p).unwrap_or(0);
-            }
+            HEADER_CELL_UPDATE => match read_u16(&mut p) {
+                Ok(update_number) => b.update_number = update_number,
+                Err(e) => {
+                    tracing::warn!(payload_len, "HEADER_CELL_UPDATE too short, ignoring: {e}");
+                }
+            },
             HEADER_CELL_NATIVESCALE => {
                 b.native_scale = read_u32(&mut p).map_err(|_| OesuError::RecordTooShort {
                     record: "HEADER_CELL_NATIVESCALE",
@@ -2851,6 +2873,112 @@ mod tests {
                 }
             ),
             "{err:?}"
+        );
+    }
+
+    /// Run `f` under a thread-local subscriber; return its result and the
+    /// formatted (ANSI-free) log lines it emitted.
+    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+        #[derive(Clone, Default)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let bytes = capture.0.lock().unwrap().clone();
+        (out, String::from_utf8(bytes).unwrap())
+    }
+
+    /// Edition/update-number records too short for their u16 are not worth
+    /// dropping the whole cell over (nothing consumes either number): the
+    /// cell still loads, with a warning naming the record.
+    #[test]
+    fn parse_file_short_edition_payloads_warn_and_keep_the_cell() {
+        for (rec_type, name) in [
+            (HEADER_CELL_EDITION, "HEADER_CELL_EDITION"),
+            (HEADER_CELL_UPDATE, "HEADER_CELL_UPDATE"),
+        ] {
+            let data = senc_stream(vec![
+                (HEADER_CELL_NATIVESCALE, Bytes::default().u32(22_000)),
+                cell_extent(54.0, 10.0, 55.0, 11.0),
+                (rec_type, Bytes::default().u8(1)),
+            ]);
+            let (cell, logs) = capture_logs(|| parse_file("test.oesu".to_owned(), &data));
+            let cell = cell.unwrap_or_else(|e| panic!("{name}: cell dropped: {e:#}"));
+            assert_eq!(cell.native_scale, 22_000);
+            assert!(
+                logs.contains("WARN") && logs.contains(name) && logs.contains("payload_len=1"),
+                "got: {logs}"
+            );
+        }
+    }
+
+    /// Parse a minimal cell carrying the given optional PUBLISHDATE /
+    /// UPDATEDATE cstrings; return its edition date and the captured log.
+    fn edition_date_of(publish: Option<&str>, update: Option<&str>) -> (s57::EditionDate, String) {
+        let mut records = vec![
+            (HEADER_CELL_NATIVESCALE, Bytes::default().u32(22_000)),
+            cell_extent(54.0, 10.0, 55.0, 11.0),
+        ];
+        for (rec_type, date) in [
+            (HEADER_CELL_PUBLISHDATE, publish),
+            (HEADER_CELL_UPDATEDATE, update),
+        ] {
+            if let Some(date) = date {
+                let cstring = [date.as_bytes(), b"\0"].concat();
+                records.push((rec_type, Bytes::default().raw(&cstring)));
+            }
+        }
+        let data = senc_stream(records);
+        let (cell, logs) = capture_logs(|| parse_file("test.oesu".to_owned(), &data));
+        (cell.unwrap().edition_date, logs)
+    }
+
+    #[test]
+    fn edition_date_prefers_update_date_over_publish_date() {
+        let (date, logs) = edition_date_of(Some("20200101"), Some("20211209"));
+        assert_eq!(date, s57::EditionDate::new(2021, 12, 9));
+        assert!(!logs.contains("edition date"), "got: {logs}");
+    }
+
+    #[test]
+    fn edition_date_falls_back_to_publish_date_without_update_date() {
+        let (date, logs) = edition_date_of(Some("20200101"), None);
+        assert_eq!(date, s57::EditionDate::new(2020, 1, 1));
+        assert!(!logs.contains("edition date"), "got: {logs}");
+    }
+
+    #[test]
+    fn absent_edition_date_is_unknown_without_warning() {
+        let (date, logs) = edition_date_of(None, None);
+        assert_eq!(date, s57::EditionDate::unknown());
+        assert!(!logs.contains("edition date"), "got: {logs}");
+    }
+
+    /// A present-but-malformed date still loads the cell, ranked oldest —
+    /// but loudly, naming the cell source and the raw value.
+    #[test]
+    fn malformed_update_date_ranks_oldest_and_warns() {
+        let (date, logs) = edition_date_of(Some("20200101"), Some("2021-12-9"));
+        assert_eq!(date, s57::EditionDate::unknown());
+        assert!(
+            logs.contains("WARN")
+                && logs.contains("unparseable edition date")
+                && logs.contains("cell=test.oesu")
+                && logs.contains("raw=2021-12-9"),
+            "got: {logs}"
         );
     }
 
