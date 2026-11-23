@@ -1,6 +1,7 @@
 //! Axis-aligned bounding box.
 
 use geo::{BoundingRect, MultiPolygon, Polygon};
+use martin_tile_utils::wgs84_to_webmercator;
 
 /// An axis-aligned bounding box in WGS84 or projected coordinates.
 ///
@@ -55,6 +56,20 @@ impl Bbox {
             && self.east >= other.west
             && self.south <= other.north
             && self.north >= other.south
+    }
+
+    /// Project a WGS84 box (degrees) to Web Mercator metres.
+    #[inline]
+    #[must_use]
+    pub(crate) fn to_web_mercator(self) -> Self {
+        let (west, south) = wgs84_to_webmercator(self.west, self.south);
+        let (east, north) = wgs84_to_webmercator(self.east, self.north);
+        Self {
+            west,
+            south,
+            east,
+            north,
+        }
     }
 }
 
