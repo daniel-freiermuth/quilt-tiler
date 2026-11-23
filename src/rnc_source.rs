@@ -310,14 +310,7 @@ mod tests {
         let data = build_rnc(1, 1, bbox, &[[200, 30, 30, 255]], 3_000_000.0);
         let cell = RncCell::parse("TEST".to_owned(), data).expect("valid .rnc parses");
 
-        let (w_m, s_m) = martin_tile_utils::wgs84_to_webmercator(bbox.west, bbox.south);
-        let (e_m, n_m) = martin_tile_utils::wgs84_to_webmercator(bbox.east, bbox.north);
-        let merc = Bbox {
-            west: w_m,
-            south: s_m,
-            east: e_m,
-            north: n_m,
-        };
+        let merc = bbox.to_web_mercator();
 
         // Contribution is only the western half of the cell.
         let contrib = Bbox {
@@ -366,14 +359,7 @@ mod tests {
         let data = build_rnc(cols, rows, bbox, &colors, 3_000_000.0);
         let cell = RncCell::parse("TEST".to_owned(), data).expect("valid .rnc parses");
 
-        let (w_m, s_m) = martin_tile_utils::wgs84_to_webmercator(bbox.west, bbox.south);
-        let (e_m, n_m) = martin_tile_utils::wgs84_to_webmercator(bbox.east, bbox.north);
-        let merc = Bbox {
-            west: w_m,
-            south: s_m,
-            east: e_m,
-            north: n_m,
-        };
+        let merc = bbox.to_web_mercator();
         let out = TileSource::render(&cell, &make_tile(merc, bbox, 3_000_000));
 
         // Expected layout is stated geographically, independent of
@@ -484,14 +470,7 @@ mod tests {
         data.extend_from_slice(serde_json::to_string(&footer).unwrap().as_bytes());
         let cell = RncCell::parse("TEST".to_owned(), data).expect("valid .rnc parses");
 
-        let (w_m, s_m) = martin_tile_utils::wgs84_to_webmercator(bbox.west, bbox.south);
-        let (e_m, n_m) = martin_tile_utils::wgs84_to_webmercator(bbox.east, bbox.north);
-        let merc = Bbox {
-            west: w_m,
-            south: s_m,
-            east: e_m,
-            north: n_m,
-        };
+        let merc = bbox.to_web_mercator();
         let tile = TileGeom {
             geom: cell.coverage(),
             merc,

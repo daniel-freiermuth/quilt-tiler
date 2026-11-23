@@ -1273,16 +1273,15 @@ mod tests {
     fn test_tile_geom(center: Point, margin_deg: f64) -> TileGeom {
         let (west, south) = (center.x() - margin_deg, center.y() - margin_deg);
         let (east, north) = (center.x() + margin_deg, center.y() + margin_deg);
-        let (west_m, south_m) = wgs84_to_webmercator(west, south);
-        let (east_m, north_m) = wgs84_to_webmercator(east, north);
+        let wgs84 = Bbox {
+            west,
+            south,
+            east,
+            north,
+        };
         TileGeom {
             geom: rect(west, south, east, north),
-            merc: Bbox {
-                west: west_m,
-                south: south_m,
-                east: east_m,
-                north: north_m,
-            },
+            merc: wgs84.to_web_mercator(),
             scale: 0,
         }
     }

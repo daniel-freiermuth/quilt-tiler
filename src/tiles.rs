@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result};
 use geo::{Area, BooleanOps, MultiPolygon};
 use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
-use martin_tile_utils::{bbox_to_xyz, wgs84_to_webmercator, xyz_to_bbox};
+use martin_tile_utils::{bbox_to_xyz, xyz_to_bbox};
 use pmtiles::{PmTilesWriter, TileCoord, TileId};
 use rayon::prelude::*;
 use tracing::{info, warn};
@@ -445,7 +445,7 @@ impl<S: TileSource> Quilt<S> {
             return Ok(TileOutcome::Omitted);
         }
 
-        let tile_merc = tile_mercator_bbox(tile_wgs84);
+        let tile_merc = tile_wgs84.to_web_mercator();
         let tile_scale = scale_from_zoom(z, self.zoom_offset);
         let mut acc = S::Accumulator::empty();
         {
@@ -479,18 +479,6 @@ fn bar_style() -> ProgressStyle {
     .progress_chars("=>-")
 }
 
-/// Convert a WGS84 bbox to Web Mercator metres.
-fn tile_mercator_bbox(wgs84: Bbox) -> Bbox {
-    let (w_m, s_m) = wgs84_to_webmercator(wgs84.west, wgs84.south);
-    let (e_m, n_m) = wgs84_to_webmercator(wgs84.east, wgs84.north);
-    Bbox {
-        west: w_m,
-        south: s_m,
-        east: e_m,
-        north: n_m,
-    }
-}
-
 /// Archive metadata. `sparse: true` follows tileserver-gl, which then
 /// answers a missing tile with 404 (fall back to an ancestor) instead of 204
 /// (draw nothing); omitted when false so a raster archive keeps
@@ -510,6 +498,7 @@ fn build_metadata(sparse: bool) -> String {
 #[cfg(test)]
 mod tests {
     use image::Rgba;
+    use martin_tile_utils::wgs84_to_webmercator;
 
     use super::*;
     use crate::rnc::RncCell;
@@ -633,7 +622,7 @@ mod tests {
 
         // Sample the bbox's own centroid, projected into this tile's pixel
         // space — robust regardless of where the bbox sits within the tile.
-        let tile_merc = tile_mercator_bbox(Bbox::from(xyz_to_bbox(z, col, row, col, row)));
+        let tile_merc = Bbox::from(xyz_to_bbox(z, col, row, col, row)).to_web_mercator();
         let (centroid_x, centroid_y) = wgs84_to_webmercator(
             f64::midpoint(bbox.west, bbox.east),
             f64::midpoint(bbox.south, bbox.north),
@@ -734,7 +723,7 @@ mod tests {
         let img = image::load_from_memory_with_format(png, image::ImageFormat::Png)
             .expect("tile decodes")
             .to_rgba8();
-        let merc = tile_mercator_bbox(Bbox::from(xyz_to_bbox(z, col, row, col, row)));
+        let merc = Bbox::from(xyz_to_bbox(z, col, row, col, row)).to_web_mercator();
         let (x, y) = wgs84_to_webmercator(lon, lat);
         let px = f64::from(crate::rnc_source::TILE_PX);
         let ix = ((x - merc.west) / (merc.east - merc.west) * px) as u32;
