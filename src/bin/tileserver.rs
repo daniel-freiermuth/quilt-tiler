@@ -16,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use axum::Router;
 use axum::extract::{Path as TilePath, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use bytes::Bytes;
@@ -44,7 +44,8 @@ struct Args {
 
     /// Public base URL (`scheme://host[:port]`, no trailing slash) embedded
     /// in `/style.json`'s tile source. Defaults to deriving
-    /// `http://<request's Host header>` per request, which works for
+    /// `http://<request's host>` per request (HTTP/1 `Host` header or
+    /// HTTP/2 `:authority`), which works for
     /// local/LAN access with zero configuration but not behind an
     /// HTTPS-terminating reverse proxy.
     #[arg(long)]
@@ -298,22 +299,30 @@ impl AppState {
     }
 
     /// Base URL for tile templates: the configured `--public-url`, or
-    /// `http://<Host header>` derived from the live request.
-    fn base_url(&self, headers: &HeaderMap) -> String {
+    /// `http://<host>` derived from the live request. The host is the
+    /// request target's authority when present — HTTP/2's `:authority`
+    /// (which hyper does not copy into a `Host` header) or an HTTP/1
+    /// absolute-form target — else the HTTP/1 `Host` header.
+    fn base_url(&self, uri: &Uri, headers: &HeaderMap) -> String {
         self.public_url.clone().unwrap_or_else(|| {
-            let host = headers
-                .get(header::HOST)
-                .and_then(|v| v.to_str().ok())
+            let host = uri
+                .authority()
+                .map(axum::http::uri::Authority::as_str)
+                .or_else(|| headers.get(header::HOST).and_then(|v| v.to_str().ok()))
                 .unwrap_or("localhost:3000");
             format!("http://{host}")
         })
     }
 }
 
-async fn style_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+async fn style_handler(
+    State(state): State<Arc<AppState>>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
     let tile_url = format!(
         "{}/tiles/{}/{{z}}/{{x}}/{{y}}",
-        state.base_url(&headers),
+        state.base_url(&uri, &headers),
         state.build_id
     );
     let body = match state.style_json(&tile_url) {
@@ -658,7 +667,7 @@ mod tests {
     async fn style_handler_round_trip_supports_conditional_get() {
         let state = empty_test_state();
 
-        let first = style_handler(State(state.clone()), HeaderMap::new()).await;
+        let first = style_handler(State(state.clone()), Uri::default(), HeaderMap::new()).await;
         assert_eq!(first.status(), StatusCode::OK);
         assert_eq!(
             first.headers().get(header::CACHE_CONTROL).unwrap(),
@@ -672,7 +681,7 @@ mod tests {
 
         let mut conditional = HeaderMap::new();
         conditional.insert(header::IF_NONE_MATCH, etag.clone());
-        let second = style_handler(State(state), conditional).await;
+        let second = style_handler(State(state), Uri::default(), conditional).await;
         assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
         assert_eq!(second.headers().get(header::ETAG), Some(&etag));
     }
@@ -683,7 +692,7 @@ mod tests {
         // through it, so a redeploy (new build_id) hands out fresh URLs
         // instead of reusing one a client may have cached as `immutable`.
         let state = empty_test_state();
-        let resp = style_handler(State(state.clone()), HeaderMap::new()).await;
+        let resp = style_handler(State(state.clone()), Uri::default(), HeaderMap::new()).await;
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .expect("style.json body must be readable");
@@ -692,6 +701,30 @@ mod tests {
             body.contains(&format!("/tiles/{}/", state.build_id)),
             "tile URL template must route through the per-process build_id segment, got: {body}"
         );
+    }
+
+    #[test]
+    fn base_url_takes_the_host_from_the_request_authority_or_host_header() {
+        // No `--public-url`: the base URL must come from the request.
+        let state = AppState {
+            public_url: None,
+            ..Arc::into_inner(empty_test_state()).expect("sole owner of fresh test state")
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("h1.example:8080"));
+        // HTTP/1 origin-form target: only the `Host` header names the host.
+        assert_eq!(
+            state.base_url(&Uri::from_static("/style.json"), &headers),
+            "http://h1.example:8080"
+        );
+        // HTTP/2: hyper puts `:authority` in the URI and adds no `Host`.
+        let h2 = Uri::from_static("http://h2.example:9000/style.json");
+        assert_eq!(
+            state.base_url(&h2, &HeaderMap::new()),
+            "http://h2.example:9000"
+        );
+        // The target's authority wins over `Host` (RFC 9112 §3.2.2).
+        assert_eq!(state.base_url(&h2, &headers), "http://h2.example:9000");
     }
 
     /// The tileserver's Content-Type must match the MIME the `MapLibre`
