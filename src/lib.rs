@@ -12,6 +12,8 @@ pub mod rnc;
 pub mod rnc_source;
 pub mod s57_source;
 pub mod style;
+#[cfg(test)]
+mod test_log;
 pub mod tile_geom;
 pub mod tile_source;
 pub mod tiles;
