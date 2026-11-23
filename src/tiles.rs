@@ -911,28 +911,7 @@ mod tests {
 
     /// Log lines `warn_unreachable_ancestors` emits for `zoom_ceil`.
     fn unreachable_warnings(quilt: &Quilt<RncCell>, zoom_ceil: u8) -> String {
-        #[derive(Clone, Default)]
-        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Capture {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().expect("capture lock").extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let capture = Capture::default();
-        let writer = capture.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .finish();
-        tracing::subscriber::with_default(subscriber, || {
-            quilt.warn_unreachable_ancestors(zoom_ceil);
-        });
-        let bytes = capture.0.lock().expect("capture lock").clone();
-        String::from_utf8(bytes).expect("log is UTF-8")
+        crate::test_log::capture_logs(|| quilt.warn_unreachable_ancestors(zoom_ceil)).1
     }
 
     #[test]
