@@ -272,3 +272,103 @@ fn sparse_raster_server_answers_data_omitted_and_empty_tiles() {
     let resp = server.get(&tile_path(&prefix, 10, tile_containing(50.0, 0.0, 10)));
     assert_eq!(resp.status, 204, "tile far away from every chart");
 }
+
+/// `GET /style.json` over cleartext HTTP/2 with prior knowledge (h2c), the
+/// way an h2c reverse proxy talks to its upstream. HTTP/2 carries the host
+/// in the `:authority` pseudo-header, not a `Host` header. Hand-rolled
+/// frames, uncompressed HPACK literals: just enough HTTP/2 to read one
+/// response body.
+fn h2c_get_body(addr: SocketAddr, path: &str) -> Vec<u8> {
+    const DATA: u8 = 0x0;
+    const HEADERS: u8 = 0x1;
+    const RST_STREAM: u8 = 0x3;
+    const SETTINGS: u8 = 0x4;
+    const GOAWAY: u8 = 0x7;
+    const END_STREAM: u8 = 0x1;
+    const END_HEADERS: u8 = 0x4;
+    const ACK: u8 = 0x1;
+
+    fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+        let len = u32::try_from(payload.len()).unwrap().to_be_bytes();
+        let mut out = vec![len[1], len[2], len[3], kind, flags];
+        out.extend_from_slice(&stream.to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+    /// HPACK "literal header field without indexing", indexed name.
+    fn literal(name_index: u8, value: &str) -> Vec<u8> {
+        let len = u8::try_from(value.len()).unwrap();
+        assert!(len < 0x7f, "single-byte HPACK length only");
+        let mut out = vec![name_index, len];
+        out.extend_from_slice(value.as_bytes());
+        out
+    }
+
+    let authority = addr.to_string();
+    // Static table: 2 = `:method: GET`, 6 = `:scheme: http`,
+    // name 4 = `:path`, name 1 = `:authority`.
+    let mut block = vec![0x82, 0x86];
+    block.extend(literal(0x04, path));
+    block.extend(literal(0x01, &authority));
+
+    let mut stream = TcpStream::connect(addr).expect("connecting to tileserver");
+    stream
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .expect("read timeout");
+    let mut request = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    request.extend(frame(SETTINGS, 0, 0, &[]));
+    request.extend(frame(HEADERS, END_STREAM | END_HEADERS, 1, &block));
+    stream.write_all(&request).expect("sending h2c request");
+
+    let mut body = Vec::new();
+    loop {
+        let mut head = [0u8; 9];
+        stream.read_exact(&mut head).expect("reading frame header");
+        let len = usize::from(head[0]) << 16 | usize::from(head[1]) << 8 | usize::from(head[2]);
+        let (kind, flags) = (head[3], head[4]);
+        let id = u32::from_be_bytes([head[5], head[6], head[7], head[8]]) & 0x7fff_ffff;
+        let mut payload = vec![0u8; len];
+        stream
+            .read_exact(&mut payload)
+            .expect("reading frame payload");
+        match kind {
+            SETTINGS if flags & ACK == 0 => stream
+                .write_all(&frame(SETTINGS, ACK, 0, &[]))
+                .expect("acking settings"),
+            RST_STREAM | GOAWAY => panic!("server aborted h2c request: frame type {kind}"),
+            DATA | HEADERS if id == 1 => {
+                if kind == DATA {
+                    body.extend_from_slice(&payload);
+                }
+                if flags & END_STREAM != 0 {
+                    return body;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn style_tile_url_uses_the_requested_authority_over_http2() {
+    let dir = Scratch::new("tileserver-h2c-style");
+    let [coarse, fine] = common::write_raster_fixtures(&dir);
+    let server = Server::spawn(&[
+        "--cache-mb".as_ref(),
+        "0".as_ref(),
+        coarse.as_os_str(),
+        fine.as_os_str(),
+    ]);
+
+    let body = h2c_get_body(server.addr, "/style.json");
+    let style: serde_json::Value = serde_json::from_slice(&body)
+        .unwrap_or_else(|e| panic!("style.json is JSON ({e}): {body:?}"));
+    let url = style["sources"]["raster"]["tiles"][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("no raster tile URL in style: {style}"));
+    let expected = format!("http://{}/tiles/", server.addr);
+    assert!(
+        url.starts_with(&expected),
+        "h2 style.json must point tiles at the requested authority {expected:?}, got {url:?}"
+    );
+}
