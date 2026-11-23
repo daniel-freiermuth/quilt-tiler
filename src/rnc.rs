@@ -86,7 +86,7 @@ impl RncCell {
             bail!("invalid footer scale {}: must be ≥ 1", footer.scale);
         }
         let native_scale = footer.scale.round().min(f64::from(u32::MAX)) as u32;
-        let edition_date = EditionDate::from_ddmmyyyy(&footer.edate);
+        let edition_date = edition_date_or_warn(&name, &footer.edate);
         let subtile_width = header.tile_bytes(&data, 0, 0).and_then(|bytes| {
             image::ImageReader::with_format(std::io::Cursor::new(bytes), image::ImageFormat::Png)
                 .into_dimensions()
@@ -174,6 +174,19 @@ impl RncCell {
         };
         Ok(img)
     }
+}
+
+/// Footer `edate` as a ranking key. Absent → [`EditionDate::unknown`]
+/// silently; present but unparseable → also `unknown`, with a warning, since
+/// the cell then silently loses every `TileSource::tiebreak`.
+fn edition_date_or_warn(cell: &str, raw: &str) -> EditionDate {
+    if raw.is_empty() {
+        return EditionDate::unknown();
+    }
+    EditionDate::parse_ddmmyyyy(raw).unwrap_or_else(|| {
+        tracing::warn!(cell, raw, "unparseable edition date; ranking as oldest");
+        EditionDate::unknown()
+    })
 }
 
 #[cfg(test)]
@@ -274,6 +287,57 @@ mod tests {
         assert!((b.east - 12.0).abs() < 1e-9);
         assert!((b.south - 57.0).abs() < 1e-9);
         assert!((b.north - 58.0).abs() < 1e-9);
+    }
+
+    /// `build_rnc` with its footer `edate` swapped for a same-length `edate`.
+    fn build_rnc_with_edate(edate: &str) -> Vec<u8> {
+        const DEFAULT: &[u8] = b"\"01/01/2026\"";
+        let mut data = build_rnc(1, 1, (11.0, 57.0, 12.0, 58.0), 3_000_000.0, &[]);
+        let replacement = format!("\"{edate}\"");
+        assert_eq!(replacement.len(), DEFAULT.len(), "same-length edate");
+        let at = data
+            .windows(DEFAULT.len())
+            .rposition(|w| w == DEFAULT)
+            .expect("footer edate present");
+        data[at..at + DEFAULT.len()].copy_from_slice(replacement.as_bytes());
+        data
+    }
+
+    #[test]
+    fn valid_edate_parses_without_warning() {
+        let (cell, logs) = crate::test_log::capture_logs(|| {
+            RncCell::parse("GOOD".to_owned(), build_rnc_with_edate("05/01/2026"))
+        });
+        let cell = cell.expect("valid .rnc parses");
+        assert_eq!(cell.edition_date(), EditionDate::new(2026, 1, 5));
+        assert_eq!(logs, "");
+    }
+
+    /// An ISO-formatted (wrong-format) `edate` still loads the cell, ranked
+    /// oldest — but loudly, naming the cell and the raw value.
+    #[test]
+    fn malformed_edate_ranks_oldest_and_warns() {
+        let (cell, logs) = crate::test_log::capture_logs(|| {
+            RncCell::parse("BAD".to_owned(), build_rnc_with_edate("2026-06-01"))
+        });
+        let cell = cell.expect("malformed edate is not fatal");
+        assert_eq!(cell.edition_date(), EditionDate::unknown());
+        assert!(
+            logs.contains("WARN")
+                && logs.contains("unparseable edition date")
+                && logs.contains("cell=\"BAD\"")
+                && logs.contains("raw=\"2026-06-01\""),
+            "got: {logs}"
+        );
+    }
+
+    #[test]
+    fn absent_edate_is_unknown_without_warning() {
+        assert_eq!(edition_date_or_warn("NONE", ""), EditionDate::unknown());
+        let ((), logs) = crate::test_log::capture_logs(|| {
+            edition_date_or_warn("NONE", "");
+        });
+        assert_eq!(logs, "");
     }
 
     #[test]
