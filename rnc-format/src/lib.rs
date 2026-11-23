@@ -84,6 +84,18 @@ pub enum RncError {
     /// A `cover` ring encloses no area.
     #[error("`cover` ring {ring} has zero area")]
     ZeroAreaCoverRing { ring: usize },
+    /// A `cover` vertex lies outside the footer's own Mercator bbox
+    /// `(xmin, ymin, xmax, ymax)`, beyond [`COVER_BBOX_TOLERANCE`].
+    #[error(
+        "`cover` ring {ring} vertex ({x}, {y}) lies outside the footer bbox \
+         {merc_bbox:?} (format Mercator metres)"
+    )]
+    CoverVertexOutsideBbox {
+        ring: usize,
+        x: f64,
+        y: f64,
+        merc_bbox: (f64, f64, f64, f64),
+    },
 }
 
 /// Result of `.rnc` parsing; the error defaults to [`RncError`].
@@ -410,7 +422,9 @@ impl RncFooter {
     ///
     /// # Errors
     /// Returns an error when any `cover` ring is unusable (odd length, fewer
-    /// than 3 points, or zero area) instead of silently substituting the bbox.
+    /// than 3 points, zero area, or a vertex outside [`Self::merc_bbox`]
+    /// beyond [`COVER_BBOX_TOLERANCE`]) instead of silently substituting the
+    /// bbox.
     pub fn coverage(&self) -> Result<MultiPolygon> {
         if self.cover.is_empty() {
             let (west, south, east, north) = self.wgs84_bbox();
@@ -425,13 +439,32 @@ impl RncFooter {
                 vec![],
             )]));
         }
-        cover_to_multipolygon(&self.cover)
+        cover_to_multipolygon(&self.cover, self.merc_bbox())
     }
 }
 
+/// Allowed `cover` overshoot past [`RncFooter::merc_bbox`], per axis, as a
+/// fraction of the footer extent's span.
+///
+/// Real footers store `cover` in whole metres with vertices on the bbox
+/// edges, so they overshoot it by rounding; anything beyond this is not
+/// this cell's cover.
+pub const COVER_BBOX_TOLERANCE: f64 = 0.01;
+
 /// Convert footer `cover` rings (flat format-native Mercator `x, y` pairs)
 /// into a `WGS-84` [`MultiPolygon`], failing on the first unusable ring.
-fn cover_to_multipolygon(rings: &[Vec<f64>]) -> Result<MultiPolygon> {
+///
+/// `merc_bbox` is the footer's own extent `(xmin, ymin, xmax, ymax)`; every
+/// vertex must lie within it, widened by [`COVER_BBOX_TOLERANCE`].
+fn cover_to_multipolygon(
+    rings: &[Vec<f64>],
+    merc_bbox: (f64, f64, f64, f64),
+) -> Result<MultiPolygon> {
+    let (xmin, ymin, xmax, ymax) = merc_bbox;
+    let x_slack = (xmax - xmin) * COVER_BBOX_TOLERANCE;
+    let y_slack = (ymax - ymin) * COVER_BBOX_TOLERANCE;
+    let x_range = (xmin - x_slack)..=(xmax + x_slack);
+    let y_range = (ymin - y_slack)..=(ymax + y_slack);
     let polygons = rings
         .iter()
         .enumerate()
@@ -441,6 +474,17 @@ fn cover_to_multipolygon(rings: &[Vec<f64>]) -> Result<MultiPolygon> {
                 return Err(RncError::InvalidCoverRing {
                     ring: i,
                     numbers: ring.len(),
+                });
+            }
+            if let Some(&[x, y]) = points
+                .iter()
+                .find(|&&[x, y]| !(x_range.contains(&x) && y_range.contains(&y)))
+            {
+                return Err(RncError::CoverVertexOutsideBbox {
+                    ring: i,
+                    x,
+                    y,
+                    merc_bbox,
                 });
             }
             let mut coords: Vec<Coord> = points
@@ -822,6 +866,63 @@ mod tests {
                 footer.coverage()
             );
         }
+    }
+
+    #[test]
+    fn coverage_rejects_cover_outside_footer_bbox() {
+        let (x0, y0) = wgs84_to_rnc_merc(11.0, 57.0);
+        for cover in [
+            // Finite but absurd Mercator metres.
+            vec![0.0, 0.0, 1e300, 0.0, 0.0, 1e300],
+            // Degrees stored where metres belong (wrong units).
+            vec![11.0, 57.0, 12.0, 57.0, 12.0, 58.0],
+            // Plausible metres, but one vertex 0.5° past each side in turn.
+            flat_ring(&[(11.0, 57.0), (12.5, 57.0), (12.0, 58.0)]),
+            flat_ring(&[(10.5, 57.0), (12.0, 57.0), (12.0, 58.0)]),
+            flat_ring(&[(11.0, 57.0), (12.0, 57.0), (12.0, 58.5)]),
+            flat_ring(&[(11.0, 56.5), (12.0, 57.0), (12.0, 58.0)]),
+            // One vertex far outside, the rest in the bbox.
+            vec![x0, y0, x0 + 1e7, y0, x0, y0 - 1e5],
+        ] {
+            let data = footer_json(
+                11.0,
+                57.0,
+                12.0,
+                58.0,
+                3_000_000.0,
+                &serde_json::json!(cover),
+            );
+            let footer = RncFooter::parse(&data).expect("well-shaped cover parses");
+            let err = footer
+                .coverage()
+                .expect_err(&format!("cover {cover:?} must be rejected"));
+            assert!(
+                matches!(err, RncError::CoverVertexOutsideBbox { ring: 0, .. }),
+                "unexpected: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn coverage_accepts_cover_rounded_to_whole_metres_on_bbox_edges() {
+        // Real footers store `cover` as whole metres, so vertices on the
+        // bbox edges land up to 0.5 m outside it.
+        let ring: Vec<f64> = flat_ring(&[(11.0, 57.0), (12.0, 57.0), (12.0, 58.0), (11.0, 58.0)])
+            .into_iter()
+            .map(f64::round)
+            .collect();
+        let data = footer_json(
+            11.0,
+            57.0,
+            12.0,
+            58.0,
+            3_000_000.0,
+            &serde_json::json!(ring),
+        );
+        let footer = RncFooter::parse(&data).expect("valid footer parses");
+        footer
+            .coverage()
+            .expect("cover on the bbox edges is accepted");
     }
 
     #[test]
