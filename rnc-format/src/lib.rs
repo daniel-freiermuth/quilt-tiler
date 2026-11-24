@@ -96,6 +96,15 @@ pub enum RncError {
         y: f64,
         merc_bbox: (f64, f64, f64, f64),
     },
+    /// The footer's `lat0`/`lat1`/`lon0`/`lon1` lie outside `WGS-84` world
+    /// bounds (`|lon| <= 180`, `|lat| < 90`) or are not finite.
+    #[error("footer bbox lon {lon0}..{lon1}, lat {lat0}..{lat1} is outside WGS-84 world bounds")]
+    FooterBboxOutOfRange {
+        lon0: f64,
+        lat0: f64,
+        lon1: f64,
+        lat1: f64,
+    },
 }
 
 /// Result of `.rnc` parsing; the error defaults to [`RncError`].
@@ -373,7 +382,8 @@ impl RncFooter {
     ///
     /// # Errors
     /// Returns an error when the footer marker is missing or the JSON after
-    /// it doesn't match [`RncFooter`]'s shape.
+    /// it doesn't match [`RncFooter`]'s shape, or when the bbox corners lie
+    /// outside `WGS-84` world bounds ([`RncError::FooterBboxOutOfRange`]).
     pub fn parse(data: &[u8]) -> Result<Self> {
         const MARKER: &[u8] = b"{\"cover\"";
         let footer = data
@@ -381,7 +391,22 @@ impl RncFooter {
             .rposition(|w| w == MARKER)
             .and_then(|pos| data.get(pos..))
             .ok_or(RncError::FooterMissing)?;
-        Ok(serde_json::from_slice(footer)?)
+        let footer: Self = serde_json::from_slice(footer)?;
+        let lon_ok = |lon: f64| (-180.0..=180.0).contains(&lon);
+        let lat_ok = |lat: f64| lat > -90.0 && lat < 90.0;
+        if !(lon_ok(footer.lon0)
+            && lon_ok(footer.lon1)
+            && lat_ok(footer.lat0)
+            && lat_ok(footer.lat1))
+        {
+            return Err(RncError::FooterBboxOutOfRange {
+                lon0: footer.lon0,
+                lat0: footer.lat0,
+                lon1: footer.lon1,
+                lat1: footer.lat1,
+            });
+        }
+        Ok(footer)
     }
 
     /// `WGS-84` bounding box, corners normalized so `west <= east` and
@@ -808,6 +833,40 @@ mod tests {
         assert!(
             (footer.coverage().expect("bbox fallback").unsigned_area() - bbox_area).abs() < 1e-9
         );
+    }
+
+    #[test]
+    fn footer_rejects_bbox_outside_world_bounds() {
+        for (lon0, lat0, lon1, lat1) in [
+            (11.0, 57.0, 1e300, 58.0),
+            (-181.0, 57.0, 12.0, 58.0),
+            (-180.000_001, 57.0, 12.0, 58.0),
+            (11.0, 57.0, 180.000_001, 58.0),
+            (11.0, 57.0, 12.0, 90.0),
+            (11.0, -90.0, 12.0, 58.0),
+            (11.0, -91.0, 12.0, 58.0),
+        ] {
+            let data = footer_json(lon0, lat0, lon1, lat1, 3_000_000.0, &serde_json::json!([]));
+            let err = RncFooter::parse(&data).unwrap_err();
+            assert!(
+                matches!(err, RncError::FooterBboxOutOfRange { .. }),
+                "bbox ({lon0}, {lat0}, {lon1}, {lat1}) must be rejected: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn footer_accepts_bbox_on_world_bounds() {
+        let data = footer_json(
+            -180.0,
+            -89.0,
+            180.0,
+            89.0,
+            3_000_000.0,
+            &serde_json::json!([]),
+        );
+        let footer = RncFooter::parse(&data).expect("bbox on lon edges parses");
+        assert_eq!(footer.wgs84_bbox(), (-180.0, -89.0, 180.0, 89.0));
     }
 
     #[test]
