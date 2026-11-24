@@ -2,7 +2,12 @@
 name = "rnc-format"
 version = "0.1.0"
 edition = "2024"
-publish = false
+description = "Parser for `.rnc` raster cells: header, PNG tile table, JSON footer and the format's Mercator projection"
+license = "GPL-3.0-only"
+repository = "https://github.com/daniel-freiermuth/quilt-tiler"
+readme = "README.md"
+keywords = ["nautical", "charts", "raster", "mercator", "parser"]
+categories = ["parser-implementations", "science::geo"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
