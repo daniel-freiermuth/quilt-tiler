@@ -849,8 +849,7 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
                 b.name = read_cstring(&mut p, payload_len).unwrap_or_default();
             }
             HEADER_CELL_PUBLISHDATE => {
-                b.publish_date =
-                    read_cstring(&mut p, payload_len).context("reading HEADER_CELL_PUBLISHDATE")?;
+                b.publish_date = read_cstring(&mut p, payload_len)?;
             }
             // Edition/update numbers have no consumer (only the dates rank
             // cells), so a short record is not worth dropping the cell over.
@@ -861,8 +860,7 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
                 }
             },
             HEADER_CELL_UPDATEDATE => {
-                b.update_date =
-                    read_cstring(&mut p, payload_len).context("reading HEADER_CELL_UPDATEDATE")?;
+                b.update_date = read_cstring(&mut p, payload_len)?;
             }
             HEADER_CELL_UPDATE => match read_u16(&mut p) {
                 Ok(update_number) => b.update_number = update_number,
