@@ -448,6 +448,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "djson-format"
+version = "0.1.0"
+dependencies = [
+ "geo",
+ "rnc-format",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "earcut"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"

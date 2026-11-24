@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "oesu", "s57", "rnc-format"]
+members = [".", "oesu", "s57", "rnc-format", "djson-format"]
 
 [package]
 name = "quilt-tiler"
