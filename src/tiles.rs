@@ -1001,6 +1001,40 @@ mod tests {
         assert_eq!(outcome(8), TileOutcome::Omitted);
     }
 
+    /// Sparse omission keys on [`TileSource::detail_zoom`], not the native
+    /// zoom: a cell whose source pixels are finer than its 1:3M scale keeps
+    /// every tile up to its pixel zoom and omits only beyond it.
+    #[test]
+    fn sparse_quilt_keeps_tiles_up_to_a_pixel_detail_zoom_above_native() {
+        // 8 px across 0.001° → 2.88 M px around the world: z13 tiles
+        // (2.1 M px) still skip source pixels, z14 (4.19 M px) do not.
+        let bbox = Bbox {
+            west: 10.0,
+            south: 56.0,
+            east: 10.001,
+            north: 56.001,
+        };
+        let cell = RncCell::parse(
+            "DENSE".to_owned(),
+            build_rnc(bbox, [200, 30, 30, 255], 3_000_000.0, "01/01/2026"),
+        )
+        .expect("cell parses");
+        assert_eq!(zoom_from_scale(3_000_000, 0.0), 7, "fixture sanity");
+        assert_eq!(cell.detail_zoom(0.0), 14, "fixture sanity");
+        let quilt = Quilt::new(vec![cell], 0.0, true);
+        let outcome = |z| {
+            let (col, row, _, _) = bbox_to_xyz(10.0005, 56.0005, 10.0005, 56.0005, z);
+            quilt.render_tile(xyz(z, col, row)).expect("renders")
+        };
+        // Coarse tiles may render blank (the cell is sub-pixel there); what
+        // matters is that none is omitted below the pixel detail zoom.
+        for z in 8..=13 {
+            assert_ne!(outcome(z), TileOutcome::Omitted, "z{z} must be stored");
+        }
+        assert!(matches!(outcome(14), TileOutcome::Rendered(_)));
+        assert_eq!(outcome(15), TileOutcome::Omitted);
+    }
+
     /// `write_pmtiles` must hand tiles to the writer in ascending `TileId`
     /// order — that is what lets the archive be flagged `clustered`, which
     /// readers rely on — and the archive header must advertise the same zoom
