@@ -449,9 +449,9 @@ dependencies = [
 
 [[package]]
 name = "earcut"
-version = "0.4.5"
+version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88459a2a8e3a514b6e6de38cf3aaa9250a894cb098f74a932db77fcc8341b6d0"
+checksum = "beecb4bee051769371e9fd229b2168782e484bd50fc5f48e9ccce4172a0037d7"
 dependencies = [
  "num-traits",
 ]
@@ -498,13 +498,14 @@ dependencies = [
 
 [[package]]
 name = "fast-mvt"
-version = "0.7.3"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "852aa4708f6b1b09274ac76f91faa312ce7ff736ac458f41cb9ac1f5329c2933"
+checksum = "c22f09443fe017cce60faf6750511b6084eee628e21af9d028c1c389e59d9089"
 dependencies = [
  "buffa",
  "foldhash 0.2.0",
  "geo-types",
+ "hashbrown 0.17.1",
  "serde",
  "serde_json",
  "thiserror",
@@ -688,7 +689,6 @@ version = "0.33.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "30eb1fdc57c1e5cfd11826fe0caec4b9dc7901f3758263bb506228d88c8d9e9a"
 dependencies = [
- "earcut",
  "float_next_after",
  "geo-types",
  "geographiclib-rs",
@@ -833,18 +833,18 @@ checksum = "705f81e042b11734af35c701c7f6b65f8a968a430621fa2c95e72e27f9f8be5c"
 
 [[package]]
 name = "hotpath"
-version = "0.31.3"
+version = "0.32.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f41c413153d29c7665f7a1a21b1fed9816c9be794fc7e58f48d420ce3e60b403"
+checksum = "c512d9810e0836ad7aae1ecc363a727a20e7d56e1d497433150a354f6ddaccee"
 dependencies = [
  "hotpath-macros",
 ]
 
 [[package]]
 name = "hotpath-macros"
-version = "0.31.3"
+version = "0.32.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "183e2530804a17d4aeef73a9d613a6977ad220cc11a1cd9312b9b6e52852ead4"
+checksum = "b1afbcca1689d57e341a886622a751f0893add180871306b99e8061fbe4361be"
 
 [[package]]
 name = "http"
@@ -1170,14 +1170,15 @@ dependencies = [
 
 [[package]]
 name = "mlt-core"
-version = "0.22.2"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b88c217d3f4c3be17490693b242a8fb77d6cfe37929c07b5c4abcc2e4df9175a"
+checksum = "7bbbbe0a22eea799e91bbe97ff5513e92f4ac642c1d5a932b2570460f2ec3385"
 dependencies = [
  "bitvec",
  "bytemuck",
  "compact_str",
  "derive-debug",
+ "earcut",
  "enum_dispatch",
  "fast-mvt",
  "fastpfor",

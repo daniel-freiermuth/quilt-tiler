@@ -8,7 +8,7 @@ publish = false
 anyhow = "1"
 s57    = { path = "../s57" }
 tracing = "0.1"
-geo    = { version = "0.33.1", default-features = false, features = ["earcut", "spade"] }
+geo    = { version = "0.33.1", default-features = false, features = ["spade"] }
 
 [lints]
 workspace = true
