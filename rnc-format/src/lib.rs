@@ -1005,4 +1005,37 @@ mod tests {
         assert!((fx - 0.5).abs() < 1e-6);
         assert!((fy - 0.5).abs() < 1e-6);
     }
+
+    /// Rows are evenly spaced in this format's Mercator y, not in latitude.
+    #[test]
+    fn grid_rows_are_evenly_spaced_in_mercator_y() {
+        let (xmin, ymin) = wgs84_to_rnc_merc(10.0, 60.0);
+        let (xmax, ymax) = wgs84_to_rnc_merc(20.0, 50.0);
+        let merc_bbox = (xmin, ymin, xmax, ymax);
+        let (cols, rows) = (4, 10);
+        let y = |r: u32| (f64::from(r) / f64::from(rows)).mul_add(ymax - ymin, ymin);
+        for row in 0..rows {
+            for col in 0..cols {
+                let (west, south, east, north) =
+                    grid_cell_wgs84_bounds(merc_bbox, cols, rows, col, row);
+                let (_, want_north) = rnc_merc_to_wgs84(xmin, y(row));
+                let (_, want_south) = rnc_merc_to_wgs84(xmin, y(row + 1));
+                assert!(
+                    (north - want_north).abs() < 1e-9,
+                    "row {row} north: {north} vs {want_north}"
+                );
+                assert!(
+                    (south - want_south).abs() < 1e-9,
+                    "row {row} south: {south} vs {want_south}"
+                );
+                // Longitude is linear in x: 2.5° per column.
+                assert!((west - f64::from(col).mul_add(2.5, 10.0)).abs() < 1e-9);
+                assert!((east - f64::from(col + 1).mul_add(2.5, 10.0)).abs() < 1e-9);
+            }
+        }
+        // Over 50–60°N the two spacings differ: the mid-grid boundary sits
+        // north of 55°, so a latitude-linear grid would fail the loop above.
+        let (_, mid, _, _) = grid_cell_wgs84_bounds(merc_bbox, cols, rows, 0, rows / 2 - 1);
+        assert!(mid > 55.1, "mid boundary {mid}");
+    }
 }
