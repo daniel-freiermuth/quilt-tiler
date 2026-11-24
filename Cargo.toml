@@ -10,7 +10,7 @@ publish = false
 [dependencies]
 oesu            = { path = "oesu" }
 s57             = { path = "s57" }
-mlt-core        = "0.22"
+mlt-core        = "0.23"
 pmtiles         = { version = "0.23", default-features = false, features = ["write"] }
 martin-tile-utils = "0.7.4"
 anyhow          = "1"
@@ -22,7 +22,7 @@ indicatif       = { version = "0.18.4", features = ["rayon"] }
 serde_json      = "1"
 tracing         = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-geo = { version = "0.33.1", default-features = false, features = ["earcut", "spade"] }
+geo = { version = "0.33.1", default-features = false, features = ["spade"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 rnc-format      = { path = "rnc-format" }
 axum = { version = "0.8.9", features = ["http2"] }
