@@ -5,7 +5,8 @@
 //! ```text
 //! offset                size            content
 //! ------                ----            -------
-//! 0                     8 B             header (ignored)
+//! 0                     7 B             signature `RXTILES` (see [`detect`])
+//! 7                     1 B             format version (4 in all files seen)
 //! 8                     4 B             u32 LE: k = grid columns
 //! 12                    4 B             u32 LE: l = grid rows
 //! 16                    (k*l + 2) * 4   offset table: u32 LE byte offsets;
@@ -109,6 +110,16 @@ pub enum RncError {
 
 /// Result of `.rnc` parsing; the error defaults to [`RncError`].
 pub type Result<T, E = RncError> = std::result::Result<T, E>;
+
+/// The first bytes of every `.rnc` file.
+pub const SIGNATURE: &[u8] = b"RXTILES";
+
+/// `true` if `data` starts with the `.rnc` [`SIGNATURE`]. Cheap; parsing
+/// still validates the rest.
+#[must_use]
+pub fn detect(data: &[u8]) -> bool {
+    data.starts_with(SIGNATURE)
+}
 
 /// This format's internal Mercator sphere circumference, in metres.
 pub const MERC_SPHERE_BASE: f64 = 4.003_017_861_858_939_4e7;
@@ -648,10 +659,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn detect_recognises_the_signature() {
+        assert!(detect(&make_rnc_bytes(1, 1, &[24, 24, 24], 0)));
+        for other in [
+            &b""[..],
+            b"RXTILE",
+            b"{\"cover\":[]}",
+            b"\x00\x00\x00\x00\x00\x00\x00\x00",
+        ] {
+            assert!(!detect(other), "{other:?}");
+        }
+    }
+
     /// Build a minimal `.rnc` byte buffer for a `cols×rows` grid with the
     /// given offset table entries (must be `cols*rows + 2` values).
     fn make_rnc_bytes(cols: u32, rows: u32, offsets: &[u32], payload_len: usize) -> Vec<u8> {
-        let mut data = vec![0u8; 8]; // 8-byte ignored header
+        let mut data = SIGNATURE.to_vec();
+        data.push(4); // format version
         data.extend_from_slice(&cols.to_le_bytes());
         data.extend_from_slice(&rows.to_le_bytes());
         for &o in offsets {

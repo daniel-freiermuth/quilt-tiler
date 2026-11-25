@@ -561,7 +561,8 @@ mod tests {
             16 + 3 * 4 + png.len() as u32,
             16 + 3 * 4 + png.len() as u32,
         ];
-        let mut buf = vec![0u8; 8];
+        let mut buf = rnc_format::SIGNATURE.to_vec();
+        buf.push(4); // format version
         buf.extend_from_slice(&1u32.to_le_bytes()); // cols
         buf.extend_from_slice(&1u32.to_le_bytes()); // rows
         for o in offsets {
@@ -1273,8 +1274,11 @@ mod tests {
         std::fs::write(&bad, build_rnc(bbox, [255, 0, 0, 255], 0.0, "01/01/2026"))
             .expect("writing BAD.rnc");
 
-        let cells = crate::loader::load_rnc_cells(&[&good, &bad], 0.0);
+        let loaded = crate::loader::load_cells(&[&good, &bad], 0.0);
         std::fs::remove_dir_all(&dir).expect("removing temp dir");
+        let Ok(crate::loader::Cells::Raster(cells)) = loaded else {
+            panic!("expected raster cells");
+        };
 
         let names: Vec<&str> = cells.iter().map(RncCell::name).collect();
         assert_eq!(names, ["GOOD"], "scale-0 cell must be skipped");

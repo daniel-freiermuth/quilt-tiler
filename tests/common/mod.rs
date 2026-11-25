@@ -62,10 +62,11 @@ pub fn build_rnc(bbox: Box4, color: [u8; 4], scale: f64, name: &str) -> Vec<u8> 
     img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
         .expect("encoding test PNG");
 
-    // 8 bytes of header, cols, rows, then 1 tile + 2 trailing offsets.
+    // Signature + version byte, cols, rows, then 1 tile + 2 trailing offsets.
     let table_end: u32 = 16 + 3 * 4;
     let png_end = table_end + u32::try_from(png.len()).expect("tiny test PNG");
-    let mut buf = vec![0u8; 8];
+    let mut buf = rnc_format::SIGNATURE.to_vec();
+    buf.push(4); // format version
     buf.extend_from_slice(&1u32.to_le_bytes()); // cols
     buf.extend_from_slice(&1u32.to_le_bytes()); // rows
     for offset in [table_end, png_end, png_end] {

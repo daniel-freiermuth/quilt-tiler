@@ -168,17 +168,14 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    // Plain argument checks run before any (slow) loading; the depths only
+    // style vector output, but a bad pair is a bad command line either way.
+    style::validate_depths(args.safety_depth, args.shoal_depth)?;
     // PMTiles stores one tile type per archive, so a run's inputs must be
-    // uniformly vector or uniformly raster — dispatch on extension and
-    // fail fast on a mix rather than silently dropping one kind.
-    let raster_count = args.input.iter().filter(|p| loader::is_rnc(p)).count();
-    match raster_count {
-        0 => run_vector(&args),
-        n if n == args.input.len() => run_raster(&args),
-        n => anyhow::bail!(
-            "cannot mix raster (.rnc) and vector inputs in one run ({n} of {} inputs are .rnc); convert them separately",
-            args.input.len()
-        ),
+    // uniformly vector or uniformly raster; `load_cells` refuses a mix.
+    match loader::load_cells(&args.input, args.zoom_offset)? {
+        loader::Cells::Vector(cells) => run_vector(&args, cells),
+        loader::Cells::Raster(cells) => run_raster(&args, cells),
     }
 }
 
@@ -199,11 +196,8 @@ fn output_identity(args: &Args) -> (String, String, String) {
     (source_id, chart_name, tile_url)
 }
 
-/// Convert decrypted `OESU`/`OSENC` vector cells into an MVT `PMTiles` archive.
-fn run_vector(args: &Args) -> Result<()> {
-    // Fail before the (slow) tile conversion rather than after it.
-    style::validate_depths(args.safety_depth, args.shoal_depth)?;
-    let cells: Vec<s57::S57Cell> = loader::load_s57_cells(&args.input, args.zoom_offset);
+/// Convert vector cells into an MLT `PMTiles` archive.
+fn run_vector(args: &Args, cells: Vec<s57::S57Cell>) -> Result<()> {
     let quilt = tiles::Quilt::new(cells, args.zoom_offset, args.sparse);
 
     info!(parsed = quilt.items().len(), "charts parsed, writing tiles");
@@ -274,8 +268,7 @@ fn run_vector(args: &Args) -> Result<()> {
 }
 
 /// Convert raster `.rnc` cells into a PNG `PMTiles` archive.
-fn run_raster(args: &Args) -> Result<()> {
-    let cells: Vec<rnc::RncCell> = loader::load_rnc_cells(&args.input, args.zoom_offset);
+fn run_raster(args: &Args, cells: Vec<rnc::RncCell>) -> Result<()> {
     let quilt = tiles::Quilt::new(cells, args.zoom_offset, args.sparse);
 
     info!(
