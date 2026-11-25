@@ -21,6 +21,8 @@ use crate::zoom::zoom_from_scale;
 pub enum Format {
     /// Decrypted SENC vector cells (`.oesu`/`.osenc`).
     Senc,
+    /// `.djson` JSON vector cells.
+    Djson,
     /// `.rnc` raster cells.
     Rnc,
 }
@@ -31,6 +33,8 @@ impl Format {
     pub fn detect(data: &[u8]) -> Option<Self> {
         if rnc_format::detect(data) {
             Some(Self::Rnc)
+        } else if djson_format::detect(data) {
+            Some(Self::Djson)
         } else if oesu::detect(data) {
             Some(Self::Senc)
         } else {
@@ -95,6 +99,14 @@ fn load_cell(path: &Path, zoom_offset: f64) -> Option<Cell> {
             let source = path.to_str().unwrap_or_default().to_owned();
             let cell = oesu::parse_file(source, &data)
                 .inspect_err(|e| warn_skipped_s57(path, e))
+                .ok()?;
+            Some(Cell::Vector(parsed_s57(cell, zoom_offset)))
+        }
+        Some(Format::Djson) => {
+            let source = path.to_str().unwrap_or_default().to_owned();
+            let cell = djson_format::parse(source, &data)
+                .and_then(s57::S57Cell::try_from)
+                .inspect_err(|e| warn!(file = %path.display(), error = %e, "skipping"))
                 .ok()?;
             Some(Cell::Vector(parsed_s57(cell, zoom_offset)))
         }
@@ -258,21 +270,40 @@ mod tests {
         out
     }
 
+    /// Minimal `.djson` cell with a name, bounds, scale and one depth area.
+    fn minimal_djson(name: &str, scale: u32) -> Vec<u8> {
+        let m = |lon, lat| <[f64; 2]>::from(rnc_format::wgs84_to_rnc_merc(lon, lat));
+        let ([xmin, y_north], [xmax, y_south]) = (m(11.0, 58.0), m(12.0, 57.0));
+        let ring: Vec<f64> = [(11.0, 57.0), (12.0, 57.0), (12.0, 58.0), (11.0, 58.0)]
+            .into_iter()
+            .flat_map(|(lon, lat)| m(lon, lat))
+            .collect();
+        serde_json::to_vec(&serde_json::json!({
+            "__system__": { "mima": [xmin, y_north, xmax, y_south, scale, scale], "name": name },
+            "A_DEPARE": [{ "_XY": ring, "DRVAL1": 0, "DRVAL2": 5 }],
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn format_is_detected_from_content_not_name() {
         assert_eq!(
             Format::detect(&minimal_oesu("C", 50_000)),
             Some(Format::Senc)
         );
+        assert_eq!(
+            Format::detect(&minimal_djson("C", 50_000)),
+            Some(Format::Djson)
+        );
         assert_eq!(Format::detect(&minimal_rnc(50_000.0)), Some(Format::Rnc));
         assert_eq!(Format::detect(b"not a chart"), None);
 
         let dir = Scratch::new("load-names");
         let paths = [
-            dir.write("a.rnc", &minimal_oesu("A", 50_000)),
+            dir.write("a.rnc", &minimal_djson("A", 50_000)),
             dir.write("b.dat", &minimal_oesu("B", 50_000)),
             dir.write("notes.txt", b"not a chart"),
-            dir.missing("absent.oesu"),
+            dir.missing("absent.djson"),
         ];
         let names: Vec<_> = vector(load_cells(&paths, 0.0))
             .into_iter()
@@ -310,7 +341,7 @@ mod tests {
     fn load_cells_refuses_mixed_runs_and_runs_with_nothing_loaded() {
         let dir = Scratch::new("load-errors");
         let raster = dir.write("r", &minimal_rnc(50_000.0));
-        let vector = dir.write("v", &minimal_oesu("V", 50_000));
+        let vector = dir.write("v", &minimal_djson("V", 50_000));
         let mixed = load_error(&[raster, vector]);
         assert!(mixed.contains("cannot mix raster and vector"), "{mixed}");
         let none = load_error(&[
@@ -353,6 +384,22 @@ mod tests {
             .expect("the pipe is read once and loading finishes");
         assert_eq!(names, ["PIPED"]);
         writer.join().unwrap().expect("writing the pipe");
+    }
+
+    #[test]
+    fn load_cells_parses_djson_whatever_its_name() {
+        let dir = Scratch::new("djson");
+        let cells = vector(load_cells(
+            &[dir.write("cell.dat", &minimal_djson("JCELL", 25_000))],
+            0.0,
+        ));
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].name, "JCELL");
+        assert_eq!(cells[0].native_scale, 25_000);
+        assert_eq!(
+            s57::object_acronym(cells[0].features[0].type_code),
+            Some("DEPARE")
+        );
     }
 
     #[test]

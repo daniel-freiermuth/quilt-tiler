@@ -1,5 +1,5 @@
-//! Live tile server for decrypted `OESU`/`OSENC` vector charts or raster
-//! `.rnc` cells.
+//! Live tile server for decrypted `OESU`/`OSENC` or `.djson` vector charts,
+//! or raster `.rnc` cells.
 //!
 //! Parses all input cells once at startup, then serves `MapLibre` GL tiles
 //! and a matching `style.json` on demand — same quilting/coverage logic as
@@ -26,13 +26,13 @@ use quilt_tiler::{loader, rnc, style, tiles};
 use tower_http::cors::CorsLayer;
 use tracing::{error, info};
 
-/// Serve decrypted `OESU`/`OSENC` vector charts or raster `.rnc` cells as
+/// Serve decrypted `OESU`/`OSENC` or `.djson` vector charts, or raster `.rnc` cells, as
 /// `MapLibre` GL tiles and a `style.json`, generated on the fly.
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
     /// Input chart files to serve (glob or explicit paths): decrypted
-    /// `.oesu`/`.osenc` vector cells, or raster `.rnc` cells.
+    /// `.oesu`/`.osenc` or `.djson` vector cells, or raster `.rnc` cells.
     /// All inputs in one run must be the same kind — pick one source type
     /// per server, same constraint as the batch `quilt-tiler` binary.
     #[arg(required = true)]

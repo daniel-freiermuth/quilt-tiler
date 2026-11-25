@@ -1,7 +1,7 @@
 //! Convert decrypted OESU chart files to a `PMTiles` vector tile archive,
 //! a `MapLibre` GL style JSON, and a Signal K chart metadata file.
 //!
-//! Parses all input `.oesu` files in parallel, then writes MVT tiles directly
+//! Parses all input vector cells in parallel, then writes MVT tiles directly
 //! into a `PMTiles` v3 archive alongside `<stem>.style.json` and
 //! `<stem>.metadata.json`.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
@@ -65,13 +65,13 @@ use clap::Parser;
 use rayon::ThreadPoolBuilder;
 use tracing::info;
 
-/// Convert decrypted `OESU`/`OSENC` vector charts or raster `.rnc`
-/// cells into a `PMTiles` tile archive and a `MapLibre` GL style.
+/// Convert decrypted `OESU`/`OSENC` or `.djson` vector charts, or raster
+/// `.rnc` cells, into a `PMTiles` tile archive and a `MapLibre` GL style.
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
     /// Input chart files to convert (glob or explicit paths): decrypted
-    /// `.oesu`/`.osenc` vector cells, or raster `.rnc` cells.
+    /// `.oesu`/`.osenc` or `.djson` vector cells, or raster `.rnc` cells.
     /// All inputs in one run must be the same kind — `PMTiles` stores one
     /// tile type (vector MVT or raster PNG) per archive.
     #[arg(required = true)]
