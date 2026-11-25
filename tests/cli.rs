@@ -182,3 +182,36 @@ fn vector_run_without_sparse_leaves_style_source_dense() {
         "dense style source: {source}"
     );
 }
+
+/// Minimal `.djson` cell over [`VECTOR_BOX`]: `__system__` bbox and scale,
+/// one `M_COVR` area and one depth area.
+fn minimal_djson() -> Vec<u8> {
+    let [west, south, east, north] = VECTOR_BOX;
+    let (xmin, y_north) = rnc_format::wgs84_to_rnc_merc(west, north);
+    let (xmax, y_south) = rnc_format::wgs84_to_rnc_merc(east, south);
+    let ring: Vec<f64> = [(west, south), (east, south), (east, north), (west, north)]
+        .iter()
+        .flat_map(|&(lon, lat)| <[f64; 2]>::from(rnc_format::wgs84_to_rnc_merc(lon, lat)))
+        .collect();
+    serde_json::to_vec(&serde_json::json!({
+        "__system__": { "mima": [xmin, y_north, xmax, y_south, 1_000_000, 1_000_000], "name": "TESTCELL" },
+        "A_M_COVR": [{ "_XY": ring, "CATCOV": 1 }],
+        "A_DEPARE": [{ "_XY": ring, "DRVAL1": 0, "DRVAL2": 5 }],
+    }))
+    .unwrap()
+}
+
+/// Inputs are recognised by content: a `.djson` cell named `.dat` still loads.
+#[test]
+fn djson_run_writes_vector_archive_whatever_the_file_name() {
+    let dir = Scratch::new("cli-djson");
+    let input = dir.write("cell.dat", &minimal_djson());
+    let out = dir.join("d.pmtiles");
+
+    // A cell that failed to load leaves nothing to tile, so the run itself fails.
+    run_quilt_tiler(&out, &[input], false);
+
+    let header = pmtiles_header(&out);
+    assert_eq!(header.tile_type, TileType::Mlt);
+    assert_bounds(&read_json(&dir.join("d.metadata.json")), VECTOR_BOX);
+}
