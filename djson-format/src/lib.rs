@@ -12,7 +12,8 @@
 //! - `_SD`: sounding depths, one per `_XY` pair (`P_SOUNDG` only).
 //!
 //! [`detect`] recognises a document by its content; [`parse`] turns it into
-//! [`Layer`]s of [`Record`]s with `WGS-84` geometry.
+//! [`Layer`]s of [`Record`]s with `WGS-84` geometry, and
+//! `s57::S57Cell::try_from` converts that into an [`s57::S57Cell`].
 //! Fetching and decompression are left to the caller.
 #![deny(clippy::indexing_slicing)]
 #![cfg_attr(
@@ -25,12 +26,14 @@
     )
 )]
 
+mod s57_cell;
+
 use std::ops::Range;
 
 use geo::{Coord, LineString, MultiLineString, MultiPolygon, Point, Polygon};
 use serde_json::{Map, Value};
 
-/// Why a `.djson` document could not be parsed.
+/// Why a `.djson` document could not be parsed or converted.
 #[derive(Debug, thiserror::Error)]
 pub enum DjsonError {
     /// The bytes are not valid JSON.
@@ -39,6 +42,12 @@ pub enum DjsonError {
     /// The JSON root is not an object of layers.
     #[error("djson root is not an object")]
     RootNotObject,
+    /// No usable `__system__.mima`, so the cell has no bounds or scale.
+    #[error("no usable `__system__.mima` (bounds and scale)")]
+    MissingSystem,
+    /// The `__system__.mima` scale is not a `1:N` denominator (`N ≥ 1`).
+    #[error("invalid scale {0}: must be ≥ 1")]
+    InvalidScale(f64),
 }
 
 /// `true` if `data` looks like a `.djson` document: a JSON object, i.e. its

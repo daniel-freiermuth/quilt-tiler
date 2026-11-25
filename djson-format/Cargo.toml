@@ -7,8 +7,10 @@ publish = false
 [dependencies]
 geo = { version = "0.33", default-features = false }
 rnc-format = { path = "../rnc-format" }
+s57 = { path = "../s57" }
 serde_json = "1"
 thiserror = "2.0.18"
+tracing = "0.1"
 
 [lints]
 workspace = true
