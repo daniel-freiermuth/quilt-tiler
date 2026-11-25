@@ -1195,6 +1195,206 @@ mod tests {
         );
     }
 
+    /// Closed axis-aligned rectangle ring in `(lon, lat)` degrees.
+    fn rect_ring(west: f64, south: f64, east: f64, north: f64) -> LineString {
+        LineString::from(vec![
+            [west, south],
+            [east, south],
+            [east, north],
+            [west, north],
+            [west, south],
+        ])
+    }
+
+    /// A `DEPARE` (code 42) area feature.
+    fn depare(area: Polygon) -> s57::Feature {
+        s57::Feature {
+            type_code: 42,
+            ..feat(s57::Geometry::Area(area), vec![])
+        }
+    }
+
+    /// The single `MultiPolygon` `push_features` emits for `area`, lifted to
+    /// `f64` so geo's predicates and measures apply.
+    fn push_area(area: Polygon, tile: &TileGeom) -> MultiPolygon {
+        let mut out = Vec::new();
+        push_features(&feat(s57::Geometry::Area(area), vec![]), tile, &mut out);
+        assert_eq!(out.len(), 1, "one feature per area");
+        let geo::Geometry::MultiPolygon(mp) = &out[0].0 else {
+            panic!("expected MultiPolygon geometry, got {:?}", out[0].0);
+        };
+        mp.map_coords(|c| coord! { x: f64::from(c.x), y: f64::from(c.y) })
+    }
+
+    /// Whether `ring` has a vertex within 1 px (truncation slack) of the
+    /// projection of `(lon, lat)`.
+    fn has_vertex_near(ring: &LineString, tile: &TileGeom, lon: f64, lat: f64) -> bool {
+        let want = to_px(coord! { x: lon, y: lat }, tile.merc);
+        ring.coords().any(|c| {
+            (c.x - f64::from(want.x)).abs() <= 1.0 && (c.y - f64::from(want.y)).abs() <= 1.0
+        })
+    }
+
+    #[test]
+    fn push_features_area_keeps_hole_inside_tile_as_interior_ring() {
+        use geo::{Contains, Winding};
+
+        let center = Point::new(10.0, 55.0);
+        let tile = test_tile_geom(center, 0.1);
+        let hole = (9.98, 54.98, 10.02, 55.02);
+        let area = Polygon::new(
+            rect_ring(9.8, 54.8, 10.2, 55.2),
+            vec![rect_ring(hole.0, hole.1, hole.2, hole.3)],
+        );
+
+        let mp = push_area(area, &tile);
+        assert_eq!(mp.0.len(), 1, "one clipped polygon");
+        let poly = &mp.0[0];
+        assert_eq!(poly.interiors().len(), 1, "the hole survives clipping");
+        let interior = &poly.interiors()[0];
+
+        // The hole's corners, projected with y flipped (north at y = 0).
+        for (lon, lat) in [
+            (hole.0, hole.1),
+            (hole.2, hole.1),
+            (hole.2, hole.3),
+            (hole.0, hole.3),
+        ] {
+            assert!(
+                has_vertex_near(interior, &tile, lon, lat),
+                "hole corner ({lon}, {lat}) missing from {interior:?}"
+            );
+        }
+        let south_west = to_px(coord! { x: hole.0, y: hole.1 }, tile.merc);
+        let north_west = to_px(coord! { x: hole.0, y: hole.3 }, tile.merc);
+        assert!(north_west.y < south_west.y, "pixel y grows southward");
+
+        let shell = Polygon::new(poly.exterior().clone(), vec![]);
+        for c in interior.coords() {
+            assert!(shell.contains(c), "hole vertex {c:?} outside exterior");
+        }
+
+        // MapLibre classifies rings by winding: a hole must turn the other way.
+        let outer = poly.exterior().winding_order();
+        let inner = interior.winding_order();
+        assert!(
+            outer.is_some() && inner.is_some(),
+            "rings are non-degenerate"
+        );
+        assert_ne!(outer, inner, "hole winds opposite to the exterior");
+    }
+
+    #[test]
+    fn push_features_area_hole_cut_by_tile_edge_becomes_exterior_notch() {
+        use geo::Contains;
+
+        let center = Point::new(10.0, 55.0);
+        let tile = test_tile_geom(center, 0.1);
+        // Hole straddles the tile's east edge (lon 10.1).
+        let area = Polygon::new(
+            rect_ring(9.8, 54.8, 10.2, 55.2),
+            vec![rect_ring(10.05, 54.98, 10.15, 55.02)],
+        );
+
+        let mp = push_area(area, &tile);
+        assert_eq!(mp.0.len(), 1, "one clipped polygon");
+        let poly = &mp.0[0];
+        assert!(
+            poly.interiors().is_empty(),
+            "no interior ring may remain for a hole the tile edge opens: {:?}",
+            poly.interiors()
+        );
+        assert_eq!(
+            distinct_corners(poly).len(),
+            8,
+            "tile rectangle plus a four-vertex notch: {:?}",
+            poly.exterior()
+        );
+        for (lon, lat) in [(10.05, 54.98), (10.05, 55.02)] {
+            assert!(
+                has_vertex_near(poly.exterior(), &tile, lon, lat),
+                "notch corner ({lon}, {lat}) missing from {:?}",
+                poly.exterior()
+            );
+        }
+
+        let px = |lon, lat| {
+            let c = to_px(coord! { x: lon, y: lat }, tile.merc);
+            coord! { x: f64::from(c.x), y: f64::from(c.y) }
+        };
+        assert!(
+            !mp.contains(&px(10.08, 55.0)),
+            "inside the hole is not covered"
+        );
+        assert!(mp.contains(&px(10.0, 55.0)), "outside the hole is covered");
+    }
+
+    #[test]
+    fn tile_entirely_inside_a_hole_gets_no_area_feature() {
+        let center = Point::new(10.0, 55.0);
+        let tile = test_tile_geom(center, 0.1);
+        let area = Polygon::new(
+            rect_ring(9.0, 54.0, 11.0, 56.0),
+            vec![rect_ring(9.8, 54.8, 10.2, 55.2)],
+        );
+
+        let f = depare(area);
+        assert!(!feat_intersects(&f, &tile.geom), "tile lies in the hole");
+        let mut out = Vec::new();
+        push_features(&f, &tile, &mut out);
+        assert_eq!(out, vec![], "clipping alone also yields nothing");
+        let layers = cell(vec![f]).render(&tile);
+        assert!(
+            !layers.contains_key("DEPARE"),
+            "no DEPARE entry for a tile inside the hole: {layers:?}"
+        );
+    }
+
+    #[test]
+    fn render_deep_area_with_hole_and_shallow_fill_do_not_overlap() {
+        use geo::{Area, BooleanOps};
+
+        let center = Point::new(10.0, 55.0);
+        let tile = test_tile_geom(center, 0.1);
+        let pocket = rect_ring(9.97, 54.97, 10.03, 55.03);
+        let deep = depare(Polygon::new(
+            rect_ring(9.8, 54.8, 10.2, 55.2),
+            vec![pocket.clone()],
+        ));
+        let shallow = depare(Polygon::new(pocket, vec![]));
+
+        let layers = cell(vec![deep, shallow]).render(&tile);
+        let depares = &layers["DEPARE"];
+        assert_eq!(depares.len(), 2, "deep and shallow both reach the tile");
+        let [deep_px, shallow_px] = [&depares[0].0, &depares[1].0].map(|g| {
+            let geo::Geometry::MultiPolygon(mp) = g else {
+                panic!("expected MultiPolygon geometry, got {g:?}");
+            };
+            mp.map_coords(|c| coord! { x: f64::from(c.x), y: f64::from(c.y) })
+        });
+
+        let overlap = deep_px.intersection(&shallow_px).unsigned_area();
+        assert!(
+            overlap < 1e-6,
+            "deep fill paints over the shoal pocket: {overlap} px²"
+        );
+        let shallow_area = shallow_px.unsigned_area();
+        assert!(shallow_area > 0.0, "shoal pocket is drawn");
+        let union_area = deep_px.union(&shallow_px).unsigned_area();
+        let tile_area = MultiPolygon::new(
+            deep_px
+                .0
+                .iter()
+                .map(|p| Polygon::new(p.exterior().clone(), vec![]))
+                .collect(),
+        )
+        .unsigned_area();
+        assert!(
+            (union_area - tile_area).abs() < 1e-6,
+            "deep + shallow tile the whole tile without gaps: {union_area} vs {tile_area}"
+        );
+    }
+
     #[test]
     fn blank_is_one_unstyled_mlt_layer() {
         let blank = S57Accumulator::blank().expect("blank encodes");
