@@ -794,6 +794,18 @@ fn is_valid_scale_factor(scale_factor: f64) -> bool {
 
 // ── Main entry point ─────────────────────────────────────────────────────────
 
+/// `true` if `data` is for this parser.
+///
+/// That is a SENC stream (it starts with the mandatory `SERVER_STATUS_RECORD`)
+/// or a BSB raster chart, which [`parse_file`] refuses with
+/// [`OesuError::UnsupportedRaster`]. Cheap; [`parse_file`] still validates the rest.
+#[must_use]
+pub fn detect(data: &[u8]) -> bool {
+    data.first_chunk::<2>()
+        .is_some_and(|&t| u16::from_le_bytes(t) == SERVER_STATUS_RECORD)
+        || is_bsb_raster(data)
+}
+
 /// Parse a decrypted SENC stream into an [`s57::S57Cell`].
 ///
 /// # Errors
@@ -2585,6 +2597,16 @@ mod tests {
             "{err:?}"
         );
         assert!(!err.is_refusal());
+    }
+
+    #[test]
+    fn detect_claims_senc_streams_and_bsb_rasters_only() {
+        assert!(detect(&prologue([1, 1, 1, 30, 0, 0], 201)));
+        // Refused by parse_file with a specific error, so still ours to report.
+        assert!(detect(b"!BSB/VER=3.0,CED/SE=1"));
+        for other in [&b""[..], b"\xc8", b"{\"A_DEPARE\":[]}", b"RXTILES\x04"] {
+            assert!(!detect(other), "{other:?}");
+        }
     }
 
     /// Each prologue length check sits exactly at its boundary and reports

@@ -443,16 +443,13 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    // Fail at startup rather than serving 500s from `/style.json`.
+    style::validate_depths(args.safety_depth, args.shoal_depth)?;
     // Same one-kind-per-run constraint as the batch CLI's PMTiles output —
     // here it's not a format limitation, just keeps one server's `/tiles`
     // route unambiguous (MVT vs PNG, one content type).
-    let raster_count = args.input.iter().filter(|p| loader::is_rnc(p)).count();
-    let sources = match raster_count {
-        0 => {
-            // Fail at startup rather than serving 500s from `/style.json`.
-            style::validate_depths(args.safety_depth, args.shoal_depth)?;
-            let cells = loader::load_s57_cells(&args.input, args.zoom_offset);
-            anyhow::ensure!(!cells.is_empty(), "no vector cells parsed from input");
+    let sources = match loader::load_cells(&args.input, args.zoom_offset)? {
+        loader::Cells::Vector(cells) => {
             let quilt = tiles::Quilt::new(cells, args.zoom_offset, args.sparse);
             let (min_zoom, max_zoom, _bounds) = quilt.zoom_range_and_bounds(args.max_zoom)?;
             quilt.warn_unreachable_ancestors(max_zoom);
@@ -469,9 +466,7 @@ async fn main() -> Result<()> {
                 max_zoom,
             }
         }
-        n if n == args.input.len() => {
-            let cells = loader::load_rnc_cells(&args.input, args.zoom_offset);
-            anyhow::ensure!(!cells.is_empty(), "no raster cells parsed from input");
+        loader::Cells::Raster(cells) => {
             let quilt = tiles::Quilt::new(cells, args.zoom_offset, args.sparse);
             let (min_zoom, max_zoom, _bounds) = quilt.zoom_range_and_bounds(args.max_zoom)?;
             quilt.warn_unreachable_ancestors(max_zoom);
@@ -488,10 +483,6 @@ async fn main() -> Result<()> {
                 max_zoom,
             }
         }
-        n => anyhow::bail!(
-            "cannot mix raster (.rnc) and vector inputs in one run ({n} of {} inputs are .rnc); serve them separately",
-            args.input.len()
-        ),
     };
 
     let cache = (args.cache_mb > 0).then(|| {
