@@ -453,8 +453,10 @@ version = "0.1.0"
 dependencies = [
  "geo",
  "rnc-format",
+ "s57",
  "serde_json",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]
