@@ -13,12 +13,14 @@
     )
 )]
 
+mod coverage;
 mod edition_date;
 
 // ── Feature data model ───────────────────────────────────────────────────────
 
 use std::collections::HashMap;
 
+pub use coverage::resolve_coverage;
 pub use edition_date::EditionDate;
 use geo_types::{LineString, MultiPolygon, Point, Polygon};
 

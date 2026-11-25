@@ -5,7 +5,13 @@ edition = "2024"
 publish = false
 
 [dependencies]
+geo = { version = "0.33", default-features = false }
 geo-types = "0.7.19"
+tracing = "0.1"
+
+[dev-dependencies]
+# Captures `tracing` output so tests can assert on data-quality warnings.
+tracing-subscriber = "0.3"
 
 [lints]
 workspace = true
