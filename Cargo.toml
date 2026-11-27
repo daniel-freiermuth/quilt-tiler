@@ -23,6 +23,9 @@ serde_json      = "1"
 tracing         = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 geo = { version = "0.33.1", default-features = false, features = ["spade"] }
+# geo's boolean ops pick their integer grid per call; `tile_grid` fixes it
+# to the tile. 9.x: 4.5 (geo's) panics on some real coverages.
+i_overlay = { version = "9.2.1", default-features = false }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 rnc-format      = { path = "rnc-format" }
 djson-format    = { path = "djson-format" }
