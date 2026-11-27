@@ -37,7 +37,7 @@ impl TileSource for RncCell {
     type Tiebreaker = EditionDate;
 
     fn source(&self) -> String {
-        self.name().to_owned()
+        Self::source(self).to_owned()
     }
 
     fn bbox(&self) -> Bbox {
@@ -147,7 +147,7 @@ impl TileSource for RncCell {
                         Err(e) => {
                             if decode_warned.insert(n) {
                                 tracing::warn!(
-                                    cell = self.name(),
+                                    cell = Self::source(self),
                                     n,
                                     error = %e,
                                     "failed to decode raster subtile; leaving transparent"

@@ -87,8 +87,10 @@ pub trait TileSource: Sync {
     /// (same floored `zoom_from_scale`) — the greater value wins the tie.
     type Tiebreaker: Ord;
 
-    /// Source identifier for this item (debug/diagnostic use by callers).
-    #[allow(dead_code)] // consumed by debug logging in a follow-up commit
+    /// Source identifier for this item, e.g. its file path. Unique per
+    /// distinct item: it orders items that tie on zoom fit and
+    /// [`Self::tiebreak`], so the input order never decides a tile. Cheap,
+    /// like [`Self::bbox`].
     fn source(&self) -> String;
 
     /// WGS84 bounds containing all of [`Self::coverage`]. Picks a tile's
