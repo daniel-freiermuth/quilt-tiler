@@ -14,7 +14,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
-use geo::{Area, BooleanOps, MultiPolygon};
+use geo::MultiPolygon;
 use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
 use martin_tile_utils::{bbox_to_xyz, xyz_to_bbox};
 use once_cell::sync::OnceCell;
@@ -24,6 +24,7 @@ use tracing::info;
 
 use crate::bbox::Bbox;
 use crate::tile_geom::TileGeom;
+use crate::tile_grid::TileGrid;
 use crate::tile_source::{TileAccumulator, TileSource};
 use crate::zoom::{scale_from_zoom, zoom_from_scale};
 
@@ -448,7 +449,9 @@ impl<S: TileSource> Quilt<S> {
     /// Greedy coverage over `candidates`, sorted by [`Self::zoom_fit`]:
     /// include an item only if its contribution adds area not yet covered.
     /// Real polygon algebra correctly handles disjoint coverage areas (e.g.
-    /// NE + SW ≠ full tile), unlike a bounding-box hull.
+    /// NE + SW ≠ full tile), unlike a bounding-box hull. All of it runs on
+    /// the tile's own grid (see [`TileGrid`]), so the tile counts as covered
+    /// exactly when it is, and every real contribution counts, however thin.
     ///
     /// A group of equally fitting candidates is ordered by tie-break key
     /// only when the loop reaches it, and only among the members whose bbox
@@ -460,7 +463,8 @@ impl<S: TileSource> Quilt<S> {
         z: u8,
         tile_wgs84: Bbox,
     ) -> Result<Vec<(usize, MultiPolygon)>> {
-        let mut uncovered = MultiPolygon::from(tile_wgs84);
+        let grid = TileGrid::new(tile_wgs84)?;
+        let mut uncovered = grid.whole();
         let mut contributions = Vec::new();
         for group in candidates.chunk_by(|&a, &b| self.zoom_fit(a, z) == self.zoom_fit(b, z)) {
             // From the catalog: a member whose bbox misses what's left of
@@ -475,13 +479,14 @@ impl<S: TileSource> Quilt<S> {
                 self.order_by_tiebreak(&mut members)?;
             }
             for i in members {
-                let contrib = self.items[i].coverage()?.intersection(&uncovered);
-                if contrib.unsigned_area() == 0.0 {
+                let coverage = grid.cut(&self.items[i].coverage()?);
+                let contrib = grid.intersection(&coverage, &uncovered);
+                if contrib.0.is_empty() {
                     continue;
                 }
-                uncovered = uncovered.difference(&contrib);
+                uncovered = grid.difference(&uncovered, &contrib);
                 contributions.push((i, contrib));
-                if uncovered.unsigned_area() == 0.0 {
+                if uncovered.0.is_empty() {
                     return Ok(contributions);
                 }
             }
@@ -1244,6 +1249,68 @@ mod tests {
         assert_eq!(asked, [(1, 0, 0, 1), (1, 0, 0, 1), (0, 0, 0, 0)]);
     }
 
+    /// A tile inside its best fit's coverage is covered by it alone: the
+    /// boolean ops' rounding leaves a remainder that must not send the
+    /// quilt on to load and render further candidates — also where that
+    /// remainder is largest, a fine tile under a large coverage (geo snaps
+    /// to a grid set by the coverage's extent, not the tile's).
+    #[test]
+    fn a_tile_inside_one_coverage_asks_no_other_candidate() {
+        for (z, lat, margin) in [(10, 56.5, 0.1), (18, 56.5, 3.0), (18, 70.5, 3.0)] {
+            let (tile, around) = probe_tile_at(z, 10.5, lat, margin);
+            let quilt = Quilt::new(
+                vec![
+                    Probe::new("FIT", around, z, 1),
+                    Probe::new("FINER", around, z + 2, 1),
+                ],
+                0.0,
+                false,
+            );
+            let case = format!("z{z} at {lat}°N, {margin}° margin");
+            assert_eq!(
+                rendered(quilt.render_tile(tile).expect("renders")),
+                "FIT",
+                "{case}"
+            );
+            assert_eq!(quilt.items()[1].asked.all(), (0, 0, 0, 0), "{case}");
+        }
+    }
+
+    /// Every real contribution counts, however thin: a cell covering a
+    /// strip along the tile's west edge contributes there, also when the
+    /// strip is half a unit of a 4096-unit vector tile wide — its points
+    /// still draw at icon size, and at finer zooms the strip widens.
+    #[test]
+    fn a_thin_strip_still_contributes() {
+        let (tile, around) = probe_tile();
+        let bounds = Bbox::from(xyz_to_bbox(
+            tile.z(),
+            tile.x(),
+            tile.y(),
+            tile.x(),
+            tile.y(),
+        ));
+        let unit = (bounds.east - bounds.west) / 4096.0;
+        let west_strip = |width_units: f64| Bbox {
+            west: bounds.west - unit,
+            south: bounds.south - unit,
+            east: width_units.mul_add(unit, bounds.west),
+            north: bounds.north + unit,
+        };
+        for width_units in [10.0, 0.5] {
+            let quilt = Quilt::new(
+                vec![
+                    Probe::new("NARROW", west_strip(width_units), 10, 1),
+                    Probe::new("WIDE", around, 12, 1),
+                ],
+                0.0,
+                false,
+            );
+            let names = rendered(quilt.render_tile(tile).expect("renders"));
+            assert_eq!(names, "NARROW,WIDE", "{width_units} units");
+        }
+    }
+
     /// A sparse quilt asks each item for its detail zoom once, however many
     /// tiles need it — even when they render at the same time.
     #[test]
@@ -1279,8 +1346,7 @@ mod tests {
             0.0,
             true,
         );
-        let outcome = quilt.render_tile(tile).expect("renders");
-        assert!(matches!(outcome, TileOutcome::Rendered(_)), "{outcome:?}");
+        assert_eq!(rendered(quilt.render_tile(tile).expect("renders")), "FIT");
         let detail_zooms: Vec<_> = quilt.items().iter().map(|i| i.asked.all().1).collect();
         assert_eq!(detail_zooms, [0, 0]);
     }
