@@ -495,14 +495,21 @@ impl<S: TileSource> Quilt<S> {
     }
 
     /// Order `members` (equally fitting candidates) newest edition first —
-    /// see [`TileSource::tiebreak`].
+    /// see [`TileSource::tiebreak`] — and equal editions by source, so that
+    /// the input order never decides which chart a tile shows.
     fn order_by_tiebreak(&self, members: &mut [usize]) -> Result<()> {
         let mut keyed = members
             .iter()
-            .map(|&i| Ok((Reverse(self.items[i].tiebreak()?), i)))
+            .map(|&i| {
+                Ok((
+                    Reverse(self.items[i].tiebreak()?),
+                    self.items[i].source(),
+                    i,
+                ))
+            })
             .collect::<Result<Vec<_>>>()?;
-        keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        for (slot, (_, i)) in members.iter_mut().zip(keyed) {
+        keyed.sort_unstable_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        for (slot, (_, _, i)) in members.iter_mut().zip(keyed) {
             *slot = i;
         }
         Ok(())
@@ -690,6 +697,33 @@ mod tests {
             [30, 200, 30, 255],
             "newer edition's color should win the fully-overlapping tile"
         );
+    }
+
+    /// Two raster cells tied in everything but their source draw the same
+    /// tile whichever comes first in the input.
+    #[test]
+    fn tied_raster_cells_draw_the_same_in_either_input_order() {
+        let bbox = Bbox {
+            west: 10.0,
+            south: 56.0,
+            east: 11.0,
+            north: 57.0,
+        };
+        let cell = |source: &str, color| {
+            RncCell::parse(
+                source.to_owned(),
+                build_rnc(bbox, color, 3_000_000.0, "01/01/2026"),
+            )
+            .expect("cell parses")
+        };
+        let z = zoom_from_scale(3_000_000, 0.0);
+        let (col, row, _, _) = bbox_to_xyz(bbox.west, bbox.south, bbox.east, bbox.north, z);
+        let render = |names: [(&str, [u8; 4]); 2]| {
+            let quilt = Quilt::new(names.map(|(s, c)| cell(s, c)).into(), 0.0, false);
+            quilt.render_tile(xyz(z, col, row)).expect("renders")
+        };
+        let (red, green) = (("a.rnc", [200, 30, 30, 255]), ("b.rnc", [30, 200, 30, 255]));
+        assert_eq!(render([red, green]), render([green, red]));
     }
 
     /// A sparse quilt must store every tile some contributor still adds
@@ -1249,6 +1283,25 @@ mod tests {
         assert_eq!(asked, [(1, 0, 0, 1), (1, 0, 0, 1), (0, 0, 0, 0)]);
     }
 
+    /// Items equal on zoom fit and tie-break key (e.g. two cells without an
+    /// edition date) are ordered by source, so the order the items were
+    /// given in never decides which one a tile shows first.
+    #[test]
+    fn full_ties_follow_the_source_not_the_input_order() {
+        let (tile, around) = probe_tile();
+        let first = |names: [&'static str; 2]| {
+            let quilt = Quilt::new(
+                names.map(|n| Probe::new(n, around, 10, 1)).into(),
+                0.0,
+                false,
+            );
+            let names = rendered(quilt.render_tile(tile).expect("renders"));
+            names.split(',').next().map(str::to_owned)
+        };
+        assert_eq!(first(["A", "B"]).as_deref(), Some("A"));
+        assert_eq!(first(["B", "A"]).as_deref(), Some("A"));
+    }
+
     /// A tile inside its best fit's coverage is covered by it alone: the
     /// boolean ops' rounding leaves a remainder that must not send the
     /// quilt on to load and render further candidates — also where that
@@ -1694,8 +1747,12 @@ mod tests {
             panic!("expected raster cells");
         };
 
-        let names: Vec<&str> = cells.iter().map(RncCell::name).collect();
-        assert_eq!(names, ["GOOD"], "scale-0 cell must be skipped");
+        let sources: Vec<&str> = cells.iter().map(RncCell::source).collect();
+        assert_eq!(
+            sources,
+            [good.to_string_lossy()],
+            "scale-0 cell must be skipped"
+        );
         let (_, zoom_ceil, _) = Quilt::new(cells, 0.0, false)
             .zoom_range_and_bounds(None)
             .expect("non-empty items");

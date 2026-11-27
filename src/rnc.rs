@@ -24,8 +24,9 @@ use crate::bbox::Bbox;
 /// PNG tiles, uniform in this format's own Mercator projection.
 #[derive(Debug)]
 pub struct RncCell {
-    /// Cell name (from the input filename) — used as [`crate::tile_source::TileSource::source`].
-    name: String,
+    /// Where the cell was read from (e.g. its file path) — identifies it in
+    /// logs and is its [`crate::tile_source::TileSource::source`].
+    source: String,
     /// Raw `.rnc` file bytes; PNG blobs are sliced out of this on demand.
     data: Vec<u8>,
     header: RncHeader,
@@ -53,7 +54,8 @@ pub struct RncCell {
 }
 
 impl RncCell {
-    /// Parse a `.rnc` file already read into memory.
+    /// Parse a `.rnc` file already read into memory from `source` (e.g. its
+    /// file path).
     ///
     /// # Errors
     /// Returns an error if the header or footer can't be parsed (truncated
@@ -61,7 +63,7 @@ impl RncCell {
     /// `scale` isn't a valid `1:N` denominator (`N ≥ 1`; also rejects NaN).
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     // native_scale's cast is range-checked and clamped immediately beforehand.
-    pub fn parse(name: String, data: Vec<u8>) -> Result<Self> {
+    pub fn parse(source: String, data: Vec<u8>) -> Result<Self> {
         let header = RncHeader::parse(&data).context("parsing .rnc header")?;
         let footer = RncFooter::parse(&data).context("parsing .rnc footer")?;
 
@@ -86,7 +88,7 @@ impl RncCell {
             bail!("invalid footer scale {}: must be ≥ 1", footer.scale);
         }
         let native_scale = footer.scale.round().min(f64::from(u32::MAX)) as u32;
-        let edition_date = edition_date_or_warn(&name, &footer.edate);
+        let edition_date = edition_date_or_warn(&source, &footer.edate);
         let subtile_width = header.tile_bytes(&data, 0, 0).and_then(|bytes| {
             image::ImageReader::with_format(std::io::Cursor::new(bytes), image::ImageFormat::Png)
                 .into_dimensions()
@@ -95,7 +97,7 @@ impl RncCell {
         });
 
         Ok(Self {
-            name,
+            source,
             data,
             header,
             bbox,
@@ -112,8 +114,8 @@ impl RncCell {
         self.edition_date
     }
 
-    pub fn name(&self) -> &str {
-        &self.name
+    pub fn source(&self) -> &str {
+        &self.source
     }
 
     pub const fn bbox(&self) -> Bbox {
@@ -165,7 +167,7 @@ impl RncCell {
             .tile_bytes(&self.data, col, row)
             .context("tile index out of bounds")?;
         let img = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
-            .with_context(|| format!("{}: decoding subtile {n}", self.name))?
+            .with_context(|| format!("{}: decoding subtile {n}", self.source))?
             .to_rgba8();
         let img = Arc::new(img);
         let img = {

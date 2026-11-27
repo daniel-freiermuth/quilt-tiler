@@ -96,14 +96,14 @@ fn load_cell(path: &Path, zoom_offset: f64) -> Option<Cell> {
     let data = read_cell_data(path)?;
     match Format::detect(&data) {
         Some(Format::Senc) => {
-            let source = path.to_str().unwrap_or_default().to_owned();
+            let source = path.to_string_lossy().into_owned();
             let cell = oesu::parse_file(source, &data)
                 .inspect_err(|e| warn_skipped_s57(path, e))
                 .ok()?;
             Some(Cell::Vector(parsed_s57(cell, zoom_offset)))
         }
         Some(Format::Djson) => {
-            let source = path.to_str().unwrap_or_default().to_owned();
+            let source = path.to_string_lossy().into_owned();
             let cell = djson_format::parse(source, &data)
                 .and_then(s57::S57Cell::try_from)
                 .inspect_err(|e| warn!(file = %path.display(), error = %e, "skipping"))
@@ -111,16 +111,11 @@ fn load_cell(path: &Path, zoom_offset: f64) -> Option<Cell> {
             Some(Cell::Vector(parsed_s57(cell, zoom_offset)))
         }
         Some(Format::Rnc) => {
-            let name = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("cell")
-                .to_owned();
-            let cell = RncCell::parse(name, data)
+            let cell = RncCell::parse(path.to_string_lossy().into_owned(), data)
                 .inspect_err(|e| warn!(file = %path.display(), error = %e, "skipping"))
                 .ok()?;
             debug!(
-                name = %cell.name(),
+                source = %cell.source(),
                 scale = cell.native_scale(),
                 zoom = zoom_from_scale(cell.native_scale(), zoom_offset),
                 cols = cell.cols(),
@@ -504,7 +499,11 @@ mod tests {
         ];
         let cells = raster(load_cells(&paths, 0.0));
         assert_eq!(cells.len(), 1, "only the valid cell survives");
-        assert_eq!(cells[0].name(), "good", "name comes from the file stem");
+        assert_eq!(
+            cells[0].source(),
+            paths[0].to_string_lossy(),
+            "the path identifies it"
+        );
         assert_eq!(cells[0].native_scale(), 250_000);
     }
 }
