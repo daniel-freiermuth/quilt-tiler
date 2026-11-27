@@ -12,6 +12,7 @@ use anyhow::Result;
 use geo::MultiPolygon;
 use pmtiles::TileType;
 
+use crate::bbox::Bbox;
 use crate::tile_geom::TileGeom;
 
 /// Accumulates per-cell [`TileSource::Content`]s into a single tile, then
@@ -52,6 +53,26 @@ pub trait TileAccumulator: Send {
 }
 
 /// A source of data that can be quilted into a `PMTiles` archive.
+///
+/// # Lazy items
+///
+/// An item may load its content on demand — from disk or the network — and
+/// keep only what [`Self::bbox`], [`Self::native_scale`] and
+/// [`Self::tiebreak`] need up front. [`crate::tiles::Quilt`] asks for
+/// content only when a tile needs it:
+///
+/// - [`Self::bbox`] and [`Self::native_scale`]: once per item, when the
+///   quilt is built.
+/// - [`Self::tiebreak`]: only for candidates whose zoom fit ties with
+///   another's.
+/// - [`Self::coverage`]: per candidate, until the tile is covered.
+/// - [`Self::render`]: only for the items contributing to a tile.
+/// - [`Self::detail_zoom`]: only by a sparse quilt, once per item, and only
+///   of a tile's candidates when none of them is natively at the tile's
+///   zoom or finer.
+///
+/// The methods that may need content return [`Result`], so a failed load
+/// fails the tile instead of silently leaving a hole in it.
 pub trait TileSource: Sync {
     /// Per-cell content produced by [`Self::render`] and consumed by
     /// [`Self::Accumulator::push`].
@@ -70,13 +91,21 @@ pub trait TileSource: Sync {
     #[allow(dead_code)] // consumed by debug logging in a follow-up commit
     fn source(&self) -> String;
 
+    /// WGS84 bounds containing all of [`Self::coverage`]. Picks a tile's
+    /// candidates, so a looser bbox costs a [`Self::coverage`] call per extra
+    /// candidate, and a tighter one loses coverage.
+    fn bbox(&self) -> Bbox;
+
     /// Geographic coverage of this item, in WGS84.
     ///
     /// `write_pmtiles` clips each candidate's coverage to only the area it
     /// actually contributes to a tile, not the whole tile, and passes that
     /// region to [`Self::render`] as [`TileGeom::geom`] — so overlapping
     /// sources never double-paint.
-    fn coverage(&self) -> MultiPolygon;
+    ///
+    /// # Errors
+    /// When the item's content can't be loaded.
+    fn coverage(&self) -> Result<MultiPolygon>;
 
     /// Native display scale denominator (e.g. `50_000` for 1:50 000).
     fn native_scale(&self) -> u32;
@@ -89,17 +118,27 @@ pub trait TileSource: Sync {
     /// [`crate::tiles::Quilt`]).
     ///
     /// Never coarser than the item's native zoom
-    /// (`zoom::zoom_from_scale(native_scale, zoom_offset)`).  Called once per
-    /// item per quilt, so a scan over the item's content is fine.
-    fn detail_zoom(&self, zoom_offset: f64) -> u8;
+    /// (`zoom::zoom_from_scale(native_scale, zoom_offset)`).  Called at most
+    /// once per item per quilt, never concurrently — again only after it
+    /// failed — so a scan over (or a load of) the item's content is fine.
+    ///
+    /// # Errors
+    /// When the item's content can't be loaded.
+    fn detail_zoom(&self, zoom_offset: f64) -> Result<u8>;
 
     /// This item's recency/priority ranking — see [`Self::Tiebreaker`].
-    fn tiebreak(&self) -> Self::Tiebreaker;
+    ///
+    /// # Errors
+    /// When the item's content can't be loaded.
+    fn tiebreak(&self) -> Result<Self::Tiebreaker>;
 
     /// Render this item into tile-space content.  `tile.geom` is this item's
     /// exact contribution region for this tile — not necessarily the whole
     /// tile — so all geometry should be clipped against it.
-    fn render(&self, tile: &TileGeom) -> Self::Content;
+    ///
+    /// # Errors
+    /// When the item's content can't be loaded.
+    fn render(&self, tile: &TileGeom) -> Result<Self::Content>;
 
     /// `PMTiles` tile type emitted by this source (e.g. `TileType::Mvt`).
     fn tile_type() -> TileType;

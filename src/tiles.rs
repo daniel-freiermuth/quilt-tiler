@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 use geo::{Area, BooleanOps, MultiPolygon};
 use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
 use martin_tile_utils::{bbox_to_xyz, xyz_to_bbox};
+use once_cell::sync::OnceCell;
 use pmtiles::{PmTilesWriter, TileCoord, TileId};
 use rayon::prelude::*;
 use tracing::info;
@@ -269,13 +270,16 @@ pub struct Quilt<S> {
 /// missing tile (`TileManager.maxUnderzooming`).
 pub const CLIENT_ANCESTOR_SEARCH: u8 = 10;
 
-/// What [`Quilt::render_tile`] needs from an item on every tile, computed
-/// once: [`TileSource::coverage`] clones a whole polygon and the zooms take
-/// a `log2` or a feature scan.
+/// What [`Quilt::render_tile`] needs from an item on every tile. The bbox and
+/// native zoom come from cheap [`TileSource`] methods and are computed up
+/// front; the detail zoom may need the item's content (see [`TileSource`]'s
+/// lazy items), so a sparse quilt computes it on first use.
 struct ItemMeta {
     bbox: Bbox,
     native_zoom: u8,
-    detail_zoom: u8,
+    /// Single-flight: concurrent tiles needing it wait for one computation
+    /// (one load of a lazy item); a failure isn't stored.
+    detail_zoom: OnceCell<u8>,
 }
 
 impl<S: TileSource> Quilt<S> {
@@ -287,9 +291,9 @@ impl<S: TileSource> Quilt<S> {
         let meta = items
             .iter()
             .map(|item| ItemMeta {
-                bbox: item.coverage().into(),
+                bbox: item.bbox(),
                 native_zoom: zoom_from_scale(item.native_scale(), zoom_offset),
-                detail_zoom: item.detail_zoom(zoom_offset),
+                detail_zoom: OnceCell::new(),
             })
             .collect();
         Self {
@@ -298,6 +302,31 @@ impl<S: TileSource> Quilt<S> {
             zoom_offset,
             sparse,
         }
+    }
+
+    /// Item `i`'s [`TileSource::detail_zoom`]: asked once, and not
+    /// concurrently; asked again only after a failure.
+    fn detail_zoom(&self, i: usize) -> Result<u8> {
+        self.meta[i]
+            .detail_zoom
+            .get_or_try_init(|| self.items[i].detail_zoom(self.zoom_offset))
+            .copied()
+    }
+
+    /// Whether every item in `items` has a detail zoom coarser than `z`.
+    /// Stops at the first that doesn't, so later items aren't asked; an
+    /// item natively at `z` or finer answers without being asked (its detail
+    /// zoom is never coarser than its native zoom).
+    fn all_coarser_than(&self, items: &[usize], z: u8) -> Result<bool> {
+        if items.iter().any(|&i| self.meta[i].native_zoom >= z) {
+            return Ok(false);
+        }
+        for &i in items {
+            if self.detail_zoom(i)? >= z {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     #[must_use]
@@ -345,26 +374,24 @@ impl<S: TileSource> Quilt<S> {
 
     /// Render one tile from the items' combined coverage.
     ///
-    /// Pure given `tile` — no shared mutable state across calls — so it's
-    /// safe to call concurrently and on demand. Backs both
+    /// Safe to call concurrently and on demand: the only state shared across
+    /// calls is each item's memoised detail zoom. Backs both
     /// [`write_pmtiles`]'s batch loop and a live tile server.
     ///
     /// # Errors
-    /// Returns an error if merging or encoding this tile's contents fails
+    /// Returns an error if an item's content can't be loaded (see
+    /// [`TileSource`]), or merging or encoding this tile's contents fails
     /// ([`TileAccumulator::push`] / [`TileAccumulator::encode`]).
     pub fn render_tile(&self, tile: TileXyz) -> Result<TileOutcome> {
         profiling::scope!("tile");
         let (z, col, row) = (tile.z(), tile.x(), tile.y());
-        let items = &self.items;
-        let meta = &self.meta;
-        let zi = i32::from(z);
         let tile_wgs84 = Bbox::from(xyz_to_bbox(z, col, row, col, row));
 
-        // Candidates: items whose coverage bbox overlaps this tile.
+        // Candidates: items whose bbox overlaps this tile.
         let mut candidates: Vec<usize> = {
             profiling::scope!("Collecting candidates");
-            (0..items.len())
-                .filter(|&i| meta[i].bbox.overlaps(&tile_wgs84))
+            (0..self.items.len())
+                .filter(|&i| self.meta[i].bbox.overlaps(&tile_wgs84))
                 .collect()
         };
 
@@ -373,53 +400,29 @@ impl<S: TileSource> Quilt<S> {
         }
         // Contributors are a subset of candidates, so this decides the
         // common open-water case without any polygon algebra.
-        if self.sparse && candidates.iter().all(|&i| meta[i].detail_zoom < z) {
+        if self.sparse && self.all_coarser_than(&candidates, z)? {
             return Ok(TileOutcome::Omitted);
         }
 
-        {
-            profiling::scope!("Sorting candidates");
-            // Sort: coarsest-appropriate zoom first, finer after, too-coarse
-            // last; ties at the same floored zoom broken by recency (newer
-            // edition wins — see `TileSource::tiebreak`).
-            candidates.sort_unstable_by_key(|&i| {
-                let nz = i32::from(meta[i].native_zoom);
-                (
-                    nz < zi,
-                    if nz >= zi { nz } else { -nz },
-                    Reverse(items[i].tiebreak()),
-                )
-            });
-        }
-
-        // Greedy coverage: include an item only if its contribution adds
-        // area not yet covered.  Real polygon algebra correctly handles
-        // disjoint coverage areas (e.g. NE + SW ≠ full tile), unlike a
-        // bounding-box hull.
-        let mut uncovered = MultiPolygon::from(tile_wgs84);
-        let mut contributions: Vec<(usize, MultiPolygon)> = Vec::new();
-        {
+        // Sort by zoom fit alone (catalog data): coarsest-appropriate zoom
+        // first, finer after, too coarse last. Equally fitting candidates
+        // end up adjacent; the greedy loop orders each such group by
+        // tie-break key only when it reaches it.
+        candidates.sort_unstable_by_key(|&i| self.zoom_fit(i, z));
+        let contributions = {
             profiling::scope!("Assigning coverage");
-            for &i in &candidates {
-                let contrib = items[i].coverage().intersection(&uncovered);
-                if contrib.unsigned_area() == 0.0 {
-                    continue;
-                }
-                uncovered = uncovered.difference(&contrib);
-                contributions.push((i, contrib));
-                if uncovered.unsigned_area() == 0.0 {
-                    break;
-                }
-            }
-        }
+            self.assign_coverage(&candidates, z, tile_wgs84)?
+        };
 
         if contributions.is_empty() {
             return Ok(TileOutcome::Uncovered);
         }
-        if self.sparse && contributions.iter().all(|&(i, _)| meta[i].detail_zoom < z) {
+        let contributors: Vec<usize> = contributions.iter().map(|&(i, _)| i).collect();
+        if self.sparse && self.all_coarser_than(&contributors, z)? {
             return Ok(TileOutcome::Omitted);
         }
 
+        let items = &self.items;
         let tile_merc = tile_wgs84.to_web_mercator();
         let tile_scale = scale_from_zoom(z, self.zoom_offset);
         let mut acc = S::Accumulator::empty();
@@ -430,7 +433,7 @@ impl<S: TileSource> Quilt<S> {
                     geom: contrib,
                     merc: tile_merc,
                     scale: tile_scale,
-                }))?;
+                })?)?;
             }
         }
 
@@ -440,6 +443,71 @@ impl<S: TileSource> Quilt<S> {
         } else {
             TileOutcome::Rendered(bytes)
         })
+    }
+
+    /// Greedy coverage over `candidates`, sorted by [`Self::zoom_fit`]:
+    /// include an item only if its contribution adds area not yet covered.
+    /// Real polygon algebra correctly handles disjoint coverage areas (e.g.
+    /// NE + SW ≠ full tile), unlike a bounding-box hull.
+    ///
+    /// A group of equally fitting candidates is ordered by tie-break key
+    /// only when the loop reaches it, and only among the members whose bbox
+    /// still meets the uncovered area; groups past the point where the tile
+    /// is covered are asked nothing.
+    fn assign_coverage(
+        &self,
+        candidates: &[usize],
+        z: u8,
+        tile_wgs84: Bbox,
+    ) -> Result<Vec<(usize, MultiPolygon)>> {
+        let mut uncovered = MultiPolygon::from(tile_wgs84);
+        let mut contributions = Vec::new();
+        for group in candidates.chunk_by(|&a, &b| self.zoom_fit(a, z) == self.zoom_fit(b, z)) {
+            // From the catalog: a member whose bbox misses what's left of
+            // the tile can't contribute.
+            let remaining = Bbox::from(&uncovered);
+            let mut members: Vec<usize> = group
+                .iter()
+                .copied()
+                .filter(|&i| self.meta[i].bbox.overlaps(&remaining))
+                .collect();
+            if members.len() > 1 {
+                self.order_by_tiebreak(&mut members)?;
+            }
+            for i in members {
+                let contrib = self.items[i].coverage()?.intersection(&uncovered);
+                if contrib.unsigned_area() == 0.0 {
+                    continue;
+                }
+                uncovered = uncovered.difference(&contrib);
+                contributions.push((i, contrib));
+                if uncovered.unsigned_area() == 0.0 {
+                    return Ok(contributions);
+                }
+            }
+        }
+        Ok(contributions)
+    }
+
+    /// Order `members` (equally fitting candidates) newest edition first —
+    /// see [`TileSource::tiebreak`].
+    fn order_by_tiebreak(&self, members: &mut [usize]) -> Result<()> {
+        let mut keyed = members
+            .iter()
+            .map(|&i| Ok((Reverse(self.items[i].tiebreak()?), i)))
+            .collect::<Result<Vec<_>>>()?;
+        keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        for (slot, (_, i)) in members.iter_mut().zip(keyed) {
+            *slot = i;
+        }
+        Ok(())
+    }
+
+    /// Sort key fitting item `i` to tile zoom `z`: coarsest-appropriate zoom
+    /// first, finer after, too coarse last.
+    fn zoom_fit(&self, i: usize, z: u8) -> (bool, i32) {
+        let (native, zi) = (i32::from(self.meta[i].native_zoom), i32::from(z));
+        (native < zi, if native >= zi { native } else { -native })
     }
 }
 
@@ -564,13 +632,15 @@ mod tests {
             east: 11.0,
             north: 57.0,
         };
+        // Sources sort the older cell first, so only the edition (not the
+        // tie fallback by source, nor the input order) can pick the newer.
         let older = RncCell::parse(
-            "OLDER".to_owned(),
+            "A-OLDER".to_owned(),
             build_rnc(bbox, [200, 30, 30, 255], 3_000_000.0, "01/01/2020"),
         )
         .expect("older cell parses");
         let newer = RncCell::parse(
-            "NEWER".to_owned(),
+            "B-NEWER".to_owned(),
             build_rnc(bbox, [30, 200, 30, 255], 3_000_000.0, "01/01/2026"),
         )
         .expect("newer cell parses");
@@ -653,7 +723,10 @@ mod tests {
         )
         .expect("fine cell parses");
         assert_eq!(
-            (coarse.detail_zoom(0.0), fine.detail_zoom(0.0)),
+            (
+                coarse.detail_zoom(0.0).unwrap(),
+                fine.detail_zoom(0.0).unwrap()
+            ),
             (7, 13),
             "fixture sanity: native zooms decide both detail zooms"
         );
@@ -928,6 +1001,305 @@ mod tests {
         );
     }
 
+    // ── Lazy items: what a quilt asks for ────────────────────────────────
+
+    /// Counts the content requests a lazy item would have to load for.
+    #[derive(Default)]
+    struct Asked {
+        coverage: std::sync::atomic::AtomicUsize,
+        detail_zoom: std::sync::atomic::AtomicUsize,
+        tiebreak: std::sync::atomic::AtomicUsize,
+        render: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Asked {
+        fn count(counter: &std::sync::atomic::AtomicUsize) -> usize {
+            counter.load(Ordering::Relaxed)
+        }
+
+        /// `(coverage, detail_zoom, tiebreak, render)` requests so far.
+        fn all(&self) -> (usize, usize, usize, usize) {
+            (
+                Self::count(&self.coverage),
+                Self::count(&self.detail_zoom),
+                Self::count(&self.tiebreak),
+                Self::count(&self.render),
+            )
+        }
+    }
+
+    /// A stand-in lazy item: `bbox` and `scale` are free, every other
+    /// method counts as a load and fails when `broken`.
+    struct Probe {
+        name: &'static str,
+        bbox: Bbox,
+        scale: u32,
+        edition: u32,
+        broken: bool,
+        /// How long each load takes, so concurrent tiles can overlap on it.
+        load_time: std::time::Duration,
+        asked: Asked,
+    }
+
+    impl Probe {
+        fn new(name: &'static str, bbox: Bbox, zoom: u8, edition: u32) -> Self {
+            // 10% finer than the band's rounded edge, well before the next.
+            let scale = scale_from_zoom(zoom, 0.0) / 10 * 9;
+            assert_eq!(zoom_from_scale(scale, 0.0), zoom, "fixture sanity");
+            Self {
+                name,
+                bbox,
+                scale,
+                edition,
+                broken: false,
+                load_time: std::time::Duration::ZERO,
+                asked: Asked::default(),
+            }
+        }
+
+        fn load(&self, counter: &std::sync::atomic::AtomicUsize) -> Result<()> {
+            counter.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(self.load_time);
+            anyhow::ensure!(!self.broken, "{} failed to load", self.name);
+            Ok(())
+        }
+    }
+
+    /// Joins the names of a tile's contributors, in quilt order.
+    struct Names(Vec<&'static str>);
+
+    impl TileAccumulator for Names {
+        type Content = &'static str;
+        fn empty() -> Self {
+            Self(Vec::new())
+        }
+        fn push(&mut self, name: &'static str) -> Result<()> {
+            self.0.push(name);
+            Ok(())
+        }
+        fn encode(self) -> Result<Vec<u8>> {
+            Ok(self.0.join(",").into_bytes())
+        }
+        fn blank() -> Result<Vec<u8>> {
+            Ok(b"-".to_vec())
+        }
+    }
+
+    impl TileSource for Probe {
+        type Content = &'static str;
+        type Accumulator = Names;
+        type Tiebreaker = u32;
+
+        fn source(&self) -> String {
+            self.name.to_owned()
+        }
+        fn bbox(&self) -> Bbox {
+            self.bbox
+        }
+        fn coverage(&self) -> Result<MultiPolygon> {
+            self.load(&self.asked.coverage)?;
+            Ok(MultiPolygon::from(geo::Polygon::from(self.bbox)))
+        }
+        fn native_scale(&self) -> u32 {
+            self.scale
+        }
+        fn detail_zoom(&self, zoom_offset: f64) -> Result<u8> {
+            self.load(&self.asked.detail_zoom)?;
+            Ok(zoom_from_scale(self.scale, zoom_offset))
+        }
+        fn tiebreak(&self) -> Result<u32> {
+            self.load(&self.asked.tiebreak)?;
+            Ok(self.edition)
+        }
+        fn render(&self, _tile: &TileGeom) -> Result<&'static str> {
+            self.load(&self.asked.render)?;
+            Ok(self.name)
+        }
+        fn tile_type() -> pmtiles::TileType {
+            pmtiles::TileType::Mvt
+        }
+    }
+
+    /// The z10 tile under (10.5°E, 56.5°N), and a bbox 0.1° around it.
+    fn probe_tile() -> (TileXyz, Bbox) {
+        probe_tile_at(10, 10.5, 56.5, 0.1)
+    }
+
+    /// The zoom-`z` tile under `(lon, lat)`, and a bbox `margin` degrees
+    /// around it.
+    fn probe_tile_at(z: u8, lon: f64, lat: f64, margin: f64) -> (TileXyz, Bbox) {
+        let (col, row, _, _) = bbox_to_xyz(lon, lat, lon, lat, z);
+        let tile = Bbox::from(xyz_to_bbox(z, col, row, col, row));
+        let around = Bbox {
+            west: tile.west - margin,
+            south: tile.south - margin,
+            east: tile.east + margin,
+            north: tile.north + margin,
+        };
+        (xyz(z, col, row), around)
+    }
+
+    fn rendered(outcome: TileOutcome) -> String {
+        match outcome {
+            TileOutcome::Rendered(bytes) => String::from_utf8(bytes).expect("names"),
+            other => panic!("expected a rendered tile, got {other:?}"),
+        }
+    }
+
+    /// Building a quilt reads only the free metadata, items outside a tile
+    /// are never asked for content, and a dense quilt never asks for detail
+    /// zooms.
+    #[test]
+    fn a_quilt_asks_no_content_up_front_nor_of_items_off_the_tile() {
+        let (tile, around) = probe_tile();
+        let far = Bbox {
+            west: -60.0,
+            south: -10.0,
+            east: -59.0,
+            north: -9.0,
+        };
+        let quilt = Quilt::new(
+            vec![
+                Probe::new("FIT", around, 10, 1),
+                Probe::new("FAR", far, 10, 1),
+            ],
+            0.0,
+            false,
+        );
+        for item in quilt.items() {
+            assert_eq!(item.asked.all(), (0, 0, 0, 0), "{} at build", item.name);
+        }
+
+        assert_eq!(rendered(quilt.render_tile(tile).expect("renders")), "FIT");
+        let asked: Vec<_> = quilt.items().iter().map(|i| i.asked.all()).collect();
+        assert_eq!(asked, [(1, 0, 0, 1), (0, 0, 0, 0)]);
+    }
+
+    /// Items tied on zoom fit are ordered by their tie-break key — the only
+    /// ones asked for it — and the newest comes first.
+    #[test]
+    fn only_tied_candidates_are_asked_for_their_tiebreak() {
+        let (tile, around) = probe_tile();
+        let quilt = Quilt::new(
+            vec![
+                Probe::new("OLD", around, 10, 1),
+                Probe::new("NEW", around, 10, 2),
+                Probe::new("FINER", around, 12, 3),
+            ],
+            0.0,
+            false,
+        );
+        let names = rendered(quilt.render_tile(tile).expect("renders"));
+        assert_eq!(names.split(',').next(), Some("NEW"), "{names}");
+        let tiebreaks: Vec<_> = quilt.items().iter().map(|i| i.asked.all().2).collect();
+        assert_eq!(tiebreaks, [1, 1, 0]);
+    }
+
+    /// A tied group the greedy loop never reaches, because a better-fitting
+    /// item already covers the tile, is asked nothing.
+    #[test]
+    fn a_tied_group_behind_a_covering_item_is_not_asked_for_dates() {
+        let (tile, exact) = probe_tile_at(10, 10.5, 56.5, 0.0);
+        let quilt = Quilt::new(
+            vec![
+                Probe::new("FIT", exact, 10, 1),
+                Probe::new("LATE_A", exact, 12, 1),
+                Probe::new("LATE_B", exact, 12, 2),
+            ],
+            0.0,
+            false,
+        );
+        assert_eq!(rendered(quilt.render_tile(tile).expect("renders")), "FIT");
+        let tiebreaks: Vec<_> = quilt.items().iter().map(|i| i.asked.all().2).collect();
+        assert_eq!(tiebreaks, [0, 0, 0]);
+    }
+
+    /// In a reached group, a member whose bbox misses the still uncovered
+    /// part of the tile can't contribute: it isn't asked for its date, and
+    /// a single remaining member needs no ordering at all.
+    #[test]
+    fn a_tied_member_off_the_remaining_gap_is_not_asked_for_its_date() {
+        let (tile, exact) = probe_tile_at(10, 10.5, 56.5, 0.0);
+        let mid = f64::midpoint(exact.west, exact.east);
+        let west_half = Bbox { east: mid, ..exact };
+        let east_half = Bbox { west: mid, ..exact };
+        let west_quarter = Bbox {
+            east: f64::midpoint(exact.west, mid),
+            ..exact
+        };
+        let quilt = Quilt::new(
+            vec![
+                Probe::new("WEST", west_half, 10, 1),
+                Probe::new("EAST", east_half, 12, 1),
+                Probe::new("OFF", west_quarter, 12, 2),
+            ],
+            0.0,
+            false,
+        );
+        assert_eq!(
+            rendered(quilt.render_tile(tile).expect("renders")),
+            "WEST,EAST"
+        );
+        let asked: Vec<_> = quilt.items().iter().map(|i| i.asked.all()).collect();
+        assert_eq!(asked, [(1, 0, 0, 1), (1, 0, 0, 1), (0, 0, 0, 0)]);
+    }
+
+    /// A sparse quilt asks each item for its detail zoom once, however many
+    /// tiles need it — even when they render at the same time.
+    #[test]
+    fn a_sparse_quilt_asks_each_detail_zoom_once() {
+        // Natively coarser than the tile, so the detail zoom must be asked.
+        let (tile, around) = probe_tile_at(12, 10.5, 56.5, 0.1);
+        let mut item = Probe::new("COARSE", around, 10, 1);
+        item.load_time = std::time::Duration::from_millis(50);
+        let quilt = Quilt::new(vec![item], 0.0, true);
+        let start = std::sync::Barrier::new(4);
+        std::thread::scope(|threads| {
+            for _ in 0..4 {
+                threads.spawn(|| {
+                    start.wait();
+                    let outcome = quilt.render_tile(tile).expect("renders");
+                    assert_eq!(outcome, TileOutcome::Omitted);
+                });
+            }
+        });
+        assert_eq!(quilt.items()[0].asked.all().1, 1);
+    }
+
+    /// A candidate natively at the tile's zoom or finer decides "not all
+    /// coarser" from the catalog alone: nobody is asked for a detail zoom.
+    #[test]
+    fn a_natively_fine_candidate_spares_the_detail_zooms() {
+        let (tile, around) = probe_tile();
+        let quilt = Quilt::new(
+            vec![
+                Probe::new("FIT", around, 10, 1),
+                Probe::new("COARSE", around, 7, 1),
+            ],
+            0.0,
+            true,
+        );
+        let outcome = quilt.render_tile(tile).expect("renders");
+        assert!(matches!(outcome, TileOutcome::Rendered(_)), "{outcome:?}");
+        let detail_zooms: Vec<_> = quilt.items().iter().map(|i| i.asked.all().1).collect();
+        assert_eq!(detail_zooms, [0, 0]);
+    }
+
+    /// A load failure fails the tile rather than leaving a hole in it, and
+    /// a later request asks again.
+    #[test]
+    fn a_failed_load_fails_the_tile() {
+        let (tile, around) = probe_tile_at(13, 10.5, 56.5, 0.1);
+        let mut broken = Probe::new("BROKEN", around, 10, 1);
+        broken.broken = true;
+        let quilt = Quilt::new(vec![broken], 0.0, true);
+        for attempt in 1..=2 {
+            let err = quilt.render_tile(tile).expect_err("the tile fails");
+            assert!(err.to_string().contains("BROKEN failed to load"), "{err}");
+            assert_eq!(quilt.items()[0].asked.all().1, attempt, "not memoised");
+        }
+    }
+
     /// A sparse quilt stores the tile at an item's own detail zoom and omits
     /// only strictly finer ones — also through the shortcut that decides
     /// from bbox candidates alone.
@@ -944,7 +1316,7 @@ mod tests {
             build_rnc(bbox, [200, 30, 30, 255], 3_000_000.0, "01/01/2026"),
         )
         .expect("cell parses");
-        assert_eq!(cell.detail_zoom(0.0), 7, "fixture sanity");
+        assert_eq!(cell.detail_zoom(0.0).unwrap(), 7, "fixture sanity");
         let quilt = Quilt::new(vec![cell], 0.0, true);
         let outcome = |z| {
             let (col, row, _, _) = bbox_to_xyz(10.5, 56.5, 10.5, 56.5, z);
@@ -973,7 +1345,7 @@ mod tests {
         )
         .expect("cell parses");
         assert_eq!(zoom_from_scale(3_000_000, 0.0), 7, "fixture sanity");
-        assert_eq!(cell.detail_zoom(0.0), 14, "fixture sanity");
+        assert_eq!(cell.detail_zoom(0.0).unwrap(), 14, "fixture sanity");
         let quilt = Quilt::new(vec![cell], 0.0, true);
         let outcome = |z| {
             let (col, row, _, _) = bbox_to_xyz(10.0005, 56.0005, 10.0005, 56.0005, z);
