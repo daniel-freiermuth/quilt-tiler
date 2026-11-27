@@ -40,8 +40,12 @@ impl TileSource for RncCell {
         self.name().to_owned()
     }
 
-    fn coverage(&self) -> MultiPolygon {
-        Self::coverage(self)
+    fn bbox(&self) -> Bbox {
+        Bbox::from(&Self::coverage(self))
+    }
+
+    fn coverage(&self) -> Result<MultiPolygon> {
+        Ok(Self::coverage(self))
     }
 
     fn native_scale(&self) -> u32 {
@@ -54,10 +58,10 @@ impl TileSource for RncCell {
     /// header yields zoom 22, so a sparse quilt never omits this cell.
     /// (`RncCell::parse` rejects an empty extent and PNGs are never 0 px
     /// wide, so `world_px` is finite and positive.)
-    fn detail_zoom(&self, zoom_offset: f64) -> u8 {
+    fn detail_zoom(&self, zoom_offset: f64) -> Result<u8> {
         let native = zoom_from_scale(Self::native_scale(self), zoom_offset);
         let Some(width) = self.subtile_width() else {
-            return MAX_ZOOM;
+            return Ok(MAX_ZOOM);
         };
         let bbox = self.bbox();
         // Source pixels around the whole world at this cell's resolution.
@@ -65,11 +69,11 @@ impl TileSource for RncCell {
         let pixel_zoom = (0..=MAX_ZOOM)
             .find(|&z| f64::from(TILE_PX) * f64::from(z).exp2() >= world_px)
             .unwrap_or(MAX_ZOOM);
-        native.max(pixel_zoom)
+        Ok(native.max(pixel_zoom))
     }
 
-    fn tiebreak(&self) -> Self::Tiebreaker {
-        self.edition_date()
+    fn tiebreak(&self) -> Result<Self::Tiebreaker> {
+        Ok(self.edition_date())
     }
 
     /// Resample this cell into `tile`'s pixel grid.
@@ -86,7 +90,7 @@ impl TileSource for RncCell {
         clippy::min_ident_chars, // x/y/u/v/n match the projection math in src/rnc.rs's docs
         clippy::many_single_char_names
     )]
-    fn render(&self, tile: &TileGeom) -> Self::Content {
+    fn render(&self, tile: &TileGeom) -> Result<Self::Content> {
         let mut buf = vec![0u8; (TILE_PX * TILE_PX * 4) as usize];
 
         // This item's exact contribution polygon for this tile (already
@@ -97,7 +101,7 @@ impl TileSource for RncCell {
         // outside it.
         let contrib_bbox = Bbox::from(&tile.geom);
         if contrib_bbox.is_bottom() {
-            return buf;
+            return Ok(buf);
         }
 
         let (xmin, ymin, xmax, ymax) = self.merc_extent();
@@ -167,7 +171,7 @@ impl TileSource for RncCell {
             }
         }
 
-        buf
+        Ok(buf)
     }
 
     fn tile_type() -> TileType {
@@ -321,7 +325,7 @@ mod tests {
         };
         let tile = make_tile(merc, contrib, 3_000_000);
 
-        let out = TileSource::render(&cell, &tile);
+        let out = TileSource::render(&cell, &tile).expect("renders");
         assert_eq!(out.len(), (TILE_PX * TILE_PX * 4) as usize);
 
         // West edge (inside contribution) must be painted.
@@ -360,7 +364,7 @@ mod tests {
         let cell = RncCell::parse("TEST".to_owned(), data).expect("valid .rnc parses");
 
         let merc = bbox.to_web_mercator();
-        let out = TileSource::render(&cell, &make_tile(merc, bbox, 3_000_000));
+        let out = TileSource::render(&cell, &make_tile(merc, bbox, 3_000_000)).expect("renders");
 
         // Expected layout is stated geographically, independent of
         // `locate_grid_cell`: columns run west→east and split longitude
@@ -477,7 +481,7 @@ mod tests {
             scale: 3_000_000,
         };
 
-        let out = TileSource::render(&cell, &tile);
+        let out = TileSource::render(&cell, &tile).expect("renders");
         let pixel_alpha = |lon: f64, lat: f64| -> u8 { pixel_at(&out, merc, lon, lat)[3] };
 
         // Inside the triangle (near its centroid).
@@ -540,12 +544,15 @@ mod tests {
         // 8 px across 1° → 2 880 px around the world: z4 tiles already sample
         // every source pixel, so the native 1:3M zoom (7) is the finer one.
         let coarse = parse(1, at(12.0));
-        assert_eq!(coarse.detail_zoom(0.0), zoom_from_scale(3_000_000, 0.0));
+        assert_eq!(
+            coarse.detail_zoom(0.0).unwrap(),
+            zoom_from_scale(3_000_000, 0.0)
+        );
 
         // 2 × 8 px across 0.001° → 5.76 M px around the world: z14 tiles
         // (4.19 M px) still skip source pixels, z15 (8.39 M px) do not.
         let fine = parse(2, at(11.001));
-        assert_eq!(fine.detail_zoom(0.0), 15);
+        assert_eq!(fine.detail_zoom(0.0).unwrap(), 15);
 
         // 8 px across 1.40625° is exactly 2 048 px around the world, which
         // z3's 8 × 256 px tiles match pixel for pixel: z3, not z4. (A
@@ -555,6 +562,6 @@ mod tests {
             build_rnc(1, 1, at(12.406_25), &[[1, 2, 3, 255]], 1_000_000_000.0),
         )
         .expect("valid .rnc parses");
-        assert_eq!(exact.detail_zoom(0.0), 3);
+        assert_eq!(exact.detail_zoom(0.0).unwrap(), 3);
     }
 }

@@ -115,9 +115,13 @@ impl TileSource for s57::S57Cell {
     type Accumulator = S57Accumulator;
     type Tiebreaker = s57::EditionDate;
 
+    fn bbox(&self) -> Bbox {
+        Bbox::from(&self.coverage)
+    }
+
     #[profiling::function]
-    fn coverage(&self) -> MultiPolygon {
-        self.coverage.clone()
+    fn coverage(&self) -> Result<MultiPolygon> {
+        Ok(self.coverage.clone())
     }
 
     fn native_scale(&self) -> u32 {
@@ -128,17 +132,18 @@ impl TileSource for s57::S57Cell {
     /// feature first shows up if that is finer — the last zoom whose render
     /// still changes (`SCAMIN` is the only scale-dependent part of
     /// [`Self::render`]).
-    fn detail_zoom(&self, zoom_offset: f64) -> u8 {
+    fn detail_zoom(&self, zoom_offset: f64) -> Result<u8> {
         let native = zoom_from_scale(self.native_scale, zoom_offset);
-        self.features
+        Ok(self
+            .features
             .iter()
             .filter_map(scamin)
             .filter_map(|gate| first_zoom_showing(gate, zoom_offset))
-            .fold(native, u8::max)
+            .fold(native, u8::max))
     }
 
-    fn tiebreak(&self) -> Self::Tiebreaker {
-        self.edition_date
+    fn tiebreak(&self) -> Result<Self::Tiebreaker> {
+        Ok(self.edition_date)
     }
 
     fn source(&self) -> String {
@@ -146,7 +151,7 @@ impl TileSource for s57::S57Cell {
     }
 
     #[profiling::function]
-    fn render(&self, tile: &TileGeom) -> Self::Content {
+    fn render(&self, tile: &TileGeom) -> Result<Self::Content> {
         let mut layers: HashMap<&'static str, Vec<RawFeature>> = HashMap::new();
 
         for feat in &self.features {
@@ -229,7 +234,7 @@ impl TileSource for s57::S57Cell {
             }
         }
 
-        layers
+        Ok(layers)
     }
 
     fn tile_type() -> TileType {
@@ -1169,14 +1174,52 @@ mod tests {
                 }],
             )
         };
-        assert_eq!(cell(vec![]).detail_zoom(0.0), 13, "native zoom");
+        assert_eq!(cell(vec![]).detail_zoom(0.0).unwrap(), 13, "native zoom");
         // Gated coarser than native: still shown from z13 on.
-        assert_eq!(cell(vec![gated(1_000_000)]).detail_zoom(0.0), 13);
+        assert_eq!(cell(vec![gated(1_000_000)]).detail_zoom(0.0).unwrap(), 13);
         // 1:4 000 only shows from z18 (z17 is ~1:4 265).
         assert_eq!(
-            cell(vec![gated(1_000_000), gated(4_000)]).detail_zoom(0.0),
+            cell(vec![gated(1_000_000), gated(4_000)])
+                .detail_zoom(0.0)
+                .unwrap(),
             18
         );
+    }
+
+    /// Of two cells equal but for their edition and content, the newer one
+    /// draws a tile both cover — although its source sorts last, which is
+    /// what decides full ties.
+    #[test]
+    fn the_newer_edition_draws_a_tile_both_cover() {
+        let center = Point::new(10.0, 55.0);
+        let dated = |source: &str, acronym: &str, year| s57::S57Cell {
+            source: source.to_owned(),
+            coverage: MultiPolygon::new(vec![Polygon::from(Bbox {
+                west: 9.9,
+                south: 54.9,
+                east: 10.1,
+                north: 55.1,
+            })]),
+            edition_date: s57::EditionDate::new(year, 1, 1),
+            ..cell(vec![s57::Feature {
+                type_code: s57::object_code(acronym).expect("known class"),
+                ..feat(s57::Geometry::Point(center), vec![])
+            }])
+        };
+        let quilt = crate::tiles::Quilt::new(
+            vec![dated("a", "LNDMRK", 2020), dated("b", "BCNLAT", 2026)],
+            0.0,
+            false,
+        );
+        let (col, row, _, _) = martin_tile_utils::bbox_to_xyz(10.0, 55.0, 10.0, 55.0, 13);
+        let tile = crate::tiles::TileXyz::new(13, col, row).expect("on the grid");
+        let crate::tiles::TileOutcome::Rendered(bytes) = quilt.render_tile(tile).expect("renders")
+        else {
+            panic!("both cells cover the tile");
+        };
+        let has_layer = |name: &str| bytes.windows(name.len()).any(|w| w == name.as_bytes());
+        assert!(has_layer("BCNLAT"), "the newer cell's layer is drawn");
+        assert!(!has_layer("LNDMRK"), "the older cell's isn't");
     }
 
     #[test]
@@ -1186,7 +1229,8 @@ mod tests {
             feat(s57::Geometry::Point(center), vec![]),
             feat(s57::Geometry::Point(Point::new(20.0, 60.0)), vec![]),
         ])
-        .render(&test_tile_geom(center, 0.1));
+        .render(&test_tile_geom(center, 0.1))
+        .expect("renders");
         assert_eq!(layers.keys().collect::<Vec<_>>(), [&"ADMARE"]);
         assert_eq!(
             layers["ADMARE"].len(),
@@ -1343,7 +1387,7 @@ mod tests {
         let mut out = Vec::new();
         push_features(&f, &tile, &mut out);
         assert_eq!(out, vec![], "clipping alone also yields nothing");
-        let layers = cell(vec![f]).render(&tile);
+        let layers = cell(vec![f]).render(&tile).expect("renders");
         assert!(
             !layers.contains_key("DEPARE"),
             "no DEPARE entry for a tile inside the hole: {layers:?}"
@@ -1363,7 +1407,7 @@ mod tests {
         ));
         let shallow = depare(Polygon::new(pocket, vec![]));
 
-        let layers = cell(vec![deep, shallow]).render(&tile);
+        let layers = cell(vec![deep, shallow]).render(&tile).expect("renders");
         let depares = &layers["DEPARE"];
         assert_eq!(depares.len(), 2, "deep and shallow both reach the tile");
         let [deep_px, shallow_px] = [&depares[0].0, &depares[1].0].map(|g| {

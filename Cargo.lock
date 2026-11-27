@@ -1469,6 +1469,7 @@ dependencies = [
  "mlt-core",
  "moka",
  "oesu",
+ "once_cell",
  "pmtiles",
  "profiling",
  "rayon",
