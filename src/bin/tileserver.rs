@@ -271,7 +271,7 @@ impl AppState {
             |cache| {
                 cache
                     .try_get_with(tile, || self.render_uncached(tile))
-                    .map_err(|e| anyhow::anyhow!("{e}"))
+                    .map_err(|e| anyhow::anyhow!("{e:#}"))
             },
         )
     }
@@ -328,7 +328,7 @@ async fn style_handler(
     let body = match state.style_json(&tile_url) {
         Ok(body) => body,
         Err(e) => {
-            error!(error = %e, "style.json build failed");
+            error!(error = format!("{e:#}"), "style.json build failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -378,7 +378,7 @@ async fn tile_handler(
     match result {
         Ok(Ok(served)) => tile_response(served, content_type, headers.get(header::IF_NONE_MATCH)),
         Ok(Err(e)) => {
-            error!(error = %e, z, x, y, "tile render failed");
+            error!(error = format!("{e:#}"), z, x, y, "tile render failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
         Err(e) => {

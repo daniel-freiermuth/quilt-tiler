@@ -149,7 +149,7 @@ impl TileSource for RncCell {
                                 tracing::warn!(
                                     cell = Self::source(self),
                                     n,
-                                    error = %e,
+                                    error = format!("{e:#}"),
                                     "failed to decode raster subtile; leaving transparent"
                                 );
                             }

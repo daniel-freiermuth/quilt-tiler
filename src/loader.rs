@@ -112,7 +112,9 @@ fn load_cell(path: &Path, zoom_offset: f64) -> Option<Cell> {
         }
         Some(Format::Rnc) => {
             let cell = RncCell::parse(path.to_string_lossy().into_owned(), data)
-                .inspect_err(|e| warn!(file = %path.display(), error = %e, "skipping"))
+                .inspect_err(
+                    |e| warn!(file = %path.display(), error = format!("{e:#}"), "skipping"),
+                )
                 .ok()?;
             debug!(
                 source = %cell.source(),
