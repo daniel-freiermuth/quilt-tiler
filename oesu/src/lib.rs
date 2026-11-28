@@ -216,7 +216,6 @@ struct OesuCell {
     bounds: [f64; 4],
     features: Vec<Feature>,
     coverage: MultiPolygon,
-    text_descriptions: HashMap<String, String>,
     source: String,
 }
 
@@ -250,7 +249,6 @@ impl From<OesuCell> for s57::S57Cell {
             features: c.features,
             coverage: c.coverage,
             source: c.source,
-            text_descriptions: c.text_descriptions,
             edition_date,
         }
     }
@@ -261,8 +259,6 @@ impl From<OesuCell> for s57::S57Cell {
 #[derive(Debug)]
 struct RawFeature {
     type_code: u16,
-    id: u16,
-    primitive: u8,
     attributes: Vec<Attribute>,
     raw_geometry: RawGeometry,
 }
@@ -353,7 +349,6 @@ struct CellBuilder {
     raw_features: Vec<RawFeature>,
     raw_covr: Vec<LineString>,
     raw_nocovr: Vec<LineString>,
-    text_descriptions: HashMap<String, String>,
     vet: HashMap<u32, EdgeEntry>,
     vct: HashMap<u32, NodeEntry>,
     current: Option<RawFeature>,
@@ -413,27 +408,6 @@ impl CellBuilder {
             .ok_or(OesuError::RecordBeforeExtent { record })
     }
 
-    /// `CELL_TXTDSC_INFO_FILE_RECORD` (101): embedded text-description file.
-    fn parse_txtdsc(&mut self, p: &mut Cursor<&[u8]>, payload_len: usize) {
-        let (Ok(name_len), Ok(_content_len)) = (read_u32(p), read_u32(p)) else {
-            tracing::warn!(payload_len, "CELL_TXTDSC_INFO_FILE_RECORD too short");
-            return;
-        };
-        let name_len = name_len as usize;
-        let fname = read_cstring(p, name_len).unwrap_or_default();
-        let consumed = 8 + name_len;
-        if !fname.is_empty()
-            && let Some(content_raw) = p.get_ref().get(consumed..)
-        {
-            let content = String::from_utf8_lossy(content_raw)
-                .trim_end_matches('\0')
-                .to_owned();
-            if !content.is_empty() {
-                self.text_descriptions.insert(fname, content);
-            }
-        }
-    }
-
     /// `FEATURE_ID_RECORD` (64): start of a new feature.
     fn parse_feature_id(&mut self, p: &mut Cursor<&[u8]>, payload_len: usize) -> Result<()> {
         if let Some(f) = self.current.take() {
@@ -441,12 +415,8 @@ impl CellBuilder {
         }
         if payload_len >= 5 {
             let type_code = read_u16(p)?;
-            let id = read_u16(p)?;
-            let primitive = read_u8(p)?;
             self.current = Some(RawFeature {
                 type_code,
-                id,
-                primitive,
                 attributes: Vec::new(),
                 raw_geometry: RawGeometry::None,
             });
@@ -856,7 +826,9 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
 
         match rec_type {
             // ── Header metadata (simple field assignments) ───────────────
-            HEADER_SENC_VERSION => { /* already consumed in prologue */ }
+            // SENC version is consumed in the prologue; embedded
+            // text-description (TXTDSC) files are not used.
+            HEADER_SENC_VERSION | CELL_TXTDSC_INFO_FILE_RECORD => {}
             HEADER_CELL_NAME => {
                 b.name = read_cstring(&mut p, payload_len).unwrap_or_default();
             }
@@ -910,7 +882,6 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
                     tracing::warn!("CELL_NOCOVR_RECORD: could not parse no-coverage polygon");
                 }
             }
-            CELL_TXTDSC_INFO_FILE_RECORD => b.parse_txtdsc(&mut p, payload_len),
 
             // ── Feature records ──────────────────────────────────────────
             FEATURE_ID_RECORD => b.parse_feature_id(&mut p, payload_len)?,
@@ -983,7 +954,6 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
         raw_features,
         raw_covr,
         raw_nocovr,
-        text_descriptions,
         vet,
         vct,
         current: _,
@@ -1021,8 +991,6 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
             );
             Feature {
                 type_code: raw.type_code,
-                id: raw.id,
-                primitive: raw.primitive,
                 attributes: raw.attributes,
                 geometry,
             }
@@ -1059,7 +1027,6 @@ pub fn parse_file(source: String, data: &[u8]) -> Result<s57::S57Cell> {
         bounds,
         features,
         coverage,
-        text_descriptions,
         source,
     }
     .into())
@@ -1972,8 +1939,6 @@ mod tests {
             }),
             current: Some(RawFeature {
                 type_code: 1,
-                id: 1,
-                primitive: 0,
                 attributes: Vec::new(),
                 raw_geometry: RawGeometry::None,
             }),
@@ -2015,7 +1980,7 @@ mod tests {
         let [feature] = cell.features.as_slice() else {
             panic!("expected exactly one feature, got {:?}", cell.features);
         };
-        assert_eq!((feature.type_code, feature.id), (42, 7));
+        assert_eq!(feature.type_code, 42);
         let Geometry::Point(p) = &feature.geometry else {
             panic!("expected a point, got {:?}", feature.geometry);
         };
@@ -2057,11 +2022,7 @@ mod tests {
     #[test]
     fn short_records_are_skipped_without_error() {
         type Parser = fn(&mut CellBuilder, &mut Cursor<&[u8]>, usize) -> Result<()>;
-        let cases: [(&str, usize, Parser); 10] = [
-            ("TXTDSC", 8, |b, p, n| {
-                b.parse_txtdsc(p, n);
-                Ok(())
-            }),
+        let cases: [(&str, usize, Parser); 9] = [
             ("FEATURE_ATTRIBUTE", 3, CellBuilder::parse_feature_attribute),
             ("GEOM_POINT", 16, CellBuilder::parse_geometry_point),
             ("GEOM_LINE", 36, CellBuilder::parse_geometry_line),
@@ -2085,7 +2046,6 @@ mod tests {
             let feature = current_feature(&b);
             assert!(matches!(feature.raw_geometry, RawGeometry::None), "{name}");
             assert!(feature.attributes.is_empty(), "{name}");
-            assert!(b.text_descriptions.is_empty(), "{name}");
             assert!(b.vet.is_empty() && b.vct.is_empty(), "{name}");
         }
     }
@@ -2163,21 +2123,6 @@ mod tests {
     }
 
     #[test]
-    fn txtdsc_stores_content_under_its_file_name() {
-        let mut b = CellBuilder::default();
-        let payload = Bytes::default()
-            .u32(6)
-            .u32(6)
-            .raw(b"a.txt\0")
-            .raw(b"Hello\0");
-        feed(&mut b, &payload.0, CellBuilder::parse_txtdsc);
-        assert_eq!(
-            b.text_descriptions,
-            HashMap::from([("a.txt".to_owned(), "Hello".to_owned())])
-        );
-    }
-
-    #[test]
     fn feature_id_closes_previous_feature_and_opens_next() {
         let mut b = CellBuilder::default();
         for payload in [
@@ -2186,14 +2131,9 @@ mod tests {
         ] {
             feed(&mut b, &payload.0, CellBuilder::parse_feature_id).unwrap();
         }
-        let closed: Vec<_> = b
-            .raw_features
-            .iter()
-            .map(|f| (f.type_code, f.id, f.primitive))
-            .collect();
-        assert_eq!(closed, [(42, 7, 1)]);
-        let open = current_feature(&b);
-        assert_eq!((open.type_code, open.id, open.primitive), (43, 8, 2));
+        let closed: Vec<_> = b.raw_features.iter().map(|f| f.type_code).collect();
+        assert_eq!(closed, [42]);
+        assert_eq!(current_feature(&b).type_code, 43);
     }
 
     #[test]
