@@ -128,7 +128,10 @@ struct Args {
     /// `MapLibre` GL JS's experimental `sparse` (≥ 6.17); raster sources do
     /// it natively. Either way, the tile server must answer missing tiles
     /// with 404 (tileserver-gl does, via the archive's `sparse` metadata) and
-    /// a `pmtiles://` protocol must reject them with a 404 status.
+    /// a `pmtiles://` protocol must reject them with a 404 status. `MapLibre`
+    /// looks at most 10 zooms up for an ancestor: where only charts more
+    /// than 10 zooms coarser than `--max-zoom` cover, the finest zooms draw
+    /// nothing.
     #[arg(long)]
     sparse: bool,
 }

@@ -19,7 +19,7 @@ use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
 use martin_tile_utils::{bbox_to_xyz, xyz_to_bbox};
 use pmtiles::{PmTilesWriter, TileCoord, TileId};
 use rayon::prelude::*;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::bbox::Bbox;
 use crate::tile_geom::TileGeom;
@@ -47,7 +47,6 @@ pub fn write_pmtiles<S: TileSource>(
     max_zoom: Option<u8>,
 ) -> Result<(u8, u8)> {
     let (zoom_floor, zoom_ceil, overall) = quilt.zoom_range_and_bounds(max_zoom)?;
-    quilt.warn_unreachable_ancestors(zoom_ceil);
     let tile_bytes = archive_tiles(quilt, zoom_floor..=zoom_ceil, overall)?;
 
     let metadata = build_metadata(quilt.is_sparse());
@@ -255,8 +254,9 @@ pub enum TileOutcome {
 /// are likewise upscaled rather than resampled from the source.
 ///
 /// `MapLibre` searches at most [`CLIENT_ANCESTOR_SEARCH`] levels up, so
-/// gaps deeper than that draw nothing there — see
-/// [`Quilt::warn_unreachable_ancestors`].
+/// gaps deeper than that draw nothing there: where only charts more than
+/// that many zooms coarser than the max zoom cover, the finest zooms stay
+/// blank. Cap `--max-zoom` accordingly, or don't quilt sparsely.
 pub struct Quilt<S> {
     items: Vec<S>,
     /// Per-item data, indexed like `items`.
@@ -308,31 +308,6 @@ impl<S: TileSource> Quilt<S> {
     #[must_use]
     pub const fn is_sparse(&self) -> bool {
         self.sparse
-    }
-
-    /// Warn when a sparse quilt leaves tiles whose nearest stored ancestor
-    /// lies beyond [`CLIENT_ANCESTOR_SEARCH`]: below `zoom_ceil`, an area
-    /// only covered by an item with a detail zoom that much coarser renders
-    /// empty in `MapLibre`.
-    pub fn warn_unreachable_ancestors(&self, zoom_ceil: u8) {
-        if !self.sparse {
-            return;
-        }
-        let reach = zoom_ceil.saturating_sub(CLIENT_ANCESTOR_SEARCH);
-        let affected = self.meta.iter().filter(|m| m.detail_zoom < reach).count();
-        if let Some(coarsest) = self.meta.iter().map(|m| m.detail_zoom).min()
-            && affected > 0
-        {
-            warn!(
-                affected,
-                coarsest_detail_zoom = coarsest,
-                zoom_ceil,
-                "items whose detail zoom is more than {CLIENT_ANCESTOR_SEARCH} levels below the \
-                 max zoom: where only they cover, MapLibre finds no stored ancestor from zoom {} \
-                 up and draws nothing",
-                coarsest + CLIENT_ANCESTOR_SEARCH + 1
-            );
-        }
     }
 
     /// Compute `(zoom_floor, zoom_ceil, overall_bbox)`: the tile zoom range
@@ -897,28 +872,6 @@ mod tests {
             .zoom_range_and_bounds(Some(6))
             .expect("above the floor");
         assert_eq!(ceil, 6);
-    }
-
-    /// Log lines `warn_unreachable_ancestors` emits for `zoom_ceil`.
-    fn unreachable_warnings(quilt: &Quilt<RncCell>, zoom_ceil: u8) -> String {
-        crate::test_log::capture_logs(|| quilt.warn_unreachable_ancestors(zoom_ceil)).1
-    }
-
-    #[test]
-    fn warns_exactly_when_an_ancestor_is_out_of_client_reach() {
-        // Detail zoom 7: from z17 the walk still reaches z7, from z18 not.
-        let sparse = overview_quilt(true);
-        assert_eq!(unreachable_warnings(&sparse, 17), "");
-        let warning = unreachable_warnings(&sparse, 18);
-        assert!(
-            warning.contains("WARN") && warning.contains("affected=1"),
-            "got: {warning}"
-        );
-        assert_eq!(
-            unreachable_warnings(&overview_quilt(false), 18),
-            "",
-            "a dense quilt leaves no gaps"
-        );
     }
 
     /// A finer cell whose bbox reaches a tile but whose cover polygon does

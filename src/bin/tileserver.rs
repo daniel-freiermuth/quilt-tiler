@@ -452,7 +452,6 @@ async fn main() -> Result<()> {
         loader::Cells::Vector(cells) => {
             let quilt = tiles::Quilt::new(cells, args.zoom_offset, args.sparse);
             let (min_zoom, max_zoom, _bounds) = quilt.zoom_range_and_bounds(args.max_zoom)?;
-            quilt.warn_unreachable_ancestors(max_zoom);
             info!(
                 cells = quilt.items().len(),
                 min_zoom,
@@ -469,7 +468,6 @@ async fn main() -> Result<()> {
         loader::Cells::Raster(cells) => {
             let quilt = tiles::Quilt::new(cells, args.zoom_offset, args.sparse);
             let (min_zoom, max_zoom, _bounds) = quilt.zoom_range_and_bounds(args.max_zoom)?;
-            quilt.warn_unreachable_ancestors(max_zoom);
             info!(
                 cells = quilt.items().len(),
                 min_zoom,
