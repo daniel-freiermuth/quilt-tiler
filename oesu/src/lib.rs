@@ -3276,6 +3276,44 @@ mod tests {
         );
     }
 
+    /// The fixed `AREA` header is 44 bytes; `AREA_EXT` adds an 8-byte
+    /// `scale_factor` for 52. One byte short is `RecordTooShort`, exact is
+    /// an empty area.
+    #[test]
+    fn area_payload_rejects_records_shorter_than_the_fixed_header() {
+        let georef = GeoRef {
+            lat: 54.75,
+            lon: 10.75,
+        };
+        for (ext, record, need) in [
+            (None, "FEATURE_GEOMETRY_RECORD_AREA", 44),
+            (Some((10.0, georef)), "FEATURE_GEOMETRY_RECORD_AREA_EXT", 52),
+        ] {
+            let mut payload = Bytes::default().extent().u32(0).u32(0).u32(0);
+            if ext.is_some() {
+                payload = payload.f64(10.0);
+            }
+            assert_eq!(payload.0.len(), need);
+
+            let exact = parse_area_payload(&mut Cursor::new(payload.0.as_slice()), need, ext);
+            assert!(
+                matches!(&exact, Ok(RawGeometry::Area { edge_refs, .. }) if edge_refs.is_empty()),
+                "{record}: {exact:?}"
+            );
+
+            let short = &payload.0[..need - 1];
+            let err = parse_area_payload(&mut Cursor::new(short), short.len(), ext).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    OesuError::RecordTooShort { record: r, len, need: n }
+                        if r == record && len == need - 1 && n == need
+                ),
+                "{record}: {err:?}"
+            );
+        }
+    }
+
     #[test]
     fn duplicate_vet_and_vct_indices_keep_the_last_record() {
         let mut b = CellBuilder::default();
