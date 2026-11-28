@@ -35,6 +35,17 @@
       }
     },
     {
+      "id": "RIVERS-fill",
+      "type": "fill",
+      "source": "enc",
+      "source-layer": "RIVERS",
+      "filter": ["==", ["geometry-type"], "Polygon"],
+      "paint": {
+        "fill-color": "#c3d3da",
+        "fill-outline-color": "#5dade2"
+      }
+    },
+    {
       "id": "DEPARE-shoal",
       "type": "fill",
       "source": "enc",
@@ -135,6 +146,17 @@
       "paint": {
         "line-color": "#5d6d7e",
         "line-width": 1.5
+      }
+    },
+    {
+      "id": "RIVERS",
+      "type": "line",
+      "source": "enc",
+      "source-layer": "RIVERS",
+      "filter": ["==", ["geometry-type"], "LineString"],
+      "paint": {
+        "line-color": "#5dade2",
+        "line-width": 1.0
       }
     },
     {
