@@ -14,7 +14,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
-use geo::MultiPolygon;
+use geo::{Intersects, MultiPolygon, Rect};
 use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
 use martin_tile_utils::{bbox_to_xyz, xyz_to_bbox};
 use once_cell::sync::OnceCell;
@@ -468,12 +468,22 @@ impl<S: TileSource> Quilt<S> {
         let mut contributions = Vec::new();
         for group in candidates.chunk_by(|&a, &b| self.zoom_fit(a, z) == self.zoom_fit(b, z)) {
             // From the catalog: a member whose bbox misses what's left of
-            // the tile can't contribute.
+            // the tile can't contribute. What's left, not its bbox: once the
+            // fitting charts cover most of a tile, the gaps they leave still
+            // span it, and the finer charts inside their coverage would all
+            // pass a bbox test.
             let remaining = Bbox::from(&uncovered);
             let mut members: Vec<usize> = group
                 .iter()
                 .copied()
-                .filter(|&i| self.meta[i].bbox.overlaps(&remaining))
+                .filter(|&i| {
+                    let bbox = self.meta[i].bbox;
+                    bbox.overlaps(&remaining)
+                        && uncovered.intersects(&Rect::new(
+                            (bbox.west, bbox.south),
+                            (bbox.east, bbox.north),
+                        ))
+                })
                 .collect();
             if members.len() > 1 {
                 self.order_by_tiebreak(&mut members)?;
@@ -1281,6 +1291,59 @@ mod tests {
         );
         let asked: Vec<_> = quilt.items().iter().map(|i| i.asked.all()).collect();
         assert_eq!(asked, [(1, 0, 0, 1), (1, 0, 0, 1), (0, 0, 0, 0)]);
+    }
+
+    /// What decides whether a candidate is asked is the uncovered part of
+    /// the tile itself, not its bbox: two coarse items covering opposite
+    /// quarters leave a gap whose bbox is the whole tile, yet a finer item
+    /// inside a covered quarter can't contribute and isn't loaded at all.
+    #[test]
+    fn an_item_inside_the_covered_part_is_not_asked_whatever_the_gap_spans() {
+        let (tile, exact) = probe_tile_at(10, 10.5, 56.5, 0.0);
+        let (mid_x, mid_y) = (
+            f64::midpoint(exact.west, exact.east),
+            f64::midpoint(exact.south, exact.north),
+        );
+        let inset = |b: Bbox| {
+            let (dx, dy) = ((b.east - b.west) / 4.0, (b.north - b.south) / 4.0);
+            Bbox {
+                west: b.west + dx,
+                south: b.south + dy,
+                east: b.east - dx,
+                north: b.north - dy,
+            }
+        };
+        let south_west = Bbox {
+            east: mid_x,
+            north: mid_y,
+            ..exact
+        };
+        let north_east = Bbox {
+            west: mid_x,
+            south: mid_y,
+            ..exact
+        };
+        let north_west = Bbox {
+            east: mid_x,
+            south: mid_y,
+            ..exact
+        };
+        let quilt = Quilt::new(
+            vec![
+                Probe::new("SW", south_west, 10, 1),
+                Probe::new("NE", north_east, 10, 1),
+                Probe::new("COVERED", inset(south_west), 12, 1),
+                Probe::new("GAP", inset(north_west), 12, 1),
+            ],
+            0.0,
+            false,
+        );
+        assert_eq!(
+            rendered(quilt.render_tile(tile).expect("renders")),
+            "NE,SW,GAP"
+        );
+        let coverage: Vec<_> = quilt.items().iter().map(|i| i.asked.all().0).collect();
+        assert_eq!(coverage, [1, 1, 0, 1]);
     }
 
     /// Items equal on zoom fit and tie-break key (e.g. two cells without an
